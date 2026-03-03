@@ -47,10 +47,56 @@ fn get_start_time() -> f64 {
 
 struct ChromeTraceLayer;
 
+/// High-frequency micro-spans to filter out. These are called thousands of
+/// times during proving and the tracing overhead (JS interop + Mutex + String
+/// alloc per entry/exit) dominates their actual computation time.
+/// Filtering these reduces trace events from ~87K to ~10K.
+const FILTERED_SPANS: &[&str] = &[
+    "bound_poly_var_top_zero_optimized",
+    "MultilinearPolynomial::bind_parallel",
+    "MultilinearPolynomial::bind",
+    "MultilinearPolynomial::evaluate",
+    "UniPoly::evaluate",
+    "UniPoly::eval_with_coeffs",
+    "GruenSplitEqPolynomial::bind",
+    "CompactPolynomial::bind",
+    "bound_poly_var_bot",
+    "ExpandingTable::update",
+    "EqPolynomial::evals",
+    "EqPolynomial::evals_cached",
+    "ProverOpeningAccumulator::append_sparse",
+    "ProverOpeningAccumulator::append_dense",
+    "update_checkpoints",
+    "PrefixSuffix::init_P",
+    "RaPolynomialRound1::bind",
+    "RaPolynomialRound2::bind",
+    "RaPolynomialRound3::bind",
+    "SharedRaRound3::bind",
+    "SparseMatrixPolynomial::bind",
+    "ExpandingTable::new",
+    "GruenSplitEqPolynomial::new",
+    "GruenSplitEqPolynomial::new_with_scaling",
+    "PrefixSuffix::init_Q_raf",
+    "EqPlusOnePolynomial::evals",
+    "MultiquadraticPolynomial::bind",
+];
+
+fn is_filtered_span(name: &str) -> bool {
+    FILTERED_SPANS.iter().any(|&filtered| name == filtered)
+}
+
 impl<S> Layer<S> for ChromeTraceLayer
 where
     S: Subscriber + for<'a> LookupSpan<'a>,
 {
+    fn enabled(&self, metadata: &tracing::Metadata<'_>, _ctx: Context<'_, S>) -> bool {
+        if metadata.is_span() {
+            !is_filtered_span(metadata.name())
+        } else {
+            true
+        }
+    }
+
     fn on_new_span(&self, attrs: &Attributes<'_>, id: &Id, ctx: Context<'_, S>) {
         let start = get_start_time();
         let ts = now_micros() - start;
