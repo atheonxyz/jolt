@@ -2644,6 +2644,69 @@ where
         #[cfg(not(feature = "webgpu-pairing"))]
         let hint = PCS::combine_hints(hints, &coeffs);
 
+        // GPU G2 path: pre-compute v2 = h2 * v_vec on WebGPU, skipping expensive CPU G2 scalar mul
+        #[cfg(feature = "webgpu-pairing")]
+        let (proof, _y_blinding) = {
+            use crate::poly::commitment::dory::{webgpu_g2, DoryCommitmentScheme};
+
+            if webgpu_g2::is_gpu_g2_available() {
+                let _span = tracing::info_span!("gpu_g2_stage8").entered();
+
+                // SAFETY: F = ark_bn254::Fr in WASM Dory builds (same memory layout)
+                let opening_point_f: Vec<F> = opening_point.r.iter().map(|c| (*c).into()).collect();
+                let ark_opening_point: &[ark_bn254::Fr] = unsafe {
+                    std::slice::from_raw_parts(
+                        opening_point_f.as_ptr() as *const ark_bn254::Fr,
+                        opening_point_f.len(),
+                    )
+                };
+                let ark_joint_poly: &MultilinearPolynomial<ark_bn254::Fr> = unsafe {
+                    &*(&joint_poly as *const MultilinearPolynomial<F>
+                        as *const MultilinearPolynomial<ark_bn254::Fr>)
+                };
+
+                let v_vec =
+                    DoryCommitmentScheme::compute_v_vec_for_gpu(ark_joint_poly, ark_opening_point);
+                let raw_scalars: Vec<ark_bn254::Fr> = v_vec.iter().map(|f| f.0).collect();
+
+                // SAFETY: PCS::ProverSetup = ArkworksProverSetup in WASM Dory builds
+                let setup: &crate::poly::commitment::dory::ArkworksProverSetup = unsafe {
+                    &*(&self.preprocessing.generators
+                        as *const PCS::ProverSetup
+                        as *const crate::poly::commitment::dory::ArkworksProverSetup)
+                };
+                // g2_fin = g2_vec[0] — the base point for v2 scalar mul in Dory
+                let g2_fin = setup.g2_vec[0].0;
+                let pre_computed_v2 =
+                    webgpu_g2::gpu_g2_fixed_base_scalar_mul(&g2_fin, &raw_scalars).await;
+
+                let (dory_proof, y_blind) = DoryCommitmentScheme::prove_with_gpu_v2(
+                    setup,
+                    ark_joint_poly,
+                    ark_opening_point,
+                    Some(hint),
+                    &mut self.transcript,
+                    pre_computed_v2,
+                );
+
+                // SAFETY: PCS::Proof = ArkDoryProof when PCS = DoryCommitmentScheme
+                let proof =
+                    unsafe { std::ptr::read(&dory_proof as *const _ as *const PCS::Proof) };
+                std::mem::forget(dory_proof);
+                let y_blinding =
+                    y_blind.map(|b| unsafe { std::mem::transmute_copy::<ark_bn254::Fr, F>(&b) });
+                (proof, y_blinding)
+            } else {
+                PCS::prove(
+                    &self.preprocessing.generators,
+                    &joint_poly,
+                    &opening_point.r,
+                    Some(hint),
+                    &mut self.transcript,
+                )
+            }
+        };
+        #[cfg(not(feature = "webgpu-pairing"))]
         let (proof, _y_blinding) = PCS::prove(
             &self.preprocessing.generators,
             &joint_poly,
