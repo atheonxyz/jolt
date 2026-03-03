@@ -105,8 +105,11 @@ pub struct JoltG2Routines;
 
 impl DoryRoutines<ArkG2> for JoltG2Routines {
     fn msm(bases: &[ArkG2], scalars: &[ArkFr]) -> ArkG2 {
-        let projective_points: Vec<G2Projective> = bases.iter().map(|w| w.0).collect();
-        let affines = G2Projective::normalize_batch(&projective_points);
+        // SAFETY: ArkG2 has same memory layout as G2Projective
+        let projective_points: &[G2Projective] = unsafe {
+            std::slice::from_raw_parts(bases.as_ptr() as *const G2Projective, bases.len())
+        };
+        let affines = G2Projective::normalize_batch(projective_points);
 
         // SAFETY: ArkFr has same memory layout as Fr
         let raw_scalars: &[Fr] =
