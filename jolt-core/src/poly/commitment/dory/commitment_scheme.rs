@@ -6,6 +6,8 @@ use super::wrappers::{
     ark_to_jolt, jolt_to_ark, ArkDoryProof, ArkFr, ArkG1, ArkGT, ArkworksProverSetup,
     ArkworksVerifierSetup, JoltToDoryTranscript, BN254,
 };
+#[cfg(all(feature = "webgpu-pairing", target_arch = "wasm32"))]
+use super::wrappers::ArkG2;
 use crate::{
     curve::JoltCurve,
     field::JoltField,
@@ -495,6 +497,205 @@ impl DoryCommitmentScheme {
         let handle = super::webgpu_pairing::dispatch_gpu_combine_hints(&hint_rows, coeffs);
         let rows = super::webgpu_pairing::resolve_gpu_combine_hints(handle).await;
         DoryOpeningProofHint::new(rows)
+    }
+
+    /// Compute v_vec (column evaluation scalars) for GPU G2 fixed-base scalar mul.
+    /// The returned scalars should be multiplied by h2 on GPU, then passed to `prove_with_gpu_v2`.
+    #[cfg(all(feature = "webgpu-pairing", target_arch = "wasm32"))]
+    pub fn compute_v_vec_for_gpu(
+        poly: &MultilinearPolynomial<ark_bn254::Fr>,
+        opening_point: &[ark_bn254::Fr],
+    ) -> Vec<ArkFr> {
+        use dory::MultilinearLagrange;
+
+        let num_cols = DoryGlobals::get_num_columns();
+        let num_rows = DoryGlobals::get_max_num_rows();
+        let sigma = num_cols.log_2();
+        let nu = num_rows.log_2();
+
+        let reordered_point = if DoryGlobals::get_layout() == DoryLayout::AddressMajor {
+            let log_T = DoryGlobals::get_T().log_2();
+            let log_K = opening_point.len().saturating_sub(log_T);
+            let (r_address, r_cycle) = opening_point.split_at(log_K);
+            [r_cycle, r_address].concat()
+        } else {
+            opening_point.to_vec()
+        };
+        let ark_point: Vec<ArkFr> = reordered_point
+            .iter()
+            .rev()
+            .map(|p| {
+                let f_val: ark_bn254::Fr = (*p).into();
+                jolt_to_ark(&f_val)
+            })
+            .collect();
+
+        let (left_vec, _right_vec) = poly.compute_evaluation_vectors(&ark_point, nu, sigma);
+        poly.vector_matrix_product(&left_vec, nu, sigma)
+    }
+
+    /// Prove with a GPU-precomputed v2 vector (G2 fixed-base scalar mul result).
+    /// This skips the expensive `M2::fixed_base_vector_scalar_mul` inside
+    /// `create_evaluation_proof`, replacing it with the pre-computed GPU result.
+    ///
+    /// Only supports Transparent (non-ZK) mode — WASM builds don't use ZK.
+    #[cfg(all(feature = "webgpu-pairing", target_arch = "wasm32"))]
+    pub fn prove_with_gpu_v2<ProofTranscript: Transcript>(
+        setup: &ArkworksProverSetup,
+        poly: &MultilinearPolynomial<ark_bn254::Fr>,
+        opening_point: &[ark_bn254::Fr],
+        hint: Option<DoryOpeningProofHint>,
+        transcript: &mut ProofTranscript,
+        pre_computed_v2: Vec<ArkG2>,
+    ) -> (ArkDoryProof, Option<ark_bn254::Fr>) {
+        use dory::primitives::arithmetic::{DoryRoutines, Field as DoryField, Group, PairingCurve};
+        use dory::primitives::transcript::Transcript as DoryTranscript;
+        use dory::{DoryProverState, MultilinearLagrange, Transparent, VMVMessage};
+
+        let _span = trace_span!("DoryCommitmentScheme::prove_with_gpu_v2").entered();
+
+        let row_commitments = hint
+            .map(|h| h.into_rows())
+            .unwrap_or_else(|| {
+                let (_commitment, row_commitments) = Self::commit(poly, setup);
+                row_commitments.into_rows()
+            });
+
+        let num_cols = DoryGlobals::get_num_columns();
+        let num_rows = DoryGlobals::get_max_num_rows();
+        let sigma = num_cols.log_2();
+        let nu = num_rows.log_2();
+
+        let reordered_point = if DoryGlobals::get_layout() == DoryLayout::AddressMajor {
+            let log_T = DoryGlobals::get_T().log_2();
+            let log_K = opening_point.len().saturating_sub(log_T);
+            let (r_address, r_cycle) = opening_point.split_at(log_K);
+            [r_cycle, r_address].concat()
+        } else {
+            opening_point.to_vec()
+        };
+        let ark_point: Vec<ArkFr> = reordered_point
+            .iter()
+            .rev()
+            .map(|p| {
+                let f_val: ark_bn254::Fr = (*p).into();
+                jolt_to_ark(&f_val)
+            })
+            .collect();
+
+        // Compute evaluation vectors and v_vec
+        let (left_vec, right_vec) = poly.compute_evaluation_vectors(&ark_point, nu, sigma);
+        let v_vec = poly.vector_matrix_product(&left_vec, nu, sigma);
+
+        let mut padded_row_commitments = row_commitments.clone();
+        if nu < sigma {
+            padded_row_commitments.resize(1 << sigma, <BN254 as PairingCurve>::G1::identity());
+        }
+
+        // Transparent mode: all blinds are zero
+        let zero = ArkFr::zero();
+        let g2_fin = &setup.g2_vec[0];
+
+        // VMV messages: C, D2, E1
+        let t_vec_v = JoltG1Routines::msm(&padded_row_commitments, &v_vec);
+        let c = BN254::pair(&t_vec_v, g2_fin);
+
+        let d2 = BN254::pair(
+            &JoltG1Routines::msm(&setup.g1_vec[..1 << sigma], &v_vec),
+            g2_fin,
+        );
+
+        let e1 = JoltG1Routines::msm(&row_commitments, &left_vec);
+
+        let vmv_message = VMVMessage { c, d2, e1 };
+
+        let mut dory_transcript = JoltToDoryTranscript::<ProofTranscript>::new(transcript);
+        dory_transcript.append_serde(b"vmv_c", &vmv_message.c);
+        dory_transcript.append_serde(b"vmv_d2", &vmv_message.d2);
+        dory_transcript.append_serde(b"vmv_e1", &vmv_message.e1);
+
+        // Use pre-computed v2 from GPU instead of expensive CPU G2 scalar mul
+        let v2 = pre_computed_v2;
+
+        let mut padded_right_vec = right_vec;
+        let mut padded_left_vec = left_vec;
+        if nu < sigma {
+            padded_right_vec.resize(1 << sigma, ArkFr::zero());
+            padded_left_vec.resize(1 << sigma, ArkFr::zero());
+        }
+
+        let mut prover_state: DoryProverState<'_, BN254, Transparent> = DoryProverState::new(
+            padded_row_commitments,
+            v2,
+            Some(v_vec),
+            padded_right_vec,
+            padded_left_vec,
+            setup,
+        );
+        prover_state.set_initial_blinds(zero, zero, zero, zero, zero);
+
+        let num_rounds = nu.max(sigma);
+        let mut first_messages = Vec::with_capacity(num_rounds);
+        let mut second_messages = Vec::with_capacity(num_rounds);
+
+        for _round in 0..num_rounds {
+            let first_msg =
+                prover_state.compute_first_message::<JoltG1Routines, JoltG2Routines>();
+
+            dory_transcript.append_serde(b"d1_left", &first_msg.d1_left);
+            dory_transcript.append_serde(b"d1_right", &first_msg.d1_right);
+            dory_transcript.append_serde(b"d2_left", &first_msg.d2_left);
+            dory_transcript.append_serde(b"d2_right", &first_msg.d2_right);
+            dory_transcript.append_serde(b"e1_beta", &first_msg.e1_beta);
+            dory_transcript.append_serde(b"e2_beta", &first_msg.e2_beta);
+
+            let beta = dory_transcript.challenge_scalar(b"beta");
+            prover_state.apply_first_challenge::<JoltG1Routines, JoltG2Routines>(&beta);
+            first_messages.push(first_msg);
+
+            let second_msg =
+                prover_state.compute_second_message::<JoltG1Routines, JoltG2Routines>();
+
+            dory_transcript.append_serde(b"c_plus", &second_msg.c_plus);
+            dory_transcript.append_serde(b"c_minus", &second_msg.c_minus);
+            dory_transcript.append_serde(b"e1_plus", &second_msg.e1_plus);
+            dory_transcript.append_serde(b"e1_minus", &second_msg.e1_minus);
+            dory_transcript.append_serde(b"e2_plus", &second_msg.e2_plus);
+            dory_transcript.append_serde(b"e2_minus", &second_msg.e2_minus);
+
+            let alpha = dory_transcript.challenge_scalar(b"alpha");
+            prover_state.apply_second_challenge::<JoltG1Routines, JoltG2Routines>(&alpha);
+            second_messages.push(second_msg);
+        }
+
+        let gamma = dory_transcript.challenge_scalar(b"gamma");
+        let final_message =
+            prover_state.compute_final_message::<JoltG1Routines, JoltG2Routines>(&gamma);
+
+        dory_transcript.append_serde(b"final_e1", &final_message.e1);
+        dory_transcript.append_serde(b"final_e2", &final_message.e2);
+        let _d = dory_transcript.challenge_scalar(b"d");
+
+        let proof = ArkDoryProof {
+            vmv_message,
+            first_messages,
+            second_messages,
+            final_message,
+            nu,
+            sigma,
+            #[cfg(feature = "zk")]
+            e2: None,
+            #[cfg(feature = "zk")]
+            y_com: None,
+            #[cfg(feature = "zk")]
+            sigma1_proof: None,
+            #[cfg(feature = "zk")]
+            sigma2_proof: None,
+            #[cfg(feature = "zk")]
+            scalar_product_proof: None,
+        };
+
+        (proof, None)
     }
 }
 
