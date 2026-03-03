@@ -568,6 +568,7 @@ where
             opening_claims,
             trace_length: self.trace.len(),
             ram_K: self.one_hot_params.ram_k,
+            bytecode_K: self.one_hot_params.bytecode_k,
             rw_config: self.rw_config.clone(),
             one_hot_config: self.one_hot_params.to_config(),
             dory_layout: DoryGlobals::get_layout(),
@@ -575,6 +576,117 @@ where
 
         let prove_duration = start.elapsed();
 
+        tracing::info!(
+            "Proved in {:.1}s ({:.1} kHz / padded {:.1} kHz)",
+            prove_duration.as_secs_f64(),
+            self.unpadded_trace_len as f64 / prove_duration.as_secs_f64() / 1000.0,
+            self.padded_trace_len as f64 / prove_duration.as_secs_f64() / 1000.0,
+        );
+
+        (proof, debug_info)
+    }
+
+    #[cfg(target_arch = "wasm32")]
+    #[allow(clippy::type_complexity)]
+    #[tracing::instrument(skip_all)]
+    pub async fn prove_with_gpu(
+        mut self,
+    ) -> (
+        JoltProof<F, PCS, ProofTranscript>,
+        Option<ProverDebugInfo<F, ProofTranscript, PCS>>,
+    ) {
+        let _pprof_prove = pprof_scope!("prove");
+
+        let start = Instant::now();
+        fiat_shamir_preamble(
+            &self.program_io,
+            self.one_hot_params.ram_k,
+            self.trace.len(),
+            &mut self.transcript,
+        );
+
+        tracing::info!(
+            "bytecode size: {}",
+            self.preprocessing.shared.bytecode.code_size
+        );
+
+        let (commitments, mut opening_proof_hints) = self.generate_and_commit_witness_polynomials();
+        let untrusted_advice_commitment = self.generate_and_commit_untrusted_advice();
+        self.generate_and_commit_trusted_advice();
+
+        if let Some(hint) = self.advice.trusted_advice_hint.take() {
+            opening_proof_hints.insert(CommittedPolynomial::TrustedAdvice, hint);
+        }
+        if let Some(hint) = self.advice.untrusted_advice_hint.take() {
+            opening_proof_hints.insert(CommittedPolynomial::UntrustedAdvice, hint);
+        }
+
+        let (stage1_uni_skip_first_round_proof, stage1_sumcheck_proof, r_stage1) =
+            self.prove_stage1();
+        let (stage2_uni_skip_first_round_proof, stage2_sumcheck_proof, r_stage2) =
+            self.prove_stage2();
+        let (stage3_sumcheck_proof, r_stage3) = self.prove_stage3();
+        let (stage4_sumcheck_proof, r_stage4) = self.prove_stage4();
+        let (stage5_sumcheck_proof, r_stage5) = self.prove_stage5();
+        let (stage6_sumcheck_proof, r_stage6) = self.prove_stage6();
+        let (stage7_sumcheck_proof, r_stage7) = self.prove_stage7();
+
+        let _sumcheck_challenges = [
+            r_stage1, r_stage2, r_stage3, r_stage4, r_stage5, r_stage6, r_stage7,
+        ];
+
+        let joint_opening_proof = self.prove_stage8_gpu(opening_proof_hints).await;
+        #[cfg(feature = "zk")]
+        let blindfold_proof = self.prove_blindfold(&joint_opening_proof);
+
+        #[cfg(not(feature = "zk"))]
+        let opening_claims =
+            crate::zkvm::proof_serialization::Claims(self.opening_accumulator.openings.clone());
+
+        #[cfg(test)]
+        assert!(
+            self.opening_accumulator
+                .appended_virtual_openings
+                .borrow()
+                .is_empty(),
+            "Not all virtual openings have been proven, missing: {:?}",
+            self.opening_accumulator.appended_virtual_openings.borrow()
+        );
+
+        #[cfg(test)]
+        let debug_info = Some(ProverDebugInfo {
+            transcript: self.transcript.clone(),
+            opening_accumulator: self.opening_accumulator.clone(),
+            prover_setup: self.preprocessing.generators.clone(),
+        });
+        #[cfg(not(test))]
+        let debug_info = None;
+
+        let proof = JoltProof {
+            commitments,
+            untrusted_advice_commitment,
+            stage1_uni_skip_first_round_proof,
+            stage1_sumcheck_proof,
+            stage2_uni_skip_first_round_proof,
+            stage2_sumcheck_proof,
+            stage3_sumcheck_proof,
+            stage4_sumcheck_proof,
+            stage5_sumcheck_proof,
+            stage6_sumcheck_proof,
+            stage7_sumcheck_proof,
+            #[cfg(feature = "zk")]
+            blindfold_proof,
+            joint_opening_proof,
+            #[cfg(not(feature = "zk"))]
+            opening_claims,
+            trace_length: self.trace.len(),
+            ram_K: self.one_hot_params.ram_k,
+            rw_config: self.rw_config.clone(),
+            one_hot_config: self.one_hot_params.to_config(),
+            dory_layout: DoryGlobals::get_layout(),
+        };
+
+        let prove_duration = start.elapsed();
         tracing::info!(
             "Proved in {:.1}s ({:.1} kHz / padded {:.1} kHz)",
             prove_duration.as_secs_f64(),
@@ -2017,6 +2129,22 @@ where
         }
 
         proof
+    }
+
+    #[cfg(target_arch = "wasm32")]
+    async fn prove_stage8_gpu(
+        &mut self,
+        opening_proof_hints: HashMap<CommittedPolynomial, PCS::OpeningProofHint>,
+    ) -> PCS::Proof {
+        self.prove_stage8(opening_proof_hints)
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    async fn prove_stage8_gpu(
+        &mut self,
+        opening_proof_hints: HashMap<CommittedPolynomial, PCS::OpeningProofHint>,
+    ) -> PCS::Proof {
+        self.prove_stage8(opening_proof_hints)
     }
 }
 

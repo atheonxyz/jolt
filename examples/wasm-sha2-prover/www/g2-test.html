@@ -1,0 +1,1141 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <meta http-equiv="Cross-Origin-Opener-Policy" content="same-origin">
+    <meta http-equiv="Cross-Origin-Embedder-Policy" content="require-corp">
+    <title>GPU G2 Fixed-Base Scalar Mul Test</title>
+    <style>
+        :root {
+            --bg: #f4f6f8;
+            --panel: #ffffff;
+            --ink: #1d2a3a;
+            --muted: #5c6776;
+            --pass: #1f8a5a;
+            --fail: #c0392b;
+            --warn: #b9770e;
+            --line: #d8dee8;
+            --accent: #1f5ea8;
+        }
+
+        * { box-sizing: border-box; }
+
+        body {
+            margin: 0;
+            font-family: "Iowan Old Style", "Palatino Linotype", "Book Antiqua", Palatino, serif;
+            color: var(--ink);
+            background:
+                radial-gradient(circle at 20% -10%, #dbe9ff 0%, transparent 45%),
+                radial-gradient(circle at 90% 10%, #d8f3e7 0%, transparent 40%),
+                var(--bg);
+            min-height: 100vh;
+        }
+
+        main {
+            width: min(1080px, 100% - 2rem);
+            margin: 1.5rem auto 2rem;
+        }
+
+        .card {
+            background: var(--panel);
+            border: 1px solid var(--line);
+            border-radius: 12px;
+            box-shadow: 0 8px 20px rgba(29, 42, 58, 0.08);
+            padding: 1rem;
+            margin-bottom: 1rem;
+        }
+
+        h1 {
+            margin: 0 0 0.4rem;
+            font-size: clamp(1.4rem, 2.3vw, 2rem);
+            color: #143b66;
+        }
+
+        p { margin: 0.25rem 0; color: var(--muted); }
+
+        #status { font-weight: 700; color: var(--accent); }
+
+        table {
+            width: 100%;
+            border-collapse: collapse;
+            font-size: 0.92rem;
+            table-layout: fixed;
+        }
+
+        th, td {
+            border-bottom: 1px solid var(--line);
+            text-align: left;
+            padding: 0.55rem 0.45rem;
+            vertical-align: top;
+            word-break: break-word;
+        }
+
+        th {
+            color: #26435f;
+            font-weight: 700;
+            font-size: 0.85rem;
+            text-transform: uppercase;
+            letter-spacing: 0.04em;
+        }
+
+        .pass { color: var(--pass); font-weight: 700; }
+        .fail { color: var(--fail); font-weight: 700; }
+        .warn { color: var(--warn); font-weight: 700; }
+
+        details {
+            margin-top: 0.4rem;
+            border: 1px solid var(--line);
+            border-radius: 8px;
+            padding: 0.45rem 0.55rem;
+            background: #fbfcfe;
+        }
+
+        summary {
+            cursor: pointer;
+            color: #294966;
+            font-weight: 700;
+        }
+
+        pre {
+            margin: 0.45rem 0 0;
+            background: #f7f9fc;
+            border: 1px solid #e6ebf3;
+            border-radius: 8px;
+            padding: 0.65rem;
+            overflow-x: auto;
+            white-space: pre-wrap;
+            font-size: 0.74rem;
+            line-height: 1.35;
+            font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", monospace;
+        }
+
+        @media (max-width: 760px) {
+            main { width: calc(100% - 1rem); margin-top: 0.8rem; }
+            .card { padding: 0.75rem; }
+            th, td { font-size: 0.82rem; padding: 0.45rem 0.35rem; }
+            pre { font-size: 0.7rem; }
+        }
+    </style>
+</head>
+<body>
+<main>
+    <section class="card">
+        <h1>GPU G2 Fixed-Base Scalar Mul vs Jolt Reference + Naive GPU</h1>
+        <p>Runs fully in-browser with WebGPU (no WASM).</p>
+        <p id="status">Initializing...</p>
+    </section>
+
+    <section class="card">
+        <table>
+            <thead>
+            <tr>
+                <th>Test</th>
+                <th>Scalars</th>
+                <th>vs GPU Naive</th>
+                <th>vs Jolt (arkworks)</th>
+                <th>Timing</th>
+            </tr></thead>
+            <tbody id="results-body"></tbody>
+        </table>
+    </section>
+</main>
+
+<script type="module">
+import { gpuG2FixedBaseScalarMul, gpuG2UploadTable, gpuG2ScalarMulCached, initGpuG2 } from "./gpu-g2.js";
+
+const NUM_LIMBS = 8;
+const G2_AFFINE_WORDS = 32;
+const G2_JACOBIAN_WORDS = 48;
+const G2_NUM_WINDOWS = 51;
+const G2_TABLE_ENTRIES = 31;
+const G2_TABLE_WORDS = G2_NUM_WINDOWS * G2_TABLE_ENTRIES * G2_AFFINE_WORDS;
+
+const SHADER_PATHS = {
+    common: "shaders/bn254_common.wgsl",
+    g2Kernel: "shaders/g2_fixed_base_mul.wgsl",
+};
+
+const FR_MODULUS = new Uint32Array([
+    4026531841, 1138881939, 2042196113, 674490440,
+    2172737629, 3092268470, 3778125865, 811880050,
+]);
+
+const G2_GENERATOR_MONT = new Uint32Array([
+    // x.c0 (Montgomery)
+    45883430, 2390996433, 1232798066, 3706394933, 2541820639, 4223149639, 2945863739, 425146433,
+    // x.c1 (Montgomery)
+    2823577920, 2947838845, 1476581572, 1615060314, 1386229638, 166285564, 988445547, 352252035,
+    // y.c0 (Montgomery)
+    2288773622, 1637743261, 4120812408, 4269789847, 589004286, 4288551522, 2929607174, 687701739,
+    // y.c1 (Montgomery)
+    3340261102, 1678334806, 847068347, 3696752930, 859115638, 1442395582, 2482857090, 228892902,
+]);
+
+// Montgomery form of 1 in Fp: R mod p
+const FP_ONE_MONT = new Uint32Array([3314486685, 3546104717, 4123462461, 175696680, 2021213740, 1718526831, 2584207151, 235567041]);
+const FP_ZERO = new Uint32Array(8);
+
+// -----------------------------------------------------------------------
+// Jolt reference: expected G2Affine results computed by arkworks (Rust).
+// Each entry is 32 u32s [x.c0, x.c1, y.c0, y.c1] in Montgomery form.
+// null = identity (scalar = 0).
+// -----------------------------------------------------------------------
+const JOLT_REF = {
+    "scalar = 1": [new Uint32Array([45883430, 2390996433, 1232798066, 3706394933, 2541820639, 4223149639, 2945863739, 425146433, 2823577920, 2947838845, 1476581572, 1615060314, 1386229638, 166285564, 988445547, 352252035, 2288773622, 1637743261, 4120812408, 4269789847, 589004286, 4288551522, 2929607174, 687701739, 3340261102, 1678334806, 847068347, 3696752930, 859115638, 1442395582, 2482857090, 228892902])],
+    "scalar = 2": [new Uint32Array([720872825, 1121168951, 3231880117, 3539339723, 1727569133, 1472317281, 519228482, 786978873, 2450158264, 2824265875, 1828929342, 1669360212, 1431584236, 511635194, 1950091920, 91005173, 1544103303, 3167790256, 2907698874, 1501034116, 2028563033, 1339956461, 3474511918, 41226137, 1068194562, 858092502, 3193237602, 2821990885, 3523285492, 2934142659, 2457005949, 235944843])],
+    "scalar = 0": [null],
+    "small scalars 1-8": [
+        new Uint32Array([45883430, 2390996433, 1232798066, 3706394933, 2541820639, 4223149639, 2945863739, 425146433, 2823577920, 2947838845, 1476581572, 1615060314, 1386229638, 166285564, 988445547, 352252035, 2288773622, 1637743261, 4120812408, 4269789847, 589004286, 4288551522, 2929607174, 687701739, 3340261102, 1678334806, 847068347, 3696752930, 859115638, 1442395582, 2482857090, 228892902]),
+        new Uint32Array([720872825, 1121168951, 3231880117, 3539339723, 1727569133, 1472317281, 519228482, 786978873, 2450158264, 2824265875, 1828929342, 1669360212, 1431584236, 511635194, 1950091920, 91005173, 1544103303, 3167790256, 2907698874, 1501034116, 2028563033, 1339956461, 3474511918, 41226137, 1068194562, 858092502, 3193237602, 2821990885, 3523285492, 2934142659, 2457005949, 235944843]),
+        new Uint32Array([3450324789, 1921933475, 2750583958, 4057037868, 835772736, 3940870593, 2694065073, 257567225, 2094956167, 2166979474, 2666288094, 1721950258, 1377379911, 1219531055, 64910143, 298565523, 3546884348, 2811265199, 58815425, 1731519501, 2083595919, 4286965121, 1261032494, 285245263, 2985763798, 1260439399, 907518442, 1311097012, 1409346311, 4220935834, 542775371, 19712918]),
+        new Uint32Array([1648066719, 3170843026, 2954511762, 2399561712, 1508265676, 3067246102, 3179743027, 296281565, 3957709386, 2492649696, 409133171, 167038310, 3723798037, 481229484, 2300529668, 669449320, 200878442, 2493278499, 1749213251, 2865241146, 3007368026, 2997474649, 61894887, 587076155, 273016942, 1070582262, 505918635, 23034308, 3924500454, 2468818369, 2125949098, 314006257]),
+        new Uint32Array([1631487676, 2014102513, 953443421, 3819273563, 3690816124, 1568830555, 2638452881, 37852751, 2889061915, 415231903, 3819245836, 3815659918, 2508810382, 2489269221, 3237266407, 330023140, 476268970, 4288952004, 3945299883, 8944677, 4207811371, 1075478822, 3070151564, 781396827, 630162762, 4119926130, 3154074765, 815483117, 1654798206, 2247576316, 661331426, 287726369]),
+        new Uint32Array([331335543, 100699140, 1829194792, 3856786531, 2292190831, 1156844305, 1755632309, 614001638, 4000183339, 3257780231, 504832976, 546344401, 1973505568, 468320203, 346123020, 445855972, 4253065240, 3061306451, 1228489884, 3027961632, 665414574, 1310264282, 3766252592, 161254601, 4210899078, 809294842, 4232078184, 4079999986, 600315550, 2071018889, 2122118363, 664900596]),
+        new Uint32Array([3112199875, 2160549414, 77981071, 1371860976, 1945603681, 1525695529, 2984501541, 480143340, 102226679, 384728708, 66010772, 1638590771, 4045357583, 3141709936, 1834107916, 98010561, 756688763, 4254176114, 3783966670, 3307021701, 3139881775, 3011413858, 3995733170, 669541022, 1666444122, 2800232216, 3212886387, 1755378482, 1027848074, 3042380810, 585538674, 137795060]),
+        new Uint32Array([978329772, 1683765663, 707956192, 3856490312, 1744703649, 3524437344, 2596595696, 532409399, 2489942042, 1585517628, 3269125727, 2855585531, 2779983737, 691616309, 2724186890, 736497590, 63190747, 2533634201, 1998631762, 877660208, 555933398, 2746080880, 2885640799, 54114495, 3199875048, 134078211, 1968263343, 1195683762, 3953904028, 457423965, 2337885628, 457406161]),
+    ],
+    "random 256-bit scalars (seed 0xC0FFEE01)": [
+        new Uint32Array([4285222472, 2107923747, 3178217304, 2750348962, 2710598611, 919595168, 1273204129, 433252544, 4018829187, 859933918, 3201728438, 4128463879, 58820162, 2430203251, 3682299612, 308545755, 1714563950, 434589508, 3337931488, 673016347, 868301917, 1647789966, 1149901375, 746379183, 428129546, 35796987, 1439149183, 3569671037, 762016648, 2091450139, 693082977, 35045264]),
+        new Uint32Array([1325190136, 3209586074, 3028880709, 1268456344, 3762674953, 519830399, 3807881639, 295510730, 2084540421, 816084524, 2636506318, 3321096003, 3745242936, 3624613073, 2576394361, 196288546, 1902621851, 3148781050, 3068116554, 736117477, 1385195283, 1684888705, 2234163621, 307186105, 3542333073, 4158517866, 670449623, 3497540206, 1692761630, 2194608626, 1573029344, 361082190]),
+        new Uint32Array([481744281, 4225255594, 1077177395, 867650377, 3020861290, 1993612111, 4041864861, 334081727, 3012757076, 3601398334, 485219641, 3155285133, 49976473, 2767554128, 2680195305, 492597967, 3624265840, 736161206, 2915522884, 3215749325, 1746487277, 1830921786, 4275488552, 378030930, 1839599308, 3837622956, 4073892094, 3272125680, 2718098811, 3150590008, 1604663965, 642971927]),
+        new Uint32Array([3793318048, 2782105027, 3069130928, 2456256223, 2901850537, 2751912306, 4073345978, 634656226, 3522908551, 249782014, 704478951, 2628793067, 3960832425, 4199692410, 285852777, 789133241, 1312568679, 2730202383, 1782164321, 4047196824, 2932540541, 2466005280, 66783602, 694045302, 1938128695, 3930458153, 2207924051, 308645946, 3483780766, 3216080987, 2487766014, 777376206]),
+        new Uint32Array([1853646942, 1867442183, 619772395, 3318049244, 4020766461, 1161663030, 4120319530, 657313735, 3096899542, 3273137196, 4154807903, 1692590960, 708568332, 2775522578, 3172111283, 117296283, 29579340, 1652689001, 1412139493, 3728765065, 2749603528, 1715971973, 3138612600, 661153128, 755380265, 3286933364, 3997023270, 4128942657, 113106071, 2493622045, 259940411, 481602353]),
+        new Uint32Array([757052184, 197285659, 1087747558, 2965191966, 4160881091, 2574967270, 3041668504, 45975345, 433369033, 179204763, 3413216335, 2149966592, 546259399, 540031878, 1406514599, 797592210, 2939500787, 3837255731, 1497303094, 2528249341, 3994466221, 2632176436, 2835037496, 3243949, 2106790077, 1197504712, 1709119682, 2045457934, 2472496137, 4289860320, 849760624, 320649283]),
+        new Uint32Array([2293538236, 4061759365, 1370346173, 1455122868, 3370268348, 2008493089, 1460713707, 283511460, 2147745616, 2876296204, 1901434578, 3050606860, 3539254573, 89738582, 569900765, 748915624, 217221298, 3102412279, 2883969673, 522984606, 821050436, 3575038242, 3743594510, 646242473, 744694581, 4111437214, 2733682161, 865619591, 2390299533, 3797792832, 2832285264, 449342785]),
+        new Uint32Array([2577885652, 1375514726, 1266407968, 3485954545, 194255418, 2256537091, 2613274029, 717842562, 2397364736, 255956815, 532995150, 2886957712, 1542667009, 3996467473, 1414617526, 142147312, 773231571, 960232833, 3157061483, 1898194877, 2852569292, 3373158557, 619869725, 752415980, 3890579532, 2827876958, 3290613960, 1306093960, 2857758885, 4263962781, 1326430826, 218589316]),
+        new Uint32Array([3508166905, 3445155325, 1649388756, 2595334760, 1090482017, 2827683079, 1280793442, 197231217, 144979193, 4001954770, 1544756700, 480813556, 3914080246, 3371903345, 692415523, 767498001, 2865830323, 503552708, 3858342844, 155366586, 613691797, 1483122342, 1825867969, 440872175, 2806695751, 1720174745, 728168504, 1505335413, 4022184285, 1435834297, 342482757, 618199448]),
+        new Uint32Array([1108616859, 293303918, 611541099, 190792081, 4104010774, 4257311140, 1011324054, 713148112, 3731039292, 1372838741, 1883366658, 38981117, 2849419009, 1223838636, 4212618405, 433064237, 2503316794, 2555775387, 357023882, 1858157595, 1206101335, 3831695041, 551701572, 468310423, 744507832, 583231643, 3384256451, 4208924440, 126050627, 1237863344, 2359777762, 654969734]),
+        new Uint32Array([2274497186, 3600003342, 2974626895, 2891022790, 733511089, 2090180006, 3192959347, 728512829, 3624826024, 4121798617, 1920258959, 984608320, 769936126, 925183737, 3498231852, 411334810, 1205136354, 480018504, 3814898386, 1822686751, 223302352, 4287171888, 621912782, 83372504, 971456381, 3505647911, 2466392813, 3386028599, 2660081360, 1134585962, 3871407467, 195945787]),
+        new Uint32Array([2397232854, 913501089, 401599600, 734360650, 714168177, 3298960844, 1414058988, 101759369, 3461889544, 2757350102, 1003954591, 3682073185, 4074734465, 3353533840, 1405922363, 217054397, 825878727, 1187540352, 2379902476, 3312612098, 1967072528, 771606442, 2505679262, 138357786, 1689655207, 2508785691, 1454772969, 761092956, 1682230537, 856351194, 3520261097, 423045016]),
+        new Uint32Array([2517753959, 402475578, 4129107955, 4093816061, 1610718457, 1485418468, 831104227, 679989052, 3578744946, 1709960524, 896913266, 1617464536, 721564285, 4190311145, 1038781428, 285096762, 3048907353, 931924754, 764010570, 1901322196, 8699576, 2332886128, 2201520662, 789839746, 2449698752, 2239184405, 2253291610, 487706263, 1835013413, 3280120482, 464487061, 36129322]),
+        new Uint32Array([2788808171, 214794253, 2916346088, 3918714755, 3338922696, 3467160673, 3714463469, 361261969, 1949319781, 2236774503, 4097666887, 1922429683, 440048383, 517746716, 805479611, 344592947, 3011394722, 1456477050, 617934148, 4067781328, 1199369397, 724577750, 3111171289, 681421651, 2573831525, 120276180, 3794811733, 3466962598, 1124344943, 2107335862, 2335655712, 218707785]),
+        new Uint32Array([1995686347, 1734243186, 2821719499, 2236101364, 1396320841, 1601975815, 91115324, 150494235, 1688805134, 3653316817, 900701216, 3179433216, 2895055645, 1259283485, 2184446102, 269984170, 2356482445, 4144512609, 3426986770, 1466694210, 3687059228, 4210861882, 4233421789, 697240815, 3156382650, 1558392062, 357417045, 3895667527, 3028291056, 3365846035, 100008818, 648927679]),
+        new Uint32Array([1656831346, 1948673214, 1084653763, 278245744, 2924796461, 148530634, 4083279027, 217393557, 414457442, 1606419002, 1399714044, 1575306193, 159473195, 550974482, 3717444644, 686949836, 1195158227, 1962870771, 1248640974, 1745966840, 659038145, 1550714963, 744986728, 449012196, 3345383050, 561347737, 2223977251, 831838740, 3538719831, 2898144354, 3749717577, 10426098]),
+    ],
+    "near-modulus scalar (Fr - 1)": [new Uint32Array([45883430, 2390996433, 1232798066, 3706394933, 2541820639, 4223149639, 2945863739, 425146433, 2823577920, 2947838845, 1476581572, 1615060314, 1386229638, 166285564, 988445547, 352252035, 1343296337, 3665990009, 1926442772, 2567018489, 1583733342, 3098684244, 848518690, 124178311, 291808857, 3625398464, 905219537, 3140055407, 1313621990, 1649872888, 1295268775, 582987148])],
+};
+
+/**
+ * Convert a Jolt reference G2Affine (32 u32s) to G2Jacobian (48 u32s) by appending z = fp2_one.
+ * For identity (null), returns g2j_zero (x=fp2_one, y=fp2_one, z=fp2_zero).
+ */
+function affineToJacobian(affine) {
+    const jac = new Uint32Array(G2_JACOBIAN_WORDS);
+    if (affine === null) {
+        // identity: x = fp2_one, y = fp2_one, z = fp2_zero
+        jac.set(FP_ONE_MONT, 0);                  // x.c0 = R mod p
+        // x.c1 = 0 (already zeroed)
+        jac.set(FP_ONE_MONT, 2 * NUM_LIMBS);        // y.c0 = R mod p
+        // y.c1 = 0, z.c0 = 0, z.c1 = 0 (already zeroed)
+        return jac;
+    }
+    jac.set(affine, 0);                              // copy x.c0, x.c1, y.c0, y.c1
+    jac.set(FP_ONE_MONT, 4 * NUM_LIMBS);             // z.c0 = R mod p
+    // z.c1 = 0 (already zeroed)
+    return jac;
+}
+
+/**
+ * Build a flat G2Jacobian buffer from an array of Jolt reference values (null or Uint32Array).
+ */
+function buildJoltRefJacobians(refs) {
+    const out = new Uint32Array(refs.length * G2_JACOBIAN_WORDS);
+    for (let i = 0; i < refs.length; i++) {
+        out.set(affineToJacobian(refs[i]), i * G2_JACOBIAN_WORDS);
+    }
+    return out;
+}
+
+const statusEl = document.getElementById("status");
+const resultsBody = document.getElementById("results-body");
+
+function setStatus(msg, cls = "") {
+    statusEl.textContent = msg;
+    statusEl.className = cls;
+}
+
+function mulberry32(seed) {
+    let t = seed >>> 0;
+    return () => {
+        t = (t + 0x6d2b79f5) >>> 0;
+        let x = Math.imul(t ^ (t >>> 15), t | 1);
+        x ^= x + Math.imul(x ^ (x >>> 7), x | 61);
+        return ((x ^ (x >>> 14)) >>> 0);
+    };
+}
+
+function scalarFromU32(value) {
+    const out = new Uint32Array(NUM_LIMBS);
+    out[0] = value >>> 0;
+    return out;
+}
+
+function frModulusMinusU32(k) {
+    const out = new Uint32Array(FR_MODULUS);
+    let borrow = k >>> 0;
+    for (let i = 0; i < NUM_LIMBS; i += 1) {
+        const val = out[i] >>> 0;
+        const next = (val - borrow) >>> 0;
+        out[i] = next;
+        borrow = (val < borrow) ? 1 : 0;
+        if (borrow === 0) break;
+    }
+    return out;
+}
+
+function randomScalarBatch(count, seed) {
+    const rng = mulberry32(seed);
+    const out = new Uint32Array(count * NUM_LIMBS);
+    for (let i = 0; i < out.length; i += 1) {
+        out[i] = rng();
+    }
+    // Clear bit 255 of each scalar — GPU processes 255 bits (0-254) only
+    for (let s = 0; s < count; s += 1) {
+        out[s * NUM_LIMBS + 7] &= 0x7FFFFFFF;
+    }
+    return out;
+}
+
+function formatU32Limbs(limbs, offset, count = NUM_LIMBS) {
+    const words = [];
+    for (let i = 0; i < count; i += 1) {
+        words.push(`0x${(limbs[offset + i] >>> 0).toString(16).padStart(8, "0")}`);
+    }
+    return `[${words.join(", ")}]`;
+}
+
+function limbsToBigInt(limbs, offset) {
+    let out = 0n;
+    for (let i = NUM_LIMBS - 1; i >= 0; i -= 1) {
+        out = (out << 32n) + BigInt(limbs[offset + i] >>> 0);
+    }
+    return out;
+}
+
+function formatFp2Limbs(data, offset) {
+    const c0 = limbsToBigInt(data, offset);
+    const c1 = limbsToBigInt(data, offset + NUM_LIMBS);
+    return `c0=0x${c0.toString(16)}
+c1=0x${c1.toString(16)}`;
+}
+
+function formatG2Point(data, msmIdx) {
+    const base = msmIdx * G2_JACOBIAN_WORDS;
+    return [
+        "x:",
+        formatFp2Limbs(data, base),
+        "y:",
+        formatFp2Limbs(data, base + 16),
+        "z:",
+        formatFp2Limbs(data, base + 32),
+    ].join("\n");
+}
+
+function appendResultRow({ testName, numScalars, passedNaive, passedJolt, timing, mismatchDetail }) {
+    const row = document.createElement("tr");
+    const naiveCls = passedNaive ? "pass" : "fail";
+    const joltCls = passedJolt ? "pass" : "fail";
+    row.innerHTML = `
+        <td>${testName}</td>
+        <td>${numScalars}</td>
+        <td class="${naiveCls}">${passedNaive ? "PASS" : "FAIL"}</td>
+        <td class="${joltCls}">${passedJolt ? "PASS" : "FAIL"}</td>
+        <td>${timing}</td>
+    `;
+    resultsBody.appendChild(row);
+
+    if (mismatchDetail) {
+        const detailRow = document.createElement("tr");
+        detailRow.innerHTML = "<td colspan=\"5\"></td>";
+        const cell = detailRow.firstElementChild;
+        const details = document.createElement("details");
+        details.open = true;
+        const summary = document.createElement("summary");
+        summary.textContent = "Mismatch details";
+        const pre = document.createElement("pre");
+        pre.textContent = mismatchDetail;
+        details.appendChild(summary);
+        details.appendChild(pre);
+        cell.appendChild(details);
+        resultsBody.appendChild(detailRow);
+    }
+}
+
+async function fetchShaders() {
+    const entries = await Promise.all(Object.entries(SHADER_PATHS).map(async ([name, path]) => {
+        const resp = await fetch(path);
+        if (!resp.ok) {
+            throw new Error(`Failed to fetch ${path}: HTTP ${resp.status}`);
+        }
+        return [name, await resp.text()];
+    }));
+    return Object.fromEntries(entries);
+}
+
+function assertShaderCompiles(device, code, label) {
+    const module = device.createShaderModule({ code });
+    return module.getCompilationInfo().then((info) => {
+        const errors = info.messages.filter((m) => m.type === "error");
+        if (errors.length > 0) {
+            const reason = errors.map((e) => `${e.message} (line ${e.lineNum})`).join("; ");
+            throw new Error(`Shader compile failed [${label}]: ${reason}`);
+        }
+        return module;
+    });
+}
+
+const G2_ARITHMETIC = `
+fn g2j_is_zero(a: G2Jacobian) -> bool {
+    return fp2_is_zero(a.z);
+}
+
+fn g2j_zero() -> G2Jacobian {
+    var r: G2Jacobian;
+    r.x = fp2_one();
+    r.y = fp2_one();
+    r.z = fp2_zero();
+    return r;
+}
+
+fn g2j_from_affine(a: G2Affine) -> G2Jacobian {
+    var r: G2Jacobian;
+    r.x = a.x;
+    r.y = a.y;
+    r.z = fp2_one();
+    return r;
+}
+
+fn g2j_dbl(pt: G2Jacobian) -> G2Jacobian {
+    let x = pt.x;
+    let y = pt.y;
+    let z = pt.z;
+
+    let a = fp2_sqr(x);
+    let b = fp2_sqr(y);
+    let c = fp2_sqr(b);
+
+    let x1b = fp2_add(x, b);
+    let x1b2 = fp2_sqr(x1b);
+    let ac = fp2_add(a, c);
+    let x1b2ac = fp2_sub(x1b2, ac);
+    let d = fp2_double(x1b2ac);
+
+    let a2 = fp2_double(a);
+    let e = fp2_add(a2, a);
+
+    let f = fp2_sqr(e);
+
+    let d2 = fp2_double(d);
+    let x3 = fp2_sub(f, d2);
+
+    let c2 = fp2_double(c);
+    let c4 = fp2_double(c2);
+    let c8 = fp2_double(c4);
+
+    let dx3 = fp2_sub(d, x3);
+    let edx3 = fp2_mul(e, dx3);
+    let y3 = fp2_sub(edx3, c8);
+
+    let y1z1 = fp2_mul(y, z);
+    let z3 = fp2_double(y1z1);
+
+    var result: G2Jacobian;
+    result.x = x3;
+    result.y = y3;
+    result.z = z3;
+    return result;
+}
+
+fn g2j_madd(a_pt: G2Jacobian, b_pt: G2Affine) -> G2Jacobian {
+    if (g2j_is_zero(a_pt)) {
+        return g2j_from_affine(b_pt);
+    }
+
+    let x1 = a_pt.x;
+    let y1 = a_pt.y;
+    let z1 = a_pt.z;
+    let x2 = b_pt.x;
+    let y2 = b_pt.y;
+
+    let z1z1 = fp2_sqr(z1);
+
+    let u2 = fp2_mul(x2, z1z1);
+
+    let temp_s2 = fp2_mul(y2, z1);
+    let s2 = fp2_mul(temp_s2, z1z1);
+
+    let h = fp2_sub(u2, x1);
+
+    if (fp2_is_zero(h)) {
+        let s2_minus_y1 = fp2_sub(s2, y1);
+        if (fp2_is_zero(s2_minus_y1)) {
+            return g2j_dbl(a_pt);
+        } else {
+            return g2j_zero();
+        }
+    }
+
+    let hh = fp2_sqr(h);
+
+    var i_val = fp2_double(hh);
+    i_val = fp2_double(i_val);
+
+    let j = fp2_mul(h, i_val);
+
+    let s2_minus_y1 = fp2_sub(s2, y1);
+    let r = fp2_double(s2_minus_y1);
+
+    let v = fp2_mul(x1, i_val);
+
+    let r2 = fp2_sqr(r);
+    let v2 = fp2_double(v);
+    let jv2 = fp2_add(j, v2);
+    let x3 = fp2_sub(r2, jv2);
+
+    let v_minus_x3 = fp2_sub(v, x3);
+    let r_vmx3 = fp2_mul(r, v_minus_x3);
+    let y1j = fp2_mul(y1, j);
+    let y1j2 = fp2_double(y1j);
+    let y3 = fp2_sub(r_vmx3, y1j2);
+
+    let z1_plus_h = fp2_add(z1, h);
+    let z1_plus_h_sq = fp2_sqr(z1_plus_h);
+    let temp_z = fp2_sub(z1_plus_h_sq, z1z1);
+    let z3 = fp2_sub(temp_z, hh);
+
+    var result: G2Jacobian;
+    result.x = x3;
+    result.y = y3;
+    result.z = z3;
+    return result;
+}
+`;
+
+function buildTableShaderSource(commonCode) {
+    return `${commonCode}
+${G2_ARITHMETIC}
+@group(0) @binding(0) var<storage, read> base_point: array<u32>;
+@group(0) @binding(1) var<storage, read_write> table_out: array<u32>;
+
+fn g2_read_affine_from(offset: u32) -> G2Affine {
+    var pt: G2Affine;
+    for (var i = 0u; i < NUM_LIMBS; i = i + 1u) {
+        pt.x.c0.limbs[i] = base_point[offset + 0u * NUM_LIMBS + i];
+        pt.x.c1.limbs[i] = base_point[offset + 1u * NUM_LIMBS + i];
+        pt.y.c0.limbs[i] = base_point[offset + 2u * NUM_LIMBS + i];
+        pt.y.c1.limbs[i] = base_point[offset + 3u * NUM_LIMBS + i];
+    }
+    return pt;
+}
+
+fn g2_write_affine(offset: u32, pt: G2Affine) {
+    for (var i = 0u; i < NUM_LIMBS; i = i + 1u) {
+        table_out[offset + 0u * NUM_LIMBS + i] = pt.x.c0.limbs[i];
+        table_out[offset + 1u * NUM_LIMBS + i] = pt.x.c1.limbs[i];
+        table_out[offset + 2u * NUM_LIMBS + i] = pt.y.c0.limbs[i];
+        table_out[offset + 3u * NUM_LIMBS + i] = pt.y.c1.limbs[i];
+    }
+}
+
+fn g2j_to_affine(pt: G2Jacobian) -> G2Affine {
+    var out: G2Affine;
+    if (g2j_is_zero(pt)) {
+        out.x = fp2_one();
+        out.y = fp2_one();
+        return out;
+    }
+    let z_inv = fp2_inv(pt.z);
+    let z2_inv = fp2_mul(z_inv, z_inv);
+    let z3_inv = fp2_mul(z2_inv, z_inv);
+    out.x = fp2_mul(pt.x, z2_inv);
+    out.y = fp2_mul(pt.y, z3_inv);
+    return out;
+}
+
+@compute @workgroup_size(1, 1, 1)
+fn build_g2_table(@builtin(global_invocation_id) gid: vec3<u32>) {
+    if (gid.x > 0u || gid.y > 0u || gid.z > 0u) {
+        return;
+    }
+
+    let base_aff = g2_read_affine_from(0u);
+    var power = g2j_from_affine(base_aff);
+
+    for (var w = 0u; w < 51u; w = w + 1u) {
+        let power_aff = g2j_to_affine(power);
+        var multiple = g2j_from_affine(power_aff);
+
+        for (var j = 0u; j < 31u; j = j + 1u) {
+            let aff = g2j_to_affine(multiple);
+            let offset = (w * 31u + j) * 32u;
+            g2_write_affine(offset, aff);
+            multiple = g2j_madd(multiple, power_aff);
+        }
+
+        for (var d = 0u; d < 5u; d = d + 1u) {
+            power = g2j_dbl(power);
+        }
+    }
+}
+`;
+}
+
+function buildNaiveShaderSource(commonCode) {
+    return `${commonCode}
+${G2_ARITHMETIC}
+@group(0) @binding(0) var<storage, read> ref_base: array<u32>;
+@group(0) @binding(1) var<storage, read> ref_scalars: array<u32>;
+@group(0) @binding(2) var<storage, read> ref_params: array<u32>;
+@group(0) @binding(3) var<storage, read_write> ref_results: array<u32>;
+
+fn g2_read_affine_from(offset: u32) -> G2Affine {
+    var pt: G2Affine;
+    for (var i = 0u; i < NUM_LIMBS; i = i + 1u) {
+        pt.x.c0.limbs[i] = ref_base[offset + 0u * NUM_LIMBS + i];
+        pt.x.c1.limbs[i] = ref_base[offset + 1u * NUM_LIMBS + i];
+        pt.y.c0.limbs[i] = ref_base[offset + 2u * NUM_LIMBS + i];
+        pt.y.c1.limbs[i] = ref_base[offset + 3u * NUM_LIMBS + i];
+    }
+    return pt;
+}
+
+fn g2_read_scalar_from(offset: u32) -> BigInt {
+    var s: BigInt;
+    for (var i = 0u; i < NUM_LIMBS; i = i + 1u) {
+        s.limbs[i] = ref_scalars[offset + i];
+    }
+    return s;
+}
+
+fn g2_write_jacobian_to(offset: u32, pt: G2Jacobian) {
+    for (var i = 0u; i < NUM_LIMBS; i = i + 1u) {
+        ref_results[offset + 0u * NUM_LIMBS + i] = pt.x.c0.limbs[i];
+        ref_results[offset + 1u * NUM_LIMBS + i] = pt.x.c1.limbs[i];
+        ref_results[offset + 2u * NUM_LIMBS + i] = pt.y.c0.limbs[i];
+        ref_results[offset + 3u * NUM_LIMBS + i] = pt.y.c1.limbs[i];
+        ref_results[offset + 4u * NUM_LIMBS + i] = pt.z.c0.limbs[i];
+        ref_results[offset + 5u * NUM_LIMBS + i] = pt.z.c1.limbs[i];
+    }
+}
+
+fn scalar_bit(s: BigInt, bit: u32) -> u32 {
+    let limb_idx = bit / 32u;
+    let bit_pos = bit % 32u;
+    return (s.limbs[limb_idx] >> bit_pos) & 1u;
+}
+
+@compute @workgroup_size(64, 1, 1)
+fn naive_g2_scalar_mul(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let tid = gid.x;
+    if (tid >= ref_params[0]) {
+        return;
+    }
+
+    let base_aff = g2_read_affine_from(0u);
+    let scalar = g2_read_scalar_from(tid * 8u);
+
+    var acc = g2j_zero();
+
+    for (var bit: i32 = 254; bit >= 0; bit = bit - 1) {
+        acc = g2j_dbl(acc);
+        if (scalar_bit(scalar, u32(bit)) == 1u) {
+            acc = g2j_madd(acc, base_aff);
+        }
+    }
+
+    g2_write_jacobian_to(tid * 48u, acc);
+}
+`;
+}
+
+function buildComparatorShaderSource(commonCode) {
+    return `${commonCode}
+${G2_ARITHMETIC}
+@group(0) @binding(0) var<storage, read> lhs: array<u32>;
+@group(0) @binding(1) var<storage, read> rhs: array<u32>;
+@group(0) @binding(2) var<storage, read_write> g2_out_flags: array<u32>;
+
+fn fp2_eq(a: Fp2, b: Fp2) -> bool {
+    return bigint_eq(a.c0, b.c0) && bigint_eq(a.c1, b.c1);
+}
+
+fn read_g2_jac_lhs(offset: u32) -> G2Jacobian {
+    var pt: G2Jacobian;
+    for (var i = 0u; i < NUM_LIMBS; i = i + 1u) {
+        pt.x.c0.limbs[i] = lhs[offset + 0u * NUM_LIMBS + i];
+        pt.x.c1.limbs[i] = lhs[offset + 1u * NUM_LIMBS + i];
+        pt.y.c0.limbs[i] = lhs[offset + 2u * NUM_LIMBS + i];
+        pt.y.c1.limbs[i] = lhs[offset + 3u * NUM_LIMBS + i];
+        pt.z.c0.limbs[i] = lhs[offset + 4u * NUM_LIMBS + i];
+        pt.z.c1.limbs[i] = lhs[offset + 5u * NUM_LIMBS + i];
+    }
+    return pt;
+}
+
+fn read_g2_jac_rhs(offset: u32) -> G2Jacobian {
+    var pt: G2Jacobian;
+    for (var i = 0u; i < NUM_LIMBS; i = i + 1u) {
+        pt.x.c0.limbs[i] = rhs[offset + 0u * NUM_LIMBS + i];
+        pt.x.c1.limbs[i] = rhs[offset + 1u * NUM_LIMBS + i];
+        pt.y.c0.limbs[i] = rhs[offset + 2u * NUM_LIMBS + i];
+        pt.y.c1.limbs[i] = rhs[offset + 3u * NUM_LIMBS + i];
+        pt.z.c0.limbs[i] = rhs[offset + 4u * NUM_LIMBS + i];
+        pt.z.c1.limbs[i] = rhs[offset + 5u * NUM_LIMBS + i];
+    }
+    return pt;
+}
+
+@compute @workgroup_size(64, 1, 1)
+fn compare_g2_results(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let idx = gid.x;
+    if (idx >= arrayLength(&g2_out_flags)) {
+        return;
+    }
+
+    let a = read_g2_jac_lhs(idx * 48u);
+    let b = read_g2_jac_rhs(idx * 48u);
+
+    if (g2j_is_zero(a) && g2j_is_zero(b)) {
+        g2_out_flags[idx] = 1u;
+        return;
+    }
+    if (g2j_is_zero(a) != g2j_is_zero(b)) {
+        g2_out_flags[idx] = 0u;
+        return;
+    }
+
+    let z1z1 = fp2_sqr(a.z);
+    let z2z2 = fp2_sqr(b.z);
+    let x1n = fp2_mul(a.x, z2z2);
+    let x2n = fp2_mul(b.x, z1z1);
+    if (!fp2_eq(x1n, x2n)) {
+        g2_out_flags[idx] = 0u;
+        return;
+    }
+
+    let z1z3 = fp2_mul(z1z1, a.z);
+    let z2z3 = fp2_mul(z2z2, b.z);
+    let y1n = fp2_mul(a.y, z2z3);
+    let y2n = fp2_mul(b.y, z1z3);
+    g2_out_flags[idx] = select(0u, 1u, fp2_eq(y1n, y2n));
+}
+`;
+}
+
+async function createTableBuilder(device, commonCode) {
+    const source = buildTableShaderSource(commonCode);
+    const module = await assertShaderCompiles(device, source, "g2-table-builder");
+    const bgl = device.createBindGroupLayout({
+        entries: [
+            { binding: 0, visibility: GPUShaderStage.COMPUTE, buffer: { type: "read-only-storage" } },
+            { binding: 1, visibility: GPUShaderStage.COMPUTE, buffer: { type: "storage" } },
+        ],
+    });
+    const pipeline = device.createComputePipeline({
+        layout: device.createPipelineLayout({ bindGroupLayouts: [bgl] }),
+        compute: { module, entryPoint: "build_g2_table" },
+    });
+    return { bgl, pipeline };
+}
+
+async function createNaiveRunner(device, commonCode) {
+    const source = buildNaiveShaderSource(commonCode);
+    const module = await assertShaderCompiles(device, source, "g2-naive-ref");
+    const bgl = device.createBindGroupLayout({
+        entries: [
+            { binding: 0, visibility: GPUShaderStage.COMPUTE, buffer: { type: "read-only-storage" } },
+            { binding: 1, visibility: GPUShaderStage.COMPUTE, buffer: { type: "read-only-storage" } },
+            { binding: 2, visibility: GPUShaderStage.COMPUTE, buffer: { type: "read-only-storage" } },
+            { binding: 3, visibility: GPUShaderStage.COMPUTE, buffer: { type: "storage" } },
+        ],
+    });
+    const pipeline = device.createComputePipeline({
+        layout: device.createPipelineLayout({ bindGroupLayouts: [bgl] }),
+        compute: { module, entryPoint: "naive_g2_scalar_mul" },
+    });
+    return { bgl, pipeline };
+}
+
+async function createComparator(device, commonCode) {
+    const source = buildComparatorShaderSource(commonCode);
+    const module = await assertShaderCompiles(device, source, "g2-result-compare");
+    const bgl = device.createBindGroupLayout({
+        entries: [
+            { binding: 0, visibility: GPUShaderStage.COMPUTE, buffer: { type: "read-only-storage" } },
+            { binding: 1, visibility: GPUShaderStage.COMPUTE, buffer: { type: "read-only-storage" } },
+            { binding: 2, visibility: GPUShaderStage.COMPUTE, buffer: { type: "storage" } },
+        ],
+    });
+    const pipeline = device.createComputePipeline({
+        layout: device.createPipelineLayout({ bindGroupLayouts: [bgl] }),
+        compute: { module, entryPoint: "compare_g2_results" },
+    });
+    return { bgl, pipeline };
+}
+
+function createBuffer(device, size, usage, label) {
+    return device.createBuffer({ size: Math.max(size, 4), usage, label });
+}
+
+async function readBufferU32(device, srcBuffer, byteLength) {
+    const staging = createBuffer(device, byteLength, GPUBufferUsage.COPY_DST | GPUBufferUsage.MAP_READ, "staging");
+    const enc = device.createCommandEncoder();
+    enc.copyBufferToBuffer(srcBuffer, 0, staging, 0, byteLength);
+    device.queue.submit([enc.finish()]);
+    await staging.mapAsync(GPUMapMode.READ);
+    const out = new Uint32Array(staging.getMappedRange().slice(0));
+    staging.unmap();
+    staging.destroy();
+    return out;
+}
+
+async function buildFixedBaseTable(device, tableBuilder, basePointLimbs) {
+    const baseBuf = createBuffer(device, basePointLimbs.byteLength, GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST, "g2-base");
+    const tableByteLength = G2_TABLE_WORDS * 4;
+    const tableBuf = createBuffer(device, tableByteLength, GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC, "g2-table");
+
+    device.queue.writeBuffer(baseBuf, 0, basePointLimbs);
+
+    const bg = device.createBindGroup({
+        layout: tableBuilder.bgl,
+        entries: [
+            { binding: 0, resource: { buffer: baseBuf } },
+            { binding: 1, resource: { buffer: tableBuf } },
+        ],
+    });
+
+    const enc = device.createCommandEncoder();
+    const pass = enc.beginComputePass();
+    pass.setPipeline(tableBuilder.pipeline);
+    pass.setBindGroup(0, bg);
+    pass.dispatchWorkgroups(1, 1, 1);
+    pass.end();
+    device.queue.submit([enc.finish()]);
+
+    const table = await readBufferU32(device, tableBuf, tableByteLength);
+    baseBuf.destroy();
+    tableBuf.destroy();
+    return table;
+}
+
+async function runNaiveG2ScalarMul(device, naive, basePointLimbs, scalarLimbs, numScalars) {
+    const baseBuf = createBuffer(device, basePointLimbs.byteLength, GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST, "naive-base");
+    const scalarBuf = createBuffer(device, scalarLimbs.byteLength, GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST, "naive-scalars");
+    const params = new Uint32Array([numScalars]);
+    const paramsBuf = createBuffer(device, params.byteLength, GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST, "naive-params");
+    const resultByteLength = numScalars * G2_JACOBIAN_WORDS * 4;
+    const resultsBuf = createBuffer(device, resultByteLength, GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC, "naive-results");
+
+    device.queue.writeBuffer(baseBuf, 0, basePointLimbs);
+    device.queue.writeBuffer(scalarBuf, 0, scalarLimbs);
+    device.queue.writeBuffer(paramsBuf, 0, params);
+
+    const bg = device.createBindGroup({
+        layout: naive.bgl,
+        entries: [
+            { binding: 0, resource: { buffer: baseBuf } },
+            { binding: 1, resource: { buffer: scalarBuf } },
+            { binding: 2, resource: { buffer: paramsBuf } },
+            { binding: 3, resource: { buffer: resultsBuf } },
+        ],
+    });
+
+    const enc = device.createCommandEncoder();
+    const pass = enc.beginComputePass();
+    pass.setPipeline(naive.pipeline);
+    pass.setBindGroup(0, bg);
+    pass.dispatchWorkgroups(Math.ceil(numScalars / 64), 1, 1);
+    pass.end();
+    device.queue.submit([enc.finish()]);
+
+    const results = await readBufferU32(device, resultsBuf, resultByteLength);
+    baseBuf.destroy();
+    scalarBuf.destroy();
+    paramsBuf.destroy();
+    resultsBuf.destroy();
+    return results;
+}
+
+async function compareProjective(device, comparator, lhs, rhs, numScalars) {
+    const byteLength = numScalars * G2_JACOBIAN_WORDS * 4;
+    const lhsBuf = createBuffer(device, byteLength, GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST, "cmp-lhs");
+    const rhsBuf = createBuffer(device, byteLength, GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST, "cmp-rhs");
+    const flagsBuf = createBuffer(device, numScalars * 4, GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC, "cmp-flags");
+
+    device.queue.writeBuffer(lhsBuf, 0, lhs);
+    device.queue.writeBuffer(rhsBuf, 0, rhs);
+
+    const bg = device.createBindGroup({
+        layout: comparator.bgl,
+        entries: [
+            { binding: 0, resource: { buffer: lhsBuf } },
+            { binding: 1, resource: { buffer: rhsBuf } },
+            { binding: 2, resource: { buffer: flagsBuf } },
+        ],
+    });
+
+    const enc = device.createCommandEncoder();
+    const pass = enc.beginComputePass();
+    pass.setPipeline(comparator.pipeline);
+    pass.setBindGroup(0, bg);
+    pass.dispatchWorkgroups(Math.ceil(numScalars / 64), 1, 1);
+    pass.end();
+    device.queue.submit([enc.finish()]);
+
+    const flags = await readBufferU32(device, flagsBuf, numScalars * 4);
+    lhsBuf.destroy();
+    rhsBuf.destroy();
+    flagsBuf.destroy();
+    return flags;
+}
+
+function buildTests() {
+    const small = new Uint32Array(8 * NUM_LIMBS);
+    for (let i = 0; i < 8; i += 1) {
+        small.set(scalarFromU32(i + 1), i * NUM_LIMBS);
+    }
+
+    return [
+        {
+            name: "scalar = 1",
+            scalars: scalarFromU32(1),
+            numScalars: 1,
+        },
+        {
+            name: "scalar = 2",
+            scalars: scalarFromU32(2),
+            numScalars: 1,
+        },
+        {
+            name: "scalar = 0",
+            scalars: scalarFromU32(0),
+            numScalars: 1,
+        },
+        {
+            name: "small scalars 1-8",
+            scalars: small,
+            numScalars: 8,
+        },
+        {
+            name: "random 256-bit scalars (seed 0xC0FFEE01)",
+            scalars: randomScalarBatch(16, 0xC0FFEE01),
+            numScalars: 16,
+        },
+        {
+            name: "near-modulus scalar (Fr - 1)",
+            scalars: frModulusMinusU32(1),
+            numScalars: 1,
+        },
+    ];
+}
+
+async function run() {
+    if (!navigator.gpu) {
+        setStatus("WebGPU unavailable in this browser.", "fail");
+        return;
+    }
+
+    try {
+        const adapter = await navigator.gpu.requestAdapter();
+        if (!adapter) {
+            setStatus("No WebGPU adapter found.", "fail");
+            return;
+        }
+
+        const device = await adapter.requestDevice();
+        const shaders = await fetchShaders();
+        await assertShaderCompiles(device, `${shaders.common}\n${shaders.g2Kernel}`, "g2_fixed_base_mul.wgsl");
+
+        const g2Ready = await initGpuG2(device);
+        if (!g2Ready) {
+            setStatus("Failed to initialize gpu-g2.js.", "fail");
+            return;
+        }
+
+        const tableBuilder = await createTableBuilder(device, shaders.common);
+        const naive = await createNaiveRunner(device, shaders.common);
+        const comparator = await createComparator(device, shaders.common);
+
+        setStatus("Building G2 fixed-base table on GPU...", "warn");
+        const tableStart = performance.now();
+        const tableLimbs = await buildFixedBaseTable(device, tableBuilder, G2_GENERATOR_MONT);
+        const tableEnd = performance.now();
+        const tableBuildMs = tableEnd - tableStart;
+
+        if (tableLimbs.length !== G2_TABLE_WORDS) {
+            throw new Error(`Unexpected table size: got ${tableLimbs.length}, expected ${G2_TABLE_WORDS}`);
+        }
+
+        const tests = buildTests();
+        const totalTests = tests.length + 1; // +1 for table entry 0 check
+        let passCount = 0;
+
+        // Verify table entry 0 matches the generator (from arkworks)
+        {
+            const EXPECTED_TABLE_ENTRY_0 = new Uint32Array([
+                45883430, 2390996433, 1232798066, 3706394933, 2541820639, 4223149639, 2945863739, 425146433,
+                2823577920, 2947838845, 1476581572, 1615060314, 1386229638, 166285564, 988445547, 352252035,
+                2288773622, 1637743261, 4120812408, 4269789847, 589004286, 4288551522, 2929607174, 687701739,
+                3340261102, 1678334806, 847068347, 3696752930, 859115638, 1442395582, 2482857090, 228892902,
+            ]);
+            let tableEntry0Match = true;
+            for (let i = 0; i < G2_AFFINE_WORDS; i++) {
+                if (tableLimbs[i] !== EXPECTED_TABLE_ENTRY_0[i]) {
+                    tableEntry0Match = false;
+                    break;
+                }
+            }
+            appendResultRow({
+                testName: "table entry 0 = generator (arkworks ref)",
+                numScalars: "-",
+                passedNaive: tableEntry0Match,
+                passedJolt: tableEntry0Match,
+                timing: `table ${tableBuildMs.toFixed(1)}ms`,
+                mismatchDetail: tableEntry0Match ? "" : `GPU table[0]: ${formatU32Limbs(tableLimbs, 0, G2_AFFINE_WORDS)}\nExpected:     ${formatU32Limbs(EXPECTED_TABLE_ENTRY_0, 0, G2_AFFINE_WORDS)}`,
+            });
+            if (tableEntry0Match) passCount += 1;
+        }
+
+        for (const test of tests) {
+            setStatus(`Running: ${test.name}...`, "warn");
+
+            const t0 = performance.now();
+            const fixedBaseResult = await gpuG2FixedBaseScalarMul(tableLimbs, test.scalars, test.numScalars);
+            const t1 = performance.now();
+
+            const naiveResult = await runNaiveG2ScalarMul(
+                device,
+                naive,
+                G2_GENERATOR_MONT,
+                test.scalars,
+                test.numScalars,
+            );
+            const t2 = performance.now();
+
+            // Compare fixed-base vs naive GPU
+            const naiveFlags = await compareProjective(device, comparator, fixedBaseResult, naiveResult, test.numScalars);
+            const t3 = performance.now();
+
+            const naiveBad = [];
+            for (let i = 0; i < naiveFlags.length; i += 1) {
+                if (naiveFlags[i] !== 1) naiveBad.push(i);
+            }
+            const passedNaive = naiveBad.length === 0;
+
+            // Compare fixed-base vs Jolt reference (arkworks)
+            const joltRefs = JOLT_REF[test.name];
+            let passedJolt = false;
+            let joltDetail = "";
+            if (joltRefs) {
+                const joltJacobians = buildJoltRefJacobians(joltRefs);
+                const joltFlags = await compareProjective(device, comparator, fixedBaseResult, joltJacobians, test.numScalars);
+                const joltBad = [];
+                for (let i = 0; i < joltFlags.length; i += 1) {
+                    if (joltFlags[i] !== 1) joltBad.push(i);
+                }
+                passedJolt = joltBad.length === 0;
+                if (!passedJolt) {
+                    const subset = joltBad.slice(0, 3);
+                    joltDetail = subset.map((idx) => {
+                        return [
+                            `Scalar index ${idx}`,
+                            `GPU result:\n${formatG2Point(fixedBaseResult, idx)}`,
+                            `Jolt (arkworks):\n${formatG2Point(joltJacobians, idx)}`,
+                        ].join("\n");
+                    }).join("\n\n");
+                }
+            } else {
+                joltDetail = "No Jolt reference for this test";
+            }
+            const t4 = performance.now();
+
+            if (passedNaive && passedJolt) passCount += 1;
+
+            let mismatchDetail = "";
+            if (!passedNaive) {
+                const subset = naiveBad.slice(0, 3);
+                mismatchDetail += "[vs Naive GPU]\n" + subset.map((idx) => {
+                    return [
+                        `Scalar index ${idx}`,
+                        `Fixed-base:\n${formatG2Point(fixedBaseResult, idx)}`,
+                        `Naive:\n${formatG2Point(naiveResult, idx)}`,
+                    ].join("\n");
+                }).join("\n\n");
+            }
+            if (!passedJolt && joltDetail) {
+                if (mismatchDetail) mismatchDetail += "\n\n";
+                mismatchDetail += "[vs Jolt arkworks]\n" + joltDetail;
+            }
+
+            appendResultRow({
+                testName: test.name,
+                numScalars: test.numScalars,
+                passedNaive,
+                passedJolt,
+                timing: `table ${tableBuildMs.toFixed(1)}ms, fixed ${(t1 - t0).toFixed(1)}ms, naive ${(t2 - t1).toFixed(1)}ms, jolt-cmp ${(t4 - t3).toFixed(1)}ms`,
+                mismatchDetail,
+            });
+        }
+
+        // ---------------------------------------------------------------
+        // Caching benchmark: upload table once, then multiple scalar muls
+        // ---------------------------------------------------------------
+        {
+            const benchScalars = randomScalarBatch(16, 0xDEADBEEF);
+            const tableLimbsArr = new Uint32Array(tableLimbs);
+
+            // Non-cached path: full table + scalar mul each time
+            const ncTimes = [];
+            for (let i = 0; i < 3; i++) {
+                const t0 = performance.now();
+                await gpuG2FixedBaseScalarMul(tableLimbsArr, benchScalars, 16);
+                ncTimes.push(performance.now() - t0);
+            }
+            const ncAvg = ncTimes.reduce((a, b) => a + b, 0) / ncTimes.length;
+
+            // Cached path: upload once, then scalar muls only
+            const uploadT0 = performance.now();
+            gpuG2UploadTable(tableLimbsArr);
+            const uploadTime = performance.now() - uploadT0;
+
+            const cTimes = [];
+            for (let i = 0; i < 3; i++) {
+                const t0 = performance.now();
+                await gpuG2ScalarMulCached(benchScalars, 16);
+                cTimes.push(performance.now() - t0);
+            }
+            const cAvg = cTimes.reduce((a, b) => a + b, 0) / cTimes.length;
+
+            // Verify correctness: cached result should match non-cached
+            const refResult = await gpuG2FixedBaseScalarMul(tableLimbsArr, benchScalars, 16);
+            const cachedResult = await gpuG2ScalarMulCached(benchScalars, 16);
+            const cmpFlags = await compareProjective(device, comparator, refResult, cachedResult, 16);
+            const allMatch = Array.from(cmpFlags).every(f => f === 1);
+
+            appendResultRow({
+                testName: `cache benchmark (16 scalars)`,
+                numScalars: 16,
+                passedNaive: allMatch,
+                passedJolt: allMatch,
+                timing: `upload: ${uploadTime.toFixed(1)}ms, cached: ${cAvg.toFixed(1)}ms, non-cached: ${ncAvg.toFixed(1)}ms`,
+                mismatchDetail: allMatch ? '' : 'Cached result does not match non-cached result',
+            });
+            if (allMatch) passCount += 1;
+            // Adjust total
+        }
+
+        setStatus(
+            `Done: ${passCount}/${totalTests + 1} tests passed.`,
+            passCount === totalTests + 1 ? "pass" : "fail",
+        );
+    } catch (err) {
+        console.error(err);
+        setStatus(`Error: ${err instanceof Error ? err.message : String(err)}`, "fail");
+    }
+}
+
+run();
+</script>
+</body>
+</html>
