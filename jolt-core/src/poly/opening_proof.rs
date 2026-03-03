@@ -324,7 +324,7 @@ impl<F: JoltField> DoryOpeningState<F> {
         one_hot_params: OneHotParams,
         trace_source: TraceSource,
         rlc_streaming_data: Arc<RLCStreamingData>,
-        mut opening_hints: HashMap<CommittedPolynomial, PCS::OpeningProofHint>,
+        opening_hints: HashMap<CommittedPolynomial, PCS::OpeningProofHint>,
         advice_polys: HashMap<CommittedPolynomial, MultilinearPolynomial<F>>,
     ) -> (MultilinearPolynomial<F>, PCS::OpeningProofHint) {
         let (joint_poly, hints, coeffs) = self.build_streaming_rlc_poly_only::<PCS>(

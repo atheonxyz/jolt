@@ -577,7 +577,6 @@ impl<
             opening_claims,
             trace_length: self.trace.len(),
             ram_K: self.one_hot_params.ram_k,
-            bytecode_K: self.one_hot_params.bytecode_k,
             rw_config: self.rw_config.clone(),
             one_hot_config: self.one_hot_params.to_config(),
             dory_layout: DoryGlobals::get_layout(),
@@ -603,11 +602,21 @@ impl<
     pub async fn prove_with_gpu(
         mut self,
     ) -> (
-        JoltProof<F, PCS, ProofTranscript>,
+        JoltProof<F, C, PCS, ProofTranscript>,
         Option<ProverDebugInfo<F, ProofTranscript, PCS>>,
-    ) {
+    )
+    where
+        PCS: StreamingCommitmentScheme<
+            Field = F,
+            ProverSetup = crate::poly::commitment::dory::ArkworksProverSetup,
+            Commitment = crate::poly::commitment::dory::ArkGT,
+            OpeningProofHint = crate::poly::commitment::dory::DoryOpeningProofHint,
+            ChunkState = Vec<crate::poly::commitment::dory::ArkG1>,
+        >,
+    {
         let _pprof_prove = pprof_scope!("prove");
 
+        #[cfg(not(target_arch = "wasm32"))]
         let start = Instant::now();
         fiat_shamir_preamble(
             &self.program_io,
@@ -621,7 +630,8 @@ impl<
             self.preprocessing.shared.bytecode.code_size
         );
 
-        let (commitments, mut opening_proof_hints) = self.generate_and_commit_witness_polynomials();
+        let (commitments, mut opening_proof_hints) =
+            self.generate_and_commit_witness_polynomials_gpu().await;
         let untrusted_advice_commitment = self.generate_and_commit_untrusted_advice();
         self.generate_and_commit_trusted_advice();
 
@@ -697,13 +707,16 @@ impl<
             dory_layout: DoryGlobals::get_layout(),
         };
 
-        let prove_duration = start.elapsed();
-        tracing::info!(
-            "Proved in {:.1}s ({:.1} kHz / padded {:.1} kHz)",
-            prove_duration.as_secs_f64(),
-            self.unpadded_trace_len as f64 / prove_duration.as_secs_f64() / 1000.0,
-            self.padded_trace_len as f64 / prove_duration.as_secs_f64() / 1000.0,
-        );
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            let prove_duration = start.elapsed();
+            tracing::info!(
+                "Proved in {:.1}s ({:.1} kHz / padded {:.1} kHz)",
+                prove_duration.as_secs_f64(),
+                self.unpadded_trace_len as f64 / prove_duration.as_secs_f64() / 1000.0,
+                self.padded_trace_len as f64 / prove_duration.as_secs_f64() / 1000.0,
+            );
+        }
 
         (proof, debug_info)
     }
@@ -881,6 +894,329 @@ impl<
         };
 
         // Append commitments to transcript
+        for commitment in &commitments {
+            self.transcript
+                .append_serializable(b"commitment", commitment);
+        }
+
+        (commitments, hint_map)
+    }
+
+    #[cfg(all(feature = "webgpu-pairing", target_arch = "wasm32"))]
+    #[tracing::instrument(skip_all, name = "generate_and_commit_witness_polynomials_gpu")]
+    async fn generate_and_commit_witness_polynomials_gpu(
+        &mut self,
+    ) -> (
+        Vec<PCS::Commitment>,
+        HashMap<CommittedPolynomial, PCS::OpeningProofHint>,
+    )
+    where
+        PCS: StreamingCommitmentScheme<
+            Field = F,
+            ProverSetup = crate::poly::commitment::dory::ArkworksProverSetup,
+            Commitment = crate::poly::commitment::dory::ArkGT,
+            OpeningProofHint = crate::poly::commitment::dory::DoryOpeningProofHint,
+            ChunkState = Vec<crate::poly::commitment::dory::ArkG1>,
+        >,
+    {
+        use crate::poly::commitment::dory::{
+            webgpu_msm, webgpu_onehot, webgpu_pairing, ArkG1, ArkG2, ArkGT,
+            DoryOpeningProofHint, BN254,
+        };
+        use crate::zkvm::instruction::LookupQuery;
+        use crate::zkvm::ram::remap_address;
+        use ark_bn254::G1Affine;
+        use ark_ec::CurveGroup;
+        use ark_ff::Zero;
+        use common::constants::XLEN;
+        use dory::primitives::arithmetic::PairingCurve;
+        use wasm_bindgen::JsCast;
+
+        let _guard = DoryGlobals::initialize_context(
+            1 << self.one_hot_params.log_k_chunk,
+            self.padded_trace_len,
+            DoryContext::Main,
+            Some(DoryGlobals::get_layout()),
+        );
+
+        let polys = all_committed_polynomials(&self.one_hot_params);
+        let T = DoryGlobals::get_T();
+
+        if DoryGlobals::get_layout() == DoryLayout::AddressMajor
+            || !webgpu_msm::is_gpu_msm_available()
+            || !webgpu_onehot::is_gpu_onehot_available()
+        {
+            return self.generate_and_commit_witness_polynomials();
+        }
+
+        let row_len = DoryGlobals::get_num_columns();
+        let num_chunks = T / row_len;
+
+        let _classify_span = tracing::trace_span!("gpu_commit.classify_polys").entered();
+        let mut onehot_poly_ids = Vec::new();
+        let mut dense_poly_ids = Vec::new();
+        for (idx, poly) in polys.iter().enumerate() {
+            if poly.get_onehot_k(&self.one_hot_params).is_some() {
+                onehot_poly_ids.push(idx);
+            } else {
+                dense_poly_ids.push(idx);
+            }
+        }
+        tracing::info!(
+            "Classified {} onehot polys, {} dense polys",
+            onehot_poly_ids.len(),
+            dense_poly_ids.len()
+        );
+        drop(_classify_span);
+
+        let num_cpu_onehot = 0;
+        let (cpu_onehot_poly_ids, gpu_onehot_poly_ids) = onehot_poly_ids.split_at(num_cpu_onehot);
+        let _ = cpu_onehot_poly_ids;
+
+        let _dispatch_span = tracing::trace_span!("gpu_commit.dispatch_onehot").entered();
+        let g1_slice = unsafe {
+            std::slice::from_raw_parts(
+                self.preprocessing.generators.g1_vec.as_ptr(),
+                self.preprocessing.generators.g1_vec.len(),
+            )
+        };
+        let g1_bases: Vec<G1Affine> = g1_slice[..row_len]
+            .iter()
+            .map(|g| g.0.into_affine())
+            .collect();
+        let bases_flat = webgpu_onehot::serialize_onehot_bases(&g1_bases, row_len);
+
+        let mut poly_gather_data: Vec<(Vec<u32>, Vec<u32>, u32, usize, usize)> = Vec::new();
+        let mut poly_metadata: Vec<(usize, usize, usize)> = Vec::new();
+        for &poly_idx in gpu_onehot_poly_ids {
+            let poly = polys[poly_idx];
+            let k = poly
+                .get_onehot_k(&self.one_hot_params)
+                .expect("GPU subset must contain only OneHot polynomials");
+
+            let all_indices: Vec<Option<u8>> = (0..T)
+                .map(|i| {
+                    let cycle = if i < self.trace.len() {
+                        &self.trace[i]
+                    } else {
+                        &Cycle::NoOp
+                    };
+                    match poly {
+                        CommittedPolynomial::InstructionRa(d) => Some(
+                            self.one_hot_params
+                                .lookup_index_chunk(LookupQuery::<XLEN>::to_lookup_index(cycle), d)
+                                as u8,
+                        ),
+                        CommittedPolynomial::BytecodeRa(d) => {
+                            Some(self.one_hot_params.bytecode_pc_chunk(
+                                self.preprocessing.shared.bytecode.get_pc(cycle),
+                                d,
+                            ) as u8)
+                        }
+                        CommittedPolynomial::RamRa(d) => remap_address(
+                            cycle.ram_access().address() as u64,
+                            &self.preprocessing.shared.memory_layout,
+                        )
+                        .map(|addr| self.one_hot_params.ram_address_chunk(addr, d) as u8),
+                        _ => None,
+                    }
+                })
+                .collect();
+
+            let (gather_cols, jobs, num_jobs) =
+                webgpu_onehot::build_gather_lists(&all_indices, num_chunks, k, row_len);
+            poly_gather_data.push((gather_cols, jobs, num_jobs, num_chunks, k));
+            let rows_per_k = T / row_len;
+            let onehot_num_rows = k * rows_per_k;
+            poly_metadata.push((poly_idx, rows_per_k, onehot_num_rows));
+        }
+        let gpu_onehot_batch_handle = if !poly_gather_data.is_empty() {
+            Some(webgpu_onehot::dispatch_gpu_onehot_batch_retain_buffer(
+                &bases_flat,
+                &poly_gather_data,
+            ))
+        } else {
+            None
+        };
+        drop(_dispatch_span);
+
+        // Dense polys: CPU tier-1 (runs while GPU OneHot computes)
+        let mut commitments_by_index: Vec<Option<PCS::Commitment>> = vec![None; polys.len()];
+        let mut hints_by_index: Vec<Option<PCS::OpeningProofHint>> = vec![None; polys.len()];
+        let mut dense_gpu_row_comms: Vec<(usize, Vec<ArkG1>)> = Vec::new();
+        let mut onehot_gpu_row_comms: Vec<(usize, Vec<ArkG1>)> = Vec::new();
+
+        if !dense_poly_ids.is_empty() {
+            let _dense_span = tracing::info_span!("gpu_commit.dense_tier1_cpu").entered();
+            let mut dense_chunk_results: Vec<Vec<PCS::ChunkState>> = vec![vec![]; num_chunks];
+
+            self.lazy_trace
+                .clone()
+                .pad_using(T, |_| Cycle::NoOp)
+                .iter_chunks(row_len)
+                .zip(dense_chunk_results.iter_mut())
+                .par_bridge()
+                .for_each(|(chunk, chunk_states)| {
+                    let res: Vec<_> = dense_poly_ids
+                        .par_iter()
+                        .map(|&poly_idx| {
+                            polys[poly_idx].stream_witness_and_commit_rows::<_, PCS>(
+                                &self.preprocessing.generators,
+                                &self.preprocessing.shared,
+                                &chunk,
+                                &self.one_hot_params,
+                            )
+                        })
+                        .collect();
+                    *chunk_states = res;
+                });
+
+            for (local_idx, &poly_idx) in dense_poly_ids.iter().enumerate() {
+                let row_comms: Vec<ArkG1> = dense_chunk_results
+                    .iter()
+                    .flat_map(|row| {
+                        row.get(local_idx)
+                            .into_iter()
+                            .flat_map(|chunk_state| chunk_state.iter().cloned())
+                    })
+                    .collect();
+                hints_by_index[poly_idx] = Some(DoryOpeningProofHint::from_rows(row_comms.clone()));
+                dense_gpu_row_comms.push((poly_idx, row_comms));
+            }
+            tracing::info!(
+                "Dense tier-1 done: {} polys, {} row comms each",
+                dense_poly_ids.len(),
+                num_chunks
+            );
+        }
+
+        // Resolve GPU OneHot gather
+        let _resolve_onehot_span = tracing::trace_span!("gpu_commit.resolve_onehot").entered();
+        let mut onehot_gpu_buffer: Option<wasm_bindgen::JsValue> = None;
+        let mut onehot_gpu_buffer_size = 0usize;
+        let mut onehot_poly_layout: Vec<(usize, usize)> = Vec::new();
+        if let Some(batch_handle) = gpu_onehot_batch_handle {
+            let batch_result =
+                webgpu_onehot::resolve_gpu_onehot_batch_with_buffer(batch_handle).await;
+            onehot_gpu_buffer = Some(batch_result.gpu_buffer);
+            onehot_gpu_buffer_size = batch_result.gpu_buffer_size;
+            onehot_poly_layout = batch_result.poly_layout;
+
+            for (i, gpu_results) in batch_result.cpu_results.into_iter().enumerate() {
+                let (poly_idx, rows_per_k, onehot_num_rows) = poly_metadata[i];
+                let mut row_comms = vec![ArkG1(ark_bn254::G1Projective::zero()); onehot_num_rows];
+                for (c, chunk_results) in gpu_results.iter().enumerate() {
+                    for (ki, point) in chunk_results.iter().enumerate() {
+                        let row_idx = c + ki * rows_per_k;
+                        if row_idx < onehot_num_rows {
+                            row_comms[row_idx] = ArkG1(*point);
+                        }
+                    }
+                }
+                hints_by_index[poly_idx] = Some(DoryOpeningProofHint::from_rows(row_comms.clone()));
+                onehot_gpu_row_comms.push((poly_idx, row_comms));
+            }
+        }
+        drop(_resolve_onehot_span);
+
+        // GPU pairing
+        let use_gpu_pairing = webgpu_msm::is_gpu_msm_available();
+        let onehot_gpu_pairing_handle =
+            if use_gpu_pairing && !onehot_gpu_row_comms.is_empty() && onehot_gpu_buffer.is_some() {
+                let _dispatch_pair_span =
+                    tracing::trace_span!("gpu_commit.dispatch_pairing.onehot_buffer").entered();
+                let g1_refs: Vec<&[ArkG1]> = onehot_gpu_row_comms
+                    .iter()
+                    .map(|(_, rc)| rc.as_slice())
+                    .collect();
+                let max_rows = g1_refs.iter().map(|g| g.len()).max().unwrap_or(0);
+                let g2_bases: &[ArkG2] = &self.preprocessing.generators.g2_vec[..max_rows];
+                Some(webgpu_pairing::dispatch_gpu_batch_pairing_from_buffer(
+                    onehot_gpu_buffer
+                        .as_ref()
+                        .expect("onehot gpu buffer must exist when dispatching pairing"),
+                    onehot_gpu_buffer_size,
+                    &onehot_poly_layout,
+                    g2_bases,
+                    &g1_refs,
+                ))
+            } else {
+                None
+            };
+
+        let dense_gpu_pairing_handle = if use_gpu_pairing && !dense_gpu_row_comms.is_empty() {
+            let _dispatch_pair_span =
+                tracing::trace_span!("gpu_commit.dispatch_pairing.dense").entered();
+            let g1_refs: Vec<&[ArkG1]> = dense_gpu_row_comms
+                .iter()
+                .map(|(_, rc)| rc.as_slice())
+                .collect();
+            let max_rows = g1_refs.iter().map(|g| g.len()).max().unwrap_or(0);
+            let g2_bases: &[ArkG2] = &self.preprocessing.generators.g2_vec[..max_rows];
+            Some(webgpu_pairing::dispatch_gpu_batch_pairing(
+                &g1_refs, g2_bases,
+            ))
+        } else {
+            None
+        };
+
+        if let Some(handle) = onehot_gpu_pairing_handle {
+            let _resolve_pair_span =
+                tracing::trace_span!("gpu_commit.resolve_pairing.onehot_buffer").entered();
+            let commitments_gt: Vec<ArkGT> =
+                webgpu_pairing::resolve_gpu_batch_pairing_from_buffer(handle).await;
+            for ((poly_idx, _), commitment) in
+                onehot_gpu_row_comms.iter().zip(commitments_gt.into_iter())
+            {
+                commitments_by_index[*poly_idx] = Some(commitment);
+            }
+        } else {
+            for (poly_idx, row_comms) in &onehot_gpu_row_comms {
+                let g2_bases = &self.preprocessing.generators.g2_vec[..row_comms.len()];
+                let commitment = <BN254 as PairingCurve>::multi_pair_g2_setup(row_comms, g2_bases);
+                commitments_by_index[*poly_idx] = Some(commitment);
+            }
+        }
+
+        if let Some(handle) = dense_gpu_pairing_handle {
+            let _resolve_pair_span =
+                tracing::trace_span!("gpu_commit.resolve_pairing.dense").entered();
+            let commitments_gt: Vec<ArkGT> =
+                webgpu_pairing::resolve_gpu_batch_pairing(handle).await;
+            for ((poly_idx, _), commitment) in
+                dense_gpu_row_comms.iter().zip(commitments_gt.into_iter())
+            {
+                commitments_by_index[*poly_idx] = Some(commitment);
+            }
+        } else {
+            let _cpu_pair_span = tracing::trace_span!("gpu_commit.cpu_pairing_fallback").entered();
+            for (poly_idx, row_comms) in &dense_gpu_row_comms {
+                let g2_bases = &self.preprocessing.generators.g2_vec[..row_comms.len()];
+                let commitment = <BN254 as PairingCurve>::multi_pair_g2_setup(row_comms, g2_bases);
+                commitments_by_index[*poly_idx] = Some(commitment);
+            }
+        }
+
+        if let Some(buffer) = onehot_gpu_buffer {
+            let _ = js_sys::Reflect::get(&buffer, &wasm_bindgen::JsValue::from_str("destroy"))
+                .ok()
+                .and_then(|f| f.dyn_into::<js_sys::Function>().ok())
+                .and_then(|destroy_fn| destroy_fn.call0(&buffer).ok());
+        }
+
+        let commitments: Vec<PCS::Commitment> = commitments_by_index
+            .into_iter()
+            .enumerate()
+            .map(|(poly_idx, c)| {
+                c.unwrap_or_else(|| panic!("missing commitment for polynomial index {poly_idx}"))
+            })
+            .collect();
+        let hint_map = HashMap::from_iter(polys.iter().copied().zip(
+            hints_by_index.into_iter().enumerate().map(|(poly_idx, h)| {
+                h.unwrap_or_else(|| panic!("missing hint for polynomial index {poly_idx}"))
+            }),
+        ));
+
         for commitment in &commitments {
             self.transcript
                 .append_serializable(b"commitment", commitment);
@@ -2208,11 +2544,210 @@ impl<
     async fn prove_stage8_gpu(
         &mut self,
         opening_proof_hints: HashMap<CommittedPolynomial, PCS::OpeningProofHint>,
-    ) -> PCS::Proof {
-        self.prove_stage8(opening_proof_hints)
+    ) -> PCS::Proof
+    where
+        PCS: StreamingCommitmentScheme<
+            Field = F,
+            OpeningProofHint = crate::poly::commitment::dory::DoryOpeningProofHint,
+        >,
+    {
+        use crate::poly::commitment::dory::{DoryCommitmentScheme, DoryContext, DoryGlobals};
+        use crate::poly::opening_proof::DoryOpeningState;
+
+        tracing::info!("Stage 8 proving (Dory batch opening) \u{2014} GPU path");
+
+        let _guard = DoryGlobals::initialize_context(
+            self.one_hot_params.k_chunk,
+            self.padded_trace_len,
+            DoryContext::Main,
+            Some(DoryGlobals::get_layout()),
+        );
+
+        let (opening_point, _) = self.opening_accumulator.get_committed_polynomial_opening(
+            CommittedPolynomial::InstructionRa(0),
+            SumcheckId::HammingWeightClaimReduction,
+        );
+
+        let log_k_chunk = self.one_hot_params.log_k_chunk;
+        let r_address_stage7 = &opening_point.r[..log_k_chunk];
+
+        let mut polynomial_claims = Vec::new();
+        let mut scaling_factors = Vec::new();
+
+        let (_, ram_inc_claim) = self.opening_accumulator.get_committed_polynomial_opening(
+            CommittedPolynomial::RamInc,
+            SumcheckId::IncClaimReduction,
+        );
+        let (_, rd_inc_claim) = self.opening_accumulator.get_committed_polynomial_opening(
+            CommittedPolynomial::RdInc,
+            SumcheckId::IncClaimReduction,
+        );
+
+        let lagrange_factor: F = EqPolynomial::zero_selector(r_address_stage7);
+        polynomial_claims.push((CommittedPolynomial::RamInc, ram_inc_claim * lagrange_factor));
+        scaling_factors.push(lagrange_factor);
+        polynomial_claims.push((CommittedPolynomial::RdInc, rd_inc_claim * lagrange_factor));
+        scaling_factors.push(lagrange_factor);
+
+        for i in 0..self.one_hot_params.instruction_d {
+            let (_, claim) = self.opening_accumulator.get_committed_polynomial_opening(
+                CommittedPolynomial::InstructionRa(i),
+                SumcheckId::HammingWeightClaimReduction,
+            );
+            polynomial_claims.push((CommittedPolynomial::InstructionRa(i), claim));
+            scaling_factors.push(F::one());
+        }
+        for i in 0..self.one_hot_params.bytecode_d {
+            let (_, claim) = self.opening_accumulator.get_committed_polynomial_opening(
+                CommittedPolynomial::BytecodeRa(i),
+                SumcheckId::HammingWeightClaimReduction,
+            );
+            polynomial_claims.push((CommittedPolynomial::BytecodeRa(i), claim));
+            scaling_factors.push(F::one());
+        }
+        for i in 0..self.one_hot_params.ram_d {
+            let (_, claim) = self.opening_accumulator.get_committed_polynomial_opening(
+                CommittedPolynomial::RamRa(i),
+                SumcheckId::HammingWeightClaimReduction,
+            );
+            polynomial_claims.push((CommittedPolynomial::RamRa(i), claim));
+            scaling_factors.push(F::one());
+        }
+
+        #[cfg(feature = "zk")]
+        let mut include_trusted_advice = false;
+        #[cfg(feature = "zk")]
+        let mut include_untrusted_advice = false;
+
+        if let Some((advice_point, advice_claim)) = self
+            .opening_accumulator
+            .get_advice_opening(AdviceKind::Trusted, SumcheckId::AdviceClaimReduction)
+        {
+            let lagrange_factor =
+                compute_advice_lagrange_factor::<F>(&opening_point.r, &advice_point.r);
+            polynomial_claims.push((
+                CommittedPolynomial::TrustedAdvice,
+                advice_claim * lagrange_factor,
+            ));
+            scaling_factors.push(lagrange_factor);
+            #[cfg(feature = "zk")]
+            {
+                include_trusted_advice = true;
+            }
+        }
+
+        if let Some((advice_point, advice_claim)) = self
+            .opening_accumulator
+            .get_advice_opening(AdviceKind::Untrusted, SumcheckId::AdviceClaimReduction)
+        {
+            let lagrange_factor =
+                compute_advice_lagrange_factor::<F>(&opening_point.r, &advice_point.r);
+            polynomial_claims.push((
+                CommittedPolynomial::UntrustedAdvice,
+                advice_claim * lagrange_factor,
+            ));
+            scaling_factors.push(lagrange_factor);
+            #[cfg(feature = "zk")]
+            {
+                include_untrusted_advice = true;
+            }
+        }
+
+        let claims: Vec<F> = polynomial_claims.iter().map(|(_, c)| *c).collect();
+        #[cfg(not(feature = "zk"))]
+        self.transcript.append_scalars(b"rlc_claims", &claims);
+        let gamma_powers: Vec<F> = self.transcript.challenge_scalar_powers(claims.len());
+        #[cfg(feature = "zk")]
+        let constraint_coeffs: Vec<F> = gamma_powers
+            .iter()
+            .zip(&scaling_factors)
+            .map(|(gamma, scale)| *gamma * *scale)
+            .collect();
+        let joint_claim: F = gamma_powers
+            .iter()
+            .zip(claims.iter())
+            .map(|(gamma, claim)| *gamma * claim)
+            .sum();
+
+        #[cfg(feature = "zk")]
+        let opening_ids = stage8_opening_ids(
+            &self.one_hot_params,
+            include_trusted_advice,
+            include_untrusted_advice,
+        );
+
+        let state = DoryOpeningState {
+            opening_point: opening_point.r.clone(),
+            gamma_powers,
+            polynomial_claims,
+        };
+
+        let streaming_data = Arc::new(RLCStreamingData {
+            bytecode: Arc::clone(&self.preprocessing.shared.bytecode),
+            memory_layout: self.preprocessing.shared.memory_layout.clone(),
+        });
+
+        let mut advice_polys = HashMap::new();
+        if let Some(poly) = self.advice.trusted_advice_polynomial.take() {
+            advice_polys.insert(CommittedPolynomial::TrustedAdvice, poly);
+        }
+        if let Some(poly) = self.advice.untrusted_advice_polynomial.take() {
+            advice_polys.insert(CommittedPolynomial::UntrustedAdvice, poly);
+        }
+
+        // GPU path: split build_streaming_rlc to dispatch combine_hints on GPU
+        let (joint_poly, hints, coeffs) = state.build_streaming_rlc_poly_only::<PCS>(
+            self.one_hot_params.clone(),
+            TraceSource::Materialized(Arc::clone(&self.trace)),
+            streaming_data,
+            opening_proof_hints,
+            advice_polys,
+        );
+
+        #[cfg(feature = "webgpu-pairing")]
+        let hint = {
+            use crate::poly::commitment::dory::DoryOpeningProofHint;
+            let dory_hints: Vec<DoryOpeningProofHint> = hints;
+            let ark_coeffs: Vec<ark_bn254::Fr> = coeffs
+                .iter()
+                .map(|c| unsafe { std::mem::transmute_copy::<F, ark_bn254::Fr>(c) })
+                .collect();
+            DoryCommitmentScheme::combine_hints_gpu(dory_hints, &ark_coeffs).await
+        };
+        #[cfg(not(feature = "webgpu-pairing"))]
+        let hint = PCS::combine_hints(hints, &coeffs);
+
+        let (proof, _y_blinding) = PCS::prove(
+            &self.preprocessing.generators,
+            &joint_poly,
+            &opening_point.r,
+            Some(hint),
+            &mut self.transcript,
+        );
+
+        #[cfg(feature = "zk")]
+        {
+            let y_com: C::G1 = PCS::eval_commitment(&proof).expect("ZK proof must have y_com");
+            bind_opening_inputs_zk::<F, C, _>(&mut self.transcript, &opening_point.r, &y_com);
+            self.blindfold_accumulator.set_opening_proof_data(
+                crate::subprotocols::blindfold::OpeningProofData {
+                    opening_ids,
+                    constraint_coeffs,
+                    joint_claim,
+                    y_blinding: _y_blinding.expect("ZK mode requires y_blinding"),
+                },
+            );
+        }
+        #[cfg(not(feature = "zk"))]
+        {
+            bind_opening_inputs::<F, _>(&mut self.transcript, &opening_point.r, &joint_claim);
+        }
+
+        proof
     }
 
     #[cfg(not(target_arch = "wasm32"))]
+    #[allow(dead_code)]
     async fn prove_stage8_gpu(
         &mut self,
         opening_proof_hints: HashMap<CommittedPolynomial, PCS::OpeningProofHint>,
