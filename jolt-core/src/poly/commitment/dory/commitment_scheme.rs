@@ -38,6 +38,10 @@ impl DoryOpeningProofHint {
         Self(row_commitments)
     }
 
+    pub fn from_rows(row_commitments: Vec<ArkG1>) -> Self {
+        Self(row_commitments)
+    }
+
     pub(crate) fn into_rows(self) -> Vec<ArkG1> {
         self.0
     }
@@ -446,6 +450,39 @@ where
 
 #[cfg(all(feature = "webgpu-pairing", target_arch = "wasm32"))]
 impl DoryCommitmentScheme {
+    /// Extract row commitments from tier-1 chunks without computing the pairing.
+    /// This is the CPU-only part of `aggregate_chunks`.
+    pub fn collect_row_commitments(
+        onehot_k: Option<usize>,
+        chunks: &[Vec<ArkG1>],
+    ) -> Vec<ArkG1> {
+        let num_rows = DoryGlobals::get_max_num_rows();
+
+        if let Some(_K) = onehot_k {
+            let row_len = DoryGlobals::get_num_columns();
+            let T = DoryGlobals::get_T();
+            let rows_per_k = T / row_len;
+
+            let mut row_commitments = vec![ArkG1(G1Projective::zero()); num_rows];
+            for (chunk_index, commitments) in chunks.iter().enumerate() {
+                row_commitments
+                    .par_iter_mut()
+                    .skip(chunk_index)
+                    .step_by(rows_per_k)
+                    .zip(commitments.par_iter())
+                    .for_each(|(dest, src)| *dest = *src);
+            }
+            row_commitments
+        } else {
+            chunks.iter().flat_map(|chunk| chunk.clone()).collect()
+        }
+    }
+
+    /// Get a slice of G2 bases from the prover setup, needed for GPU pairing.
+    pub fn get_g2_bases(setup: &ArkworksProverSetup, len: usize) -> Vec<super::wrappers::ArkG2> {
+        setup.g2_vec[..len].to_vec()
+    }
+
     pub async fn combine_hints_gpu(
         hints: Vec<DoryOpeningProofHint>,
         coeffs: &[ark_bn254::Fr],

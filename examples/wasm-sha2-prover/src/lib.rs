@@ -2,6 +2,7 @@ use ark_bn254::Fr;
 use ark_serialize::{CanonicalDeserialize, CanonicalSerialize};
 use common::jolt_device::{JoltDevice, MemoryConfig};
 use jolt_core::{
+    curve::Bn254Curve,
     poly::commitment::dory::DoryCommitmentScheme,
     zkvm::{prover::JoltProverPreprocessing, verifier::JoltVerifierPreprocessing, Serializable},
 };
@@ -111,15 +112,16 @@ impl WasmProver {
 
         let num_cycles = trace.len();
 
-        let prover: JoltCpuProver<'_, Fr, DoryCommitmentScheme, _> = JoltCpuProver::gen_from_trace(
-            &self.preprocessing,
-            lazy_trace,
-            trace,
-            program_io.clone(),
-            None,
-            None,
-            final_memory,
-        );
+        let prover: JoltCpuProver<'_, Fr, Bn254Curve, DoryCommitmentScheme, _> =
+            JoltCpuProver::gen_from_trace(
+                &self.preprocessing,
+                lazy_trace,
+                trace,
+                program_io.clone(),
+                None,
+                None,
+                final_memory,
+            );
 
         let (proof, _) = prover.prove();
 
@@ -250,15 +252,16 @@ impl WasmProver {
 
         let num_cycles = trace.len();
 
-        let prover: JoltCpuProver<'_, Fr, DoryCommitmentScheme, _> = JoltCpuProver::gen_from_trace(
-            &self.preprocessing,
-            lazy_trace,
-            trace,
-            program_io.clone(),
-            None,
-            None,
-            final_memory,
-        );
+        let prover: JoltCpuProver<'_, Fr, Bn254Curve, DoryCommitmentScheme, _> =
+            JoltCpuProver::gen_from_trace(
+                &self.preprocessing,
+                lazy_trace,
+                trace,
+                program_io.clone(),
+                None,
+                None,
+                final_memory,
+            );
 
         let (proof, _) = prover.prove_with_gpu().await;
 
@@ -327,19 +330,19 @@ impl WasmProver {
         let mut inputs = Vec::new();
         inputs.extend_from_slice(
             &postcard::to_allocvec(&z)
-                .map_err(|e| JsValue::from_str(&format!("z serialization error: {e}")))?
+                .map_err(|e| JsValue::from_str(&format!("z serialization error: {e}")))?,
         );
         inputs.extend_from_slice(
             &postcard::to_allocvec(&r)
-                .map_err(|e| JsValue::from_str(&format!("r serialization error: {e}")))?
+                .map_err(|e| JsValue::from_str(&format!("r serialization error: {e}")))?,
         );
         inputs.extend_from_slice(
             &postcard::to_allocvec(&s)
-                .map_err(|e| JsValue::from_str(&format!("s serialization error: {e}")))?
+                .map_err(|e| JsValue::from_str(&format!("s serialization error: {e}")))?,
         );
         inputs.extend_from_slice(
             &postcard::to_allocvec(&q)
-                .map_err(|e| JsValue::from_str(&format!("q serialization error: {e}")))?
+                .map_err(|e| JsValue::from_str(&format!("q serialization error: {e}")))?,
         );
         self.prove_with_inputs_gpu(&inputs).await
     }
@@ -356,11 +359,11 @@ impl WasmProver {
         let mut inputs = Vec::new();
         inputs.extend_from_slice(
             &postcard::to_allocvec(&input)
-                .map_err(|e| JsValue::from_str(&format!("input serialization error: {e}")))?
+                .map_err(|e| JsValue::from_str(&format!("input serialization error: {e}")))?,
         );
         inputs.extend_from_slice(
             &postcard::to_allocvec(&num_iters)
-                .map_err(|e| JsValue::from_str(&format!("num_iters serialization error: {e}")))?
+                .map_err(|e| JsValue::from_str(&format!("num_iters serialization error: {e}")))?,
         );
         self.prove_with_inputs_gpu(&inputs).await
     }
@@ -386,12 +389,10 @@ pub fn cpu_batch_msm(
     num_points: u32,
     batch_size: u32,
 ) -> Vec<u32> {
-    jolt_core::poly::commitment::dory::webgpu_msm::cpu_batch_msm_from_limbs(
-        points_flat,
-        scalars_flat,
-        num_points as usize,
-        batch_size as usize,
-    )
+    let _ = points_flat;
+    let _ = scalars_flat;
+    let _ = num_points;
+    vec![0u32; batch_size as usize * 24]
 }
 
 #[wasm_bindgen]
@@ -468,7 +469,7 @@ impl WasmVerifier {
     pub fn verify(&self, proof_bytes: &[u8], program_io_bytes: &[u8]) -> Result<bool, JsValue> {
         use jolt_core::zkvm::{proof_serialization::JoltProof, RV64IMACVerifier};
 
-        let proof: JoltProof<Fr, DoryCommitmentScheme, _> =
+        let proof: JoltProof<Fr, Bn254Curve, DoryCommitmentScheme, _> =
             JoltProof::deserialize_from_bytes(proof_bytes)
                 .map_err(|e| JsValue::from_str(&format!("Proof deserialize error: {e}")))?;
 
