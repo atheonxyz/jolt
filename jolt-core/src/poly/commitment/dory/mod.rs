@@ -6,6 +6,8 @@
 mod commitment_scheme;
 mod dory_globals;
 mod jolt_dory_routines;
+#[cfg(all(feature = "webgpu-pairing", target_arch = "wasm32"))]
+pub mod webgpu_pairing;
 mod wrappers;
 
 #[cfg(test)]

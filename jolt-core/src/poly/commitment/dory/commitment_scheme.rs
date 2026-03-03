@@ -38,7 +38,7 @@ impl DoryOpeningProofHint {
         Self(row_commitments)
     }
 
-    fn into_rows(self) -> Vec<ArkG1> {
+    pub(crate) fn into_rows(self) -> Vec<ArkG1> {
         self.0
     }
 }
@@ -438,6 +438,26 @@ where
             .collect();
         let h1 = C::G1::from(setup.0.h1);
         Some((g1s, h1))
+    }
+}
+
+#[cfg(all(feature = "webgpu-pairing", target_arch = "wasm32"))]
+impl DoryCommitmentScheme {
+    pub async fn combine_hints_gpu(
+        hints: Vec<DoryOpeningProofHint>,
+        coeffs: &[ark_bn254::Fr],
+    ) -> DoryOpeningProofHint {
+        if !super::webgpu_pairing::is_gpu_combine_hints_available() {
+            return <Self as CommitmentScheme>::combine_hints(hints, coeffs);
+        }
+
+        let hint_rows: Vec<Vec<ArkG1>> = hints
+            .into_iter()
+            .map(DoryOpeningProofHint::into_rows)
+            .collect();
+        let handle = super::webgpu_pairing::dispatch_gpu_combine_hints(&hint_rows, coeffs);
+        let rows = super::webgpu_pairing::resolve_gpu_combine_hints(handle).await;
+        DoryOpeningProofHint::new(rows)
     }
 }
 
