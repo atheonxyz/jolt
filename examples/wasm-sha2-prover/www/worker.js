@@ -14,6 +14,34 @@ import { initGPUMSM, executeGPUBatchMSMHybrid } from './gpu-msm.js';
 import { initGpuG2, gpuG2FixedBaseScalarMul, gpuG2UploadTable, gpuG2ScalarMulCached, isGpuG2Available } from './gpu-g2.js';
 import { initGpuOnehot, gpuOnehotBatchG1Add, gpuOnehotGatherDirect, gpuOnehotGatherDirectRetainBuffer, isGpuOnehotAvailable } from './gpu-onehot.js';
 
+// Safari cannot reliably handle 4GB (65536 pages) shared WASM memory due to
+// WebKit's Gigacage security feature. Detect Safari and allocate with backoff.
+// See: https://bugs.webkit.org/show_bug.cgi?id=255103
+//      https://github.com/rustwasm/wasm-bindgen/discussions/4185
+function createSharedMemory() {
+    const INITIAL_PAGES = 29;
+    const isSafari = /^((?!chrome|android).)*safari/i.test(navigator.userAgent);
+
+    if (!isSafari) {
+        return new WebAssembly.Memory({ initial: INITIAL_PAGES, maximum: 65536, shared: true });
+    }
+
+    // Safari: try decreasing maximums until allocation succeeds
+    const attempts = [65536, 49152, 32768, 16384];
+    for (const maximum of attempts) {
+        try {
+            const memory = new WebAssembly.Memory({ initial: INITIAL_PAGES, maximum, shared: true });
+            if (memory && memory.buffer) {
+                console.log(`[worker] Safari: allocated shared memory with ${maximum} pages (${(maximum * 65536 / 1024 / 1024 / 1024).toFixed(1)} GB)`);
+                return memory;
+            }
+        } catch (e) {
+            console.warn(`[worker] Safari: failed to allocate ${maximum} pages: ${e.message}`);
+        }
+    }
+    throw new Error('Failed to allocate WebAssembly shared memory');
+}
+
 let wasmExports = null;
 const provers = {};
 const verifiers = {};
@@ -24,7 +52,8 @@ self.onmessage = async (e) => {
     try {
         switch (type) {
             case 'init': {
-                wasmExports = await init();
+                const memory = createSharedMemory();
+                wasmExports = await init({ memory });
                 await initThreadPool(data.numThreads);
                 init_tracing();
                 init_inlines();
