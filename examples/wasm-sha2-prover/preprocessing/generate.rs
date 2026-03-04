@@ -1,7 +1,7 @@
+use ark_serialize::CanonicalSerialize;
 use jolt_core::poly::commitment::dory::{ArkworksVerifierSetup, DoryCommitmentScheme};
 use jolt_core::zkvm::prover::JoltProverPreprocessing;
 use jolt_core::zkvm::verifier::{JoltSharedPreprocessing, JoltVerifierPreprocessing};
-use ark_serialize::CanonicalSerialize;
 use std::path::{Path, PathBuf};
 
 type ProverPrep = JoltProverPreprocessing<ark_bn254::Fr, DoryCommitmentScheme>;
@@ -50,7 +50,13 @@ fn generate_program(www_dir: &Path, spec: &ProgramSpec) {
     verifier_preprocessing
         .serialize_uncompressed(&mut verifier_bytes)
         .expect("Failed to serialize verifier preprocessing");
-    write_file(www_dir, spec.verifier_file, name, "Verifier", &verifier_bytes);
+    write_file(
+        www_dir,
+        spec.verifier_file,
+        name,
+        "Verifier",
+        &verifier_bytes,
+    );
 
     let elf_path = www_dir.join(spec.elf_file);
     std::fs::write(&elf_path, &elf_contents).expect("Failed to write ELF");

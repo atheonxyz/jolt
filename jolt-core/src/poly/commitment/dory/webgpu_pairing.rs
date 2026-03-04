@@ -354,6 +354,139 @@ pub struct GpuBatchPairingHandle {
 }
 
 #[cfg(target_arch = "wasm32")]
+pub struct GpuMultiGroupPairingHandle {
+    gpu_future: wasm_bindgen_futures::JsFuture,
+    cpu_millers: Vec<Option<Fq12>>,
+    num_groups: usize,
+}
+
+/// Fire a multi-group GPU pairing dispatch where each group has its OWN G2 vector.
+/// Unlike `dispatch_gpu_batch_pairing` (shared G2), this flattens per-group G2 into
+/// the same buffer layout — the GPU shader processes (g1[i], g2[i]) pairs independently.
+/// Returns a handle for later collection with `resolve_gpu_multi_group_pairing`.
+#[cfg(target_arch = "wasm32")]
+pub fn dispatch_gpu_multi_group_pairing(
+    groups: &[(&[ArkG1], &[ArkG2])],
+) -> GpuMultiGroupPairingHandle {
+    use rayon::prelude::*;
+    use wasm_bindgen::JsCast;
+
+    const GPU_RATIO: f64 = 0.95;
+    const MIN_HYBRID_PAIRS: usize = 20;
+
+    let num_groups = groups.len();
+
+    let mut gpu_counts = Vec::with_capacity(num_groups);
+    let mut gpu_group_sizes = Vec::with_capacity(num_groups);
+    let mut gpu_group_offsets = Vec::with_capacity(num_groups);
+    let mut total_gpu_pairs = 0usize;
+
+    for (g1, g2) in groups {
+        assert_eq!(g1.len(), g2.len(), "G1 and G2 lengths must match within group");
+        let n = g1.len();
+        let gpu_count = if n < MIN_HYBRID_PAIRS {
+            n
+        } else {
+            ((n as f64) * GPU_RATIO)
+                .round()
+                .max(1.0)
+                .min((n - 1) as f64) as usize
+        };
+        gpu_counts.push(gpu_count);
+        gpu_group_sizes.push(gpu_count as u32);
+        gpu_group_offsets.push(total_gpu_pairs as u32);
+        total_gpu_pairs += gpu_count;
+    }
+
+    let per_group_g1: Vec<Vec<u32>> = groups
+        .par_iter()
+        .zip(gpu_counts.par_iter())
+        .map(|((g1, _), &gc)| serialize_g1_points(&g1[..gc]))
+        .collect();
+
+    let per_group_g2: Vec<Vec<u32>> = groups
+        .par_iter()
+        .zip(gpu_counts.par_iter())
+        .map(|((_, g2), &gc)| serialize_g2_points(&g2[..gc]))
+        .collect();
+
+    let mut g1_flat = Vec::with_capacity(total_gpu_pairs * 2 * NUM_LIMBS);
+    let mut g2_flat = Vec::with_capacity(total_gpu_pairs * 4 * NUM_LIMBS);
+    for g in 0..num_groups {
+        g1_flat.extend_from_slice(&per_group_g1[g]);
+        g2_flat.extend_from_slice(&per_group_g2[g]);
+    }
+
+    let promise_js = js_bridge::js_gpu_batch_pairing_fire(
+        &g1_flat,
+        &g2_flat,
+        &gpu_group_sizes,
+        &gpu_group_offsets,
+    );
+    let promise: js_sys::Promise = promise_js.unchecked_into();
+    let gpu_future = wasm_bindgen_futures::JsFuture::from(promise);
+
+    let cpu_millers: Vec<Option<Fq12>> = groups
+        .par_iter()
+        .zip(gpu_counts.par_iter())
+        .map(|((g1, g2), &gc)| {
+            let n = g1.len();
+            if gc >= n {
+                None
+            } else {
+                let miller = Bn254::multi_miller_loop(
+                    g1[gc..].iter().map(|p| p.0.into_affine()),
+                    g2[gc..].iter().map(|p| p.0.into_affine()),
+                );
+                Some(miller.0)
+            }
+        })
+        .collect();
+
+    GpuMultiGroupPairingHandle {
+        gpu_future,
+        cpu_millers,
+        num_groups,
+    }
+}
+
+#[cfg(target_arch = "wasm32")]
+pub async fn resolve_gpu_multi_group_pairing(
+    handle: GpuMultiGroupPairingHandle,
+) -> Vec<ArkGT> {
+    use js_sys::Uint32Array;
+    use rayon::prelude::*;
+    use wasm_bindgen::JsCast;
+
+    let result_js = handle
+        .gpu_future
+        .await
+        .expect("GPU multi-group pairing Promise rejected");
+    let result_u32_array: Uint32Array =
+        result_js.dyn_into().expect("Expected Uint32Array from GPU");
+    let result_words: Vec<u32> = result_u32_array.to_vec();
+
+    (0..handle.num_groups)
+        .into_par_iter()
+        .map(|g| {
+            let start = g * FP12_WORDS;
+            let end = start + FP12_WORDS;
+            let gpu_miller = deserialize_fq12(&result_words[start..end]);
+
+            let combined_miller = match &handle.cpu_millers[g] {
+                Some(cpu_fp12) => gpu_miller * cpu_fp12,
+                None => gpu_miller,
+            };
+
+            let pairing_result =
+                Bn254::final_exponentiation(MillerLoopOutput::<Bn254>(combined_miller))
+                    .expect("Final exponentiation failed");
+            ArkGT(pairing_result.0)
+        })
+        .collect()
+}
+
+#[cfg(target_arch = "wasm32")]
 pub struct GpuBatchPairingFromBufferHandle {
     gpu_future: wasm_bindgen_futures::JsFuture,
     cpu_millers: Vec<Option<Fq12>>,

@@ -920,8 +920,8 @@ impl<
         >,
     {
         use crate::poly::commitment::dory::{
-            webgpu_msm, webgpu_onehot, webgpu_pairing, ArkG1, ArkG2, ArkGT,
-            DoryOpeningProofHint, BN254,
+            webgpu_msm, webgpu_onehot, webgpu_pairing, ArkG1, ArkG2, ArkGT, DoryOpeningProofHint,
+            BN254,
         };
         use crate::zkvm::instruction::LookupQuery;
         use crate::zkvm::ram::remap_address;
@@ -2744,8 +2744,7 @@ impl<
 
                 // SAFETY: PCS::ProverSetup = ArkworksProverSetup in WASM Dory builds
                 let setup: &crate::poly::commitment::dory::ArkworksProverSetup = unsafe {
-                    &*(&self.preprocessing.generators
-                        as *const PCS::ProverSetup
+                    &*(&self.preprocessing.generators as *const PCS::ProverSetup
                         as *const crate::poly::commitment::dory::ArkworksProverSetup)
                 };
                 // g2_fin = g2_vec[0] — the base point for v2 scalar mul in Dory
@@ -2760,11 +2759,11 @@ impl<
                     Some(hint),
                     &mut self.transcript,
                     pre_computed_v2,
-                );
+                )
+                .await;
 
                 // SAFETY: PCS::Proof = ArkDoryProof when PCS = DoryCommitmentScheme
-                let proof =
-                    unsafe { std::ptr::read(&dory_proof as *const _ as *const PCS::Proof) };
+                let proof = unsafe { std::ptr::read(&dory_proof as *const _ as *const PCS::Proof) };
                 std::mem::forget(dory_proof);
                 let y_blinding =
                     y_blind.map(|b| unsafe { std::mem::transmute_copy::<ark_bn254::Fr, F>(&b) });
