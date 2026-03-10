@@ -141,9 +141,8 @@ async function initMSMPipeline(device) {
         cscBGL, decomposePipeline, prefixSumPipeline, scatterPipeline,
         smvpBGL, pbprBGL, hornerBGL,
         smvpPipeline, hornerPipeline,
-        pbprModule, pbprFusedModule, pbprPipelineLayout,
+        pbprModule, pbprPipelineLayout,
         _pbprPipelineCache: new Map(),
-        _bprFusedPipelineCache: new Map(),
         _pointsCache: null,
     };
     return _msmPipeline;
@@ -167,17 +166,6 @@ function getPBPRPipelines(p, bWgSize) {
     return entry;
 }
 
-function getBPRFusedPipeline(p, bWgSize) {
-    if (p._bprFusedPipelineCache.has(bWgSize)) {
-        return p._bprFusedPipelineCache.get(bWgSize);
-    }
-    const bprFusedPipeline = p.device.createComputePipeline({
-        layout: p.pbprPipelineLayout,
-        compute: { module: p.pbprFusedModule, entryPoint: 'bpr_fused', constants: { WG_SIZE: bWgSize } },
-    });
-    p._bprFusedPipelineCache.set(bWgSize, bprFusedPipeline);
-    return bprFusedPipeline;
-}
 
 // ── Main entry point: batch MSM ──────────────────────────────────────────────
 //
@@ -447,253 +435,10 @@ async function gpuBatchMSM(pointsFlat, scalarsFlat, numPoints, scalarBitWidth, b
 
     return resultData; // 24 u32s per MSM result (Jacobian x:8, y:8, z:8)
 }
-
-async function gpuBatchMSMChunked(pointsFlat, scalarsFlat, numPoints, scalarBitWidth, batchSize) {
-    const device = _msmPipeline.device;
-    const p = _msmPipeline;
-
-    const t0 = performance.now();
-    const windowSize = optimalWindowSize(numPoints, scalarBitWidth);
-    const numColumns = 1 << windowSize;
-    const halfColumns = numColumns >>> 1;
-    const subtasksPerMSM = Math.ceil(scalarBitWidth / windowSize);
-    const totalSubtasks = batchSize * subtasksPerMSM;
-    const CHUNK_SIZE = 128;
-
-    const bWgSize = Math.max(Math.min(Math.floor(halfColumns / 128), 64), 32);
-    const bprFusedPipeline = getBPRFusedPipeline(p, bWgSize);
-
-    let pointsBuf;
-    if (p._pointsCache && p._pointsCache.numPoints === numPoints && p._pointsCache.byteLength === pointsFlat.byteLength) {
-        pointsBuf = p._pointsCache.buf;
-    } else {
-        if (p._pointsCache) p._pointsCache.buf.destroy();
-        pointsBuf = device.createBuffer({
-            size: pointsFlat.byteLength,
-            usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST,
-        });
-        device.queue.writeBuffer(pointsBuf, 0, pointsFlat);
-        p._pointsCache = { buf: pointsBuf, numPoints, byteLength: pointsFlat.byteLength };
-    }
-
-    const scalarsBuf = device.createBuffer({
-        size: scalarsFlat.byteLength,
-        usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST,
-    });
-    device.queue.writeBuffer(scalarsBuf, 0, scalarsFlat);
-
-    const totalWork = totalSubtasks * numPoints;
-    const colIndicesBuf = device.createBuffer({
-        size: Math.max(totalWork * 4, 4),
-        usage: GPUBufferUsage.STORAGE,
-    });
-
-    const colPtrLen = totalSubtasks * (numColumns + 1);
-    const colPtrBuf = device.createBuffer({
-        size: Math.max(colPtrLen * 4, 4),
-        usage: GPUBufferUsage.STORAGE,
-    });
-
-    const valIdxsBuf = device.createBuffer({
-        size: Math.max(totalWork * 4, 4),
-        usage: GPUBufferUsage.STORAGE,
-    });
-
-    const scatterCntBuf = device.createBuffer({
-        size: Math.max(totalSubtasks * numColumns * 4, 4),
-        usage: GPUBufferUsage.STORAGE,
-    });
-
-    const cscParams = new Uint32Array([numPoints, numColumns, windowSize, subtasksPerMSM, batchSize, totalSubtasks, NUM_LIMBS]);
-    const cscParamsBuf = device.createBuffer({
-        size: cscParams.byteLength,
-        usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST,
-    });
-    device.queue.writeBuffer(cscParamsBuf, 0, cscParams);
-
-    const bucketSubtasks = Math.min(CHUNK_SIZE, totalSubtasks);
-    const bucketLen = halfColumns * bucketSubtasks * 3 * NUM_LIMBS;
-    const bucketBuf = device.createBuffer({
-        size: Math.max(bucketLen * 4, 4),
-        usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC | GPUBufferUsage.COPY_DST,
-    });
-
-    const gPointsLen = totalSubtasks * bWgSize * 3 * NUM_LIMBS;
-    const gPointsBuf = device.createBuffer({
-        size: Math.max(gPointsLen * 4, 4),
-        usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC,
-    });
-
-    const resultLen = batchSize * 3 * NUM_LIMBS;
-    const resultBuf = device.createBuffer({
-        size: Math.max(resultLen * 4, 4),
-        usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC | GPUBufferUsage.COPY_DST,
-    });
-    const stagingBuf = device.createBuffer({
-        size: resultLen * 4,
-        usage: GPUBufferUsage.MAP_READ | GPUBufferUsage.COPY_DST,
-    });
-
-    const cscBG = device.createBindGroup({
-        layout: p.cscBGL,
-        entries: [
-            { binding: 0, resource: { buffer: scalarsBuf } },
-            { binding: 1, resource: { buffer: colIndicesBuf } },
-            { binding: 2, resource: { buffer: colPtrBuf } },
-            { binding: 3, resource: { buffer: valIdxsBuf } },
-            { binding: 4, resource: { buffer: scatterCntBuf } },
-            { binding: 5, resource: { buffer: cscParamsBuf } },
-        ],
-    });
-
-    const smvpParams = new Uint32Array([numPoints, numColumns, 0, 0, 0]);
-    const smvpParamsBuf = device.createBuffer({
-        size: smvpParams.byteLength,
-        usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST,
-    });
-
-    const smvpBG = device.createBindGroup({
-        layout: p.smvpBGL,
-        entries: [
-            { binding: 0, resource: { buffer: colPtrBuf } },
-            { binding: 1, resource: { buffer: valIdxsBuf } },
-            { binding: 2, resource: { buffer: pointsBuf } },
-            { binding: 3, resource: { buffer: bucketBuf } },
-            { binding: 4, resource: { buffer: smvpParamsBuf } },
-        ],
-    });
-
-    const bprParams = new Uint32Array([numColumns, 0]);
-    const bprParamsBuf = device.createBuffer({
-        size: bprParams.byteLength,
-        usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST,
-    });
-    device.queue.writeBuffer(bprParamsBuf, 0, bprParams);
-
-    const bprBG = device.createBindGroup({
-        layout: p.pbprBGL,
-        entries: [
-            { binding: 0, resource: { buffer: bucketBuf } },
-            { binding: 1, resource: { buffer: gPointsBuf } },
-            { binding: 2, resource: { buffer: bprParamsBuf } },
-        ],
-    });
-
-    const hornerParams = new Uint32Array([batchSize, subtasksPerMSM, bWgSize, windowSize]);
-    const hornerParamsBuf = device.createBuffer({
-        size: hornerParams.byteLength,
-        usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST,
-    });
-    device.queue.writeBuffer(hornerParamsBuf, 0, hornerParams);
-
-    const hornerBG = device.createBindGroup({
-        layout: p.hornerBGL,
-        entries: [
-            { binding: 0, resource: { buffer: gPointsBuf } },
-            { binding: 1, resource: { buffer: resultBuf } },
-            { binding: 2, resource: { buffer: hornerParamsBuf } },
-        ],
-    });
-
-    const t1 = performance.now();
-
-    const totalPoints = batchSize * numPoints;
-    const decompWG = Math.ceil(totalPoints / 256);
-
-    const cscEncoder = device.createCommandEncoder();
-    const decompPass = cscEncoder.beginComputePass();
-    decompPass.setPipeline(p.decomposePipeline);
-    decompPass.setBindGroup(0, cscBG);
-    decompPass.dispatchWorkgroups(decompWG, 1, 1);
-    decompPass.end();
-
-    const pfxPass = cscEncoder.beginComputePass();
-    pfxPass.setPipeline(p.prefixSumPipeline);
-    pfxPass.setBindGroup(0, cscBG);
-    pfxPass.dispatchWorkgroups(totalSubtasks, 1, 1);
-    pfxPass.end();
-
-    const scatterPass = cscEncoder.beginComputePass();
-    scatterPass.setPipeline(p.scatterPipeline);
-    scatterPass.setBindGroup(0, cscBG);
-    scatterPass.dispatchWorkgroups(decompWG, 1, 1);
-    scatterPass.end();
-
-    device.queue.submit([cscEncoder.finish()]);
-
-    const smvpWgSize = 64;
-    for (let chunkStart = 0; chunkStart < totalSubtasks; chunkStart += CHUNK_SIZE) {
-        const chunkSize = Math.min(CHUNK_SIZE, totalSubtasks - chunkStart);
-
-        smvpParams[2] = chunkSize;
-        smvpParams[3] = chunkStart;
-        smvpParams[4] = 0;  // csc_base_offset = 0: CSC covers ALL subtasks
-        device.queue.writeBuffer(smvpParamsBuf, 0, smvpParams);
-
-        bprParams[1] = chunkStart;
-        device.queue.writeBuffer(bprParamsBuf, 0, bprParams);
-
-        const chunkEncoder = device.createCommandEncoder();
-        chunkEncoder.clearBuffer(bucketBuf);
-
-        const smvpPass = chunkEncoder.beginComputePass();
-        smvpPass.setPipeline(p.smvpPipeline);
-        smvpPass.setBindGroup(0, smvpBG);
-        smvpPass.dispatchWorkgroups(Math.ceil((halfColumns * chunkSize) / smvpWgSize), 1, 1);
-        smvpPass.end();
-
-        const bprPass = chunkEncoder.beginComputePass();
-        bprPass.setPipeline(bprFusedPipeline);
-        bprPass.setBindGroup(0, bprBG);
-        bprPass.dispatchWorkgroups(1, chunkSize, 1);
-        bprPass.end();
-
-        device.queue.submit([chunkEncoder.finish()]);
-    }
-
-    const finalEncoder = device.createCommandEncoder();
-    const hornerWgSize = 64;
-    const hornerNumWG = Math.ceil(batchSize / hornerWgSize);
-    const hornerPass = finalEncoder.beginComputePass();
-    hornerPass.setPipeline(p.hornerPipeline);
-    hornerPass.setBindGroup(0, hornerBG);
-    hornerPass.dispatchWorkgroups(hornerNumWG, 1, 1);
-    hornerPass.end();
-
-    finalEncoder.copyBufferToBuffer(resultBuf, 0, stagingBuf, 0, resultLen * 4);
-    device.queue.submit([finalEncoder.finish()]);
-    const t2 = performance.now();
-
-    await stagingBuf.mapAsync(GPUMapMode.READ);
-    const resultData = new Uint32Array(stagingBuf.getMappedRange().slice(0));
-    stagingBuf.unmap();
-    const t3 = performance.now();
-
-    scalarsBuf.destroy();
-    colIndicesBuf.destroy();
-    colPtrBuf.destroy();
-    valIdxsBuf.destroy();
-    scatterCntBuf.destroy();
-    cscParamsBuf.destroy();
-    bucketBuf.destroy();
-    gPointsBuf.destroy();
-    smvpParamsBuf.destroy();
-    bprParamsBuf.destroy();
-    hornerParamsBuf.destroy();
-    resultBuf.destroy();
-    stagingBuf.destroy();
-
-    const uploadMB = ((scalarsFlat.byteLength + (p._pointsCache ? 0 : pointsFlat.byteLength)) / 1048576).toFixed(1);
-    console.log(`[gpu-msm] chunked batch=${batchSize} pts=${numPoints} bits=${scalarBitWidth} w=${windowSize} chunk=${CHUNK_SIZE} ` +
-        `upload=${uploadMB}MB bufs=${(t1-t0).toFixed(1)}ms submit=${(t2-t1).toFixed(1)}ms read=${(t3-t2).toFixed(1)}ms total=${(t3-t0).toFixed(1)}ms`);
-
-    return resultData;
-}
-
 // ── Hybrid CPU+GPU batch MSM ─────────────────────────────────────────────
 // Splits batch into GPU and CPU portions, running them in parallel.
 // cpuMsmFn: (pointsFlat, scalarsFlat, numPoints, batchSize) => Uint32Array (Jacobian)
-// gpuFn: either gpuBatchMSM or gpuBatchMSMChunked
+// gpuFn: the GPU MSM function to use (gpuBatchMSM)
 async function gpuBatchMSMHybrid(pointsFlat, scalarsFlat, numPoints, scalarBitWidth, batchSize, cpuMsmFn, gpuFn) {
     if (!cpuMsmFn) {
         // No CPU function available — fall back to pure GPU
@@ -749,6 +494,10 @@ export async function initGPUMSM(device) {
 
 export async function executeGPUBatchMSM(pointsFlat, scalarsFlat, numPoints, scalarBitWidth, batchSize) {
     return gpuBatchMSM(pointsFlat, scalarsFlat, numPoints, scalarBitWidth, batchSize);
+}
+
+export async function executeGPUBatchMSMHybrid(pointsFlat, scalarsFlat, numPoints, scalarBitWidth, batchSize, cpuMsmFn) {
+    return gpuBatchMSMHybrid(pointsFlat, scalarsFlat, numPoints, scalarBitWidth, batchSize, cpuMsmFn, gpuBatchMSM);
 }
 
 

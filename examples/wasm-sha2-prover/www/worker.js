@@ -11,7 +11,7 @@ import init, {
 // GPU imports — these JS modules still load fine, they just won't be called without the feature
 import { initGpuPairing, gpuBatchMultiPairing, gpuBatchMultiPairingFromBuffer, gpuCombineHints, getGpuDevice } from './gpu-pairing.js';
 import { initGPUMSM, executeGPUBatchMSMHybrid } from './gpu-msm.js';
-import { initGpuG2, gpuG2FixedBaseScalarMul, gpuG2UploadTable, gpuG2ScalarMulCached, isGpuG2Available } from './gpu-g2.js';
+import { initGpuG2, gpuG2FixedBaseScalarMul, gpuG2UploadTable, gpuG2ScalarMulCached } from './gpu-g2.js';
 import { initGpuOnehot, gpuOnehotGatherDirect, gpuOnehotGatherDirectRetainBuffer } from './gpu-onehot.js';
 
 // Safari cannot reliably handle 4GB (65536 pages) shared WASM memory due to
