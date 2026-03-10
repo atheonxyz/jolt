@@ -13,10 +13,6 @@ use std::sync::OnceLock;
 
 const NUM_LIMBS: usize = 8;
 
-// ---------------------------------------------------------------------------
-// Limb conversion helpers
-// ---------------------------------------------------------------------------
-
 /// Convert Fq (base field) from 8 u32 limbs (little-endian)
 #[inline(always)]
 fn limbs8_to_fq(limbs: &[u32]) -> Fq {
@@ -52,10 +48,6 @@ fn jacobian_from_limbs(limbs: &[u32]) -> G1Projective {
     let z = limbs8_to_fq(&limbs[16..24]);
     G1Projective::new_unchecked(x, y, z)
 }
-
-// ---------------------------------------------------------------------------
-// Scalar serialization — convert various types to 8 × u32 limbs
-// ---------------------------------------------------------------------------
 
 /// Serialize a Fr scalar to 8 u32 limbs (in Montgomery form, as Arkworks stores them).
 /// No into_bigint() — we keep Montgomery form and correct with R^{-1} after MSM.
@@ -139,10 +131,6 @@ fn s128_to_limbs(s: &S128) -> [u32; NUM_LIMBS] {
     }
 }
 
-// ---------------------------------------------------------------------------
-// R_inv correction for Montgomery-form scalar MSMs
-// ---------------------------------------------------------------------------
-
 /// Precomputed R^{-1} mod q for Montgomery form correction.
 /// When scalars are in Montgomery form (Fr), the MSM result is scaled by R.
 /// Multiply by R^{-1} to get the correct result.
@@ -165,10 +153,6 @@ fn apply_r_inv_correction(point: G1Projective) -> G1Projective {
     let r_inv = get_r_inv();
     point * r_inv
 }
-
-// ---------------------------------------------------------------------------
-// JS Bridge — extern imports via wasm_bindgen
-// ---------------------------------------------------------------------------
 
 #[cfg(target_arch = "wasm32")]
 mod js_bridge {
@@ -207,10 +191,6 @@ mod js_bridge {
         pub fn js_gpu_msm_available() -> bool;
     }
 }
-
-// ---------------------------------------------------------------------------
-// Public API
-// ---------------------------------------------------------------------------
 
 /// Check if WebGPU MSM acceleration is available in the current runtime.
 #[cfg(target_arch = "wasm32")]
@@ -334,10 +314,6 @@ pub async fn gpu_batch_msm(
     results
 }
 
-// ---------------------------------------------------------------------------
-// Scalar serialization helpers for commit_tier_1
-// ---------------------------------------------------------------------------
-
 /// Serialize a slice of u8 scalars into a Vec of u32 limbs (NUM_LIMBS per scalar)
 pub fn serialize_u8_scalars(scalars: &[u8]) -> Vec<u32> {
     let mut out = Vec::with_capacity(scalars.len() * NUM_LIMBS);
@@ -410,10 +386,6 @@ pub fn serialize_fr_scalars(scalars: &[Fr]) -> Vec<u32> {
     }
     out
 }
-
-// ---------------------------------------------------------------------------
-// Non-blocking dispatch/resolve for GPU MSM overlap
-// ---------------------------------------------------------------------------
 
 /// Handle for an in-flight GPU MSM computation.
 /// Created by `dispatch_gpu_batch_msm`, consumed by `resolve_gpu_batch_msm`.
@@ -498,10 +470,6 @@ pub async fn resolve_gpu_batch_msm(handle: GpuMsmHandle) -> Vec<G1Projective> {
     results
 }
 
-// ---------------------------------------------------------------------------
-// CPU batch MSM — mirrors the commit_tier_1 path for browser comparison tests
-// ---------------------------------------------------------------------------
-
 /// CPU batch MSM using arkworks `VariableBaseMSM::msm_serial` with rayon
 /// parallelism across batch rows — **exactly** matching `commit_tier_1`.
 ///
@@ -577,29 +545,14 @@ pub fn cpu_batch_msm_from_limbs(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use ark_bn254::{Bn254, Fr, G1Affine, G1Projective};
+    use ark_bn254::{Fr, G1Affine, G1Projective};
     use ark_ec::{AffineRepr, CurveGroup, VariableBaseMSM};
     use ark_ff::{Field, MontConfig, One, PrimeField, Zero};
-
-    /// Helper: print a slice of u32 limbs in JS `new Uint32Array([...])` format.
-    fn print_js_u32_array(name: &str, limbs: &[u32]) {
-        print!("const {} = new Uint32Array([", name);
-        for (i, l) in limbs.iter().enumerate() {
-            if i > 0 {
-                print!(", ");
-            }
-            if i % 8 == 0 {
-                print!("\n  ");
-            }
-            print!("0x{:08x}", l);
-        }
-        println!("\n]);");
-    }
 
     /// Print MSM reference values as u32 limbs (JS format) for use in browser tests.
     /// Computes scalar multiples of the generator and verifies MSM results.
     #[test]
-    fn print_msm_reference_values() {
+    fn msm_reference_values_correctness() {
         let g = G1Affine::generator();
         let g_proj = G1Projective::from(g);
 
@@ -610,27 +563,15 @@ mod tests {
 
         // Print G1 generator as JS limbs
         let g_limbs = g1_affine_to_limbs(&g);
-        println!("G1 generator:");
-        print_js_u32_array("REF_G_X", &g_limbs[0..8]);
-        print_js_u32_array("REF_G_Y", &g_limbs[8..16]);
 
         // Print 2G
         let g2_limbs = g1_affine_to_limbs(&g2);
-        println!("\n2G:");
-        print_js_u32_array("REF_2G_X", &g2_limbs[0..8]);
-        print_js_u32_array("REF_2G_Y", &g2_limbs[8..16]);
 
         // Print 3G
         let g3_limbs = g1_affine_to_limbs(&g3);
-        println!("\n3G:");
-        print_js_u32_array("REF_3G_X", &g3_limbs[0..8]);
-        print_js_u32_array("REF_3G_Y", &g3_limbs[8..16]);
 
         // Print 5G
         let g5_limbs = g1_affine_to_limbs(&g5);
-        println!("\n5G:");
-        print_js_u32_array("REF_5G_X", &g5_limbs[0..8]);
-        print_js_u32_array("REF_5G_Y", &g5_limbs[8..16]);
 
         // MSM test 1: 2*G + 3*(2G) + 1*(3G) = 2G + 6G + 3G = 11G
         let bases_1 = vec![g, g2, g3];
@@ -641,12 +582,9 @@ mod tests {
             msm_1, expected_11g,
             "MSM(2*G + 3*2G + 1*3G) should equal 11G"
         );
-        println!("\nMSM test 1: 2*G + 3*(2G) + 1*(3G) = 11G OK");
 
         let msm_1_affine = msm_1.into_affine();
         let msm_1_limbs = g1_affine_to_limbs(&msm_1_affine);
-        print_js_u32_array("REF_11G_X", &msm_1_limbs[0..8]);
-        print_js_u32_array("REF_11G_Y", &msm_1_limbs[8..16]);
 
         // MSM test 2: 1*G + 2*(2G) + 3*(3G) + 4*(4G) + 5*(5G)
         //           = 1G + 4G + 9G + 16G + 25G = 55G
@@ -665,12 +603,9 @@ mod tests {
             msm_2, expected_55g,
             "MSM(1*G + 2*2G + 3*3G + 4*4G + 5*5G) should equal 55G"
         );
-        println!("\nMSM test 2: 1*G + 2*(2G) + 3*(3G) + 4*(4G) + 5*(5G) = 55G OK");
 
         let msm_2_affine = msm_2.into_affine();
         let msm_2_limbs = g1_affine_to_limbs(&msm_2_affine);
-        print_js_u32_array("REF_55G_X", &msm_2_limbs[0..8]);
-        print_js_u32_array("REF_55G_Y", &msm_2_limbs[8..16]);
     }
 
     /// Verify G1 point serialization/deserialization roundtrip.
@@ -685,7 +620,6 @@ mod tests {
         let y_back = limbs8_to_fq(&limbs[8..16]);
         assert_eq!(x_back, g.x, "G1 generator x roundtrip failed");
         assert_eq!(y_back, g.y, "G1 generator y roundtrip failed");
-        println!("G1 generator serialization roundtrip: OK");
 
         // Test with 2G
         let g2 = (G1Projective::from(g) + G1Projective::from(g)).into_affine();
@@ -695,7 +629,6 @@ mod tests {
         let y2_back = limbs8_to_fq(&limbs2[8..16]);
         assert_eq!(x2_back, g2.x, "2G x roundtrip failed");
         assert_eq!(y2_back, g2.y, "2G y roundtrip failed");
-        println!("2G serialization roundtrip: OK");
 
         // Test Jacobian roundtrip: create Jacobian with z=1, recover affine
         let mut jac_limbs = [0u32; 24];
@@ -709,7 +642,6 @@ mod tests {
         }
         let g_back = jacobian_from_limbs(&jac_limbs);
         assert_eq!(g_back.into_affine(), g, "Jacobian roundtrip failed");
-        println!("Jacobian serialization roundtrip: OK");
     }
 
     /// Compare MSM computed via arkworks VariableBaseMSM against expected scalar multiples.
@@ -722,7 +654,6 @@ mod tests {
         let result = G1Projective::msm(&[g], &[Fr::from(7u64)]).unwrap();
         let expected = g_proj * Fr::from(7u64);
         assert_eq!(result, expected, "Single-point MSM: 7*G should equal 7G");
-        println!("MSM test: 7*G = 7G OK");
 
         // Test 2: Two identical bases — 3*G + 5*G = 8G
         let result2 = G1Projective::msm(&[g, g], &[Fr::from(3u64), Fr::from(5u64)]).unwrap();
@@ -731,7 +662,6 @@ mod tests {
             result2, expected2,
             "Two-point MSM: 3*G + 5*G should equal 8G"
         );
-        println!("MSM test: 3*G + 5*G = 8G OK");
 
         // Test 3: Different bases — 2*G + 3*(2G) = 2G + 6G = 8G
         let g2 = (g_proj + g_proj).into_affine();
@@ -741,7 +671,6 @@ mod tests {
             result3, expected3,
             "Mixed-base MSM: 2*G + 3*(2G) should equal 8G"
         );
-        println!("MSM test: 2*G + 3*(2G) = 8G OK");
 
         // Test 4: Zero scalar — 0*G + 5*G = 5G
         let result4 = G1Projective::msm(&[g, g], &[Fr::zero(), Fr::from(5u64)]).unwrap();
@@ -750,7 +679,6 @@ mod tests {
             result4, expected4,
             "MSM with zero scalar: 0*G + 5*G should equal 5G"
         );
-        println!("MSM test: 0*G + 5*G = 5G OK");
 
         // Test 5: Larger MSM — sum of i*(iG) for i=1..5 = 1+4+9+16+25 = 55G
         let g3 = (g_proj * Fr::from(3u64)).into_affine();
@@ -770,7 +698,6 @@ mod tests {
             result5, expected5,
             "Larger MSM: sum i*(iG) for i=1..5 should equal 55G"
         );
-        println!("MSM test: sum i*(iG) for i=1..5 = 55G OK");
     }
 
     /// Verify R_inv correction math for Montgomery-form scalar MSMs.
@@ -788,7 +715,6 @@ mod tests {
 
         // Verify R * R^{-1} = 1
         assert_eq!(r_fr * r_inv, Fr::one(), "R * R_inv should equal 1");
-        println!("R * R^{{-1}} = 1 OK");
 
         // Simulate GPU Montgomery-form MSM:
         // We want: scalar * G
@@ -804,7 +730,6 @@ mod tests {
             corrected, expected,
             "R_inv correction should recover correct MSM result"
         );
-        println!("R_inv correction for scalar=42: OK");
 
         // Verify apply_r_inv_correction produces the same result
         let corrected2 = apply_r_inv_correction(gpu_result);
@@ -812,7 +737,6 @@ mod tests {
             corrected2, expected,
             "apply_r_inv_correction should match manual R_inv"
         );
-        println!("apply_r_inv_correction matches manual computation OK");
 
         // Test with zero point — should remain zero
         let zero_point = G1Projective::zero();
@@ -821,12 +745,7 @@ mod tests {
             zero_corrected.is_zero(),
             "R_inv correction of zero should be zero"
         );
-        println!("R_inv correction of zero point: OK");
 
         // Print R and R_inv as u32 limbs for JS reference
-        let r_limbs = fr_to_limbs(&r_fr);
-        let r_inv_limbs = fr_to_limbs(&r_inv);
-        print_js_u32_array("MONT_R", &r_limbs);
-        print_js_u32_array("MONT_R_INV", &r_inv_limbs);
     }
 }

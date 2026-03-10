@@ -25,10 +25,6 @@ const TABLE_ENTRIES: usize = 31; // 2^5 - 1
 const G2_AFFINE_WORDS: usize = 4 * NUM_LIMBS; // x.c0, x.c1, y.c0, y.c1
 const G2_JACOBIAN_WORDS: usize = 6 * NUM_LIMBS; // x.c0, x.c1, y.c0, y.c1, z.c0, z.c1
 
-// ---------------------------------------------------------------------------
-// Limb conversion helpers
-// ---------------------------------------------------------------------------
-
 /// Serialize an Fq element to 8 u32 limbs (Montgomery form, little-endian).
 /// Directly splits the internal u64 limbs into u32 pairs.
 #[inline(always)]
@@ -90,10 +86,6 @@ fn fr_to_raw_limbs(scalar: &Fr) -> [u32; NUM_LIMBS] {
     out
 }
 
-// ---------------------------------------------------------------------------
-// Table construction
-// ---------------------------------------------------------------------------
-
 /// Build the precomputed table for a given base point.
 ///
 /// Table layout: for each window i (0..NUM_WINDOWS), for each digit j (1..=TABLE_ENTRIES):
@@ -128,10 +120,6 @@ pub fn build_fixed_base_table(base: &G2Affine) -> Vec<u32> {
     table
 }
 
-// ---------------------------------------------------------------------------
-// Scalar serialization
-// ---------------------------------------------------------------------------
-
 /// Serialize a slice of Fr scalars to raw bit representation for GPU.
 pub fn serialize_fr_scalars_raw(scalars: &[Fr]) -> Vec<u32> {
     let mut out = Vec::with_capacity(scalars.len() * NUM_LIMBS);
@@ -140,10 +128,6 @@ pub fn serialize_fr_scalars_raw(scalars: &[Fr]) -> Vec<u32> {
     }
     out
 }
-
-// ---------------------------------------------------------------------------
-// Result deserialization
-// ---------------------------------------------------------------------------
 
 /// Parse a G2 Jacobian result from u32 limbs back to G2Projective.
 ///
@@ -175,14 +159,6 @@ fn parse_g2_jacobian(limbs: &[u32]) -> G2Projective {
     let affine = G2Affine::new_unchecked(aff_x, aff_y);
     G2Projective::from(affine)
 }
-
-// ---------------------------------------------------------------------------
-// Table cache: build once per base point, reuse across all calls.
-//
-// The base point is always dory_setup.h2.0 (the G2 generator from setup),
-// so this cache effectively means the table is built once at first use.
-// Uses thread_local because WASM is single-threaded.
-// ---------------------------------------------------------------------------
 
 #[cfg(target_arch = "wasm32")]
 thread_local! {
@@ -221,10 +197,6 @@ fn get_or_build_table(base: &G2Affine) -> (Vec<u32>, bool) {
     })
 }
 
-// ---------------------------------------------------------------------------
-// JS Bridge — extern imports via wasm_bindgen
-// ---------------------------------------------------------------------------
-
 #[cfg(target_arch = "wasm32")]
 mod js_bridge {
     use wasm_bindgen::prelude::*;
@@ -256,10 +228,6 @@ mod js_bridge {
         pub fn js_gpu_g2_available() -> bool;
     }
 }
-
-// ---------------------------------------------------------------------------
-// Public API
-// ---------------------------------------------------------------------------
 
 /// Check if WebGPU G2 scalar mul acceleration is available in the current runtime.
 #[cfg(target_arch = "wasm32")]
@@ -331,120 +299,4 @@ pub async fn gpu_g2_fixed_base_scalar_mul(
     }
 
     results
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use ark_ec::AffineRepr;
-    use ark_ff::One;
-
-    /// Mulberry32 PRNG — must match the JS implementation exactly.
-    fn mulberry32(seed: u32) -> impl FnMut() -> u32 {
-        let mut t = seed;
-        move || {
-            t = t.wrapping_add(0x6d2b79f5);
-            let mut x = t ^ (t >> 15);
-            x = x.wrapping_mul(t | 1);
-            x ^= x.wrapping_add((x ^ (x >> 7)).wrapping_mul(x | 61));
-            x ^ (x >> 14)
-        }
-    }
-
-    /// Convert raw u32 limbs to Fr.
-    /// Clears bit 255 first (GPU only processes bits 0-254),
-    /// then uses from_le_bytes_mod_order.
-    fn fr_from_raw_limbs_gpu(limbs: &[u32]) -> Fr {
-        let mut bytes = [0u8; 32];
-        for i in 0..8 {
-            let le = limbs[i].to_le_bytes();
-            bytes[i * 4..i * 4 + 4].copy_from_slice(&le);
-        }
-        // Clear bit 255 (MSB of last byte) — GPU processes 255 bits (0-254 only)
-        bytes[31] &= 0x7F;
-        Fr::from_le_bytes_mod_order(&bytes)
-    }
-
-    fn affine_to_32_limbs(pt: &G2Affine) -> [u32; 32] {
-        g2_affine_to_limbs(pt)
-    }
-
-    fn format_u32_array_js(limbs: &[u32]) -> String {
-        let strs: Vec<String> = limbs.iter().map(|x| x.to_string()).collect();
-        format!("new Uint32Array([{}])", strs.join(", "))
-    }
-
-    #[test]
-    fn generate_g2_reference_values() {
-        let r#gen = G2Affine::generator();
-        let gen_proj = G2Projective::from(r#gen);
-
-        // scalar = 1
-        {
-            let fr = Fr::one();
-            let result = (gen_proj * fr).into_affine();
-            let limbs = affine_to_32_limbs(&result);
-            println!("\"scalar = 1\": [{}],", format_u32_array_js(&limbs));
-        }
-
-        // scalar = 2
-        {
-            let fr = Fr::from(2u64);
-            let result = (gen_proj * fr).into_affine();
-            let limbs = affine_to_32_limbs(&result);
-            println!("\"scalar = 2\": [{}],", format_u32_array_js(&limbs));
-        }
-
-        // scalar = 0
-        println!("\"scalar = 0\": [null],");
-
-        // small scalars 1-8
-        {
-            print!("\"small scalars 1-8\": [");
-            for k in 1..=8u64 {
-                let fr = Fr::from(k);
-                let result = (gen_proj * fr).into_affine();
-                let limbs = affine_to_32_limbs(&result);
-                if k > 1 {
-                    print!(", ");
-                }
-                print!("{}", format_u32_array_js(&limbs));
-            }
-            println!("],");
-        }
-
-        // random 256-bit scalars (seed 0xC0FFEE01) — 16 scalars
-        // IMPORTANT: clear bit 255 to match GPU behavior (255 bits only)
-        {
-            let mut rng = mulberry32(0xC0FFEE01);
-            print!("\"random 256-bit scalars (seed 0xC0FFEE01)\": [");
-            for k in 0..16 {
-                let mut raw_limbs = [0u32; 8];
-                for i in 0..8 {
-                    raw_limbs[i] = rng();
-                }
-                // Clear bit 255 — GPU processes bits 0-254 only
-                raw_limbs[7] &= 0x7FFFFFFF;
-                let fr = fr_from_raw_limbs_gpu(&raw_limbs);
-                let result = (gen_proj * fr).into_affine();
-                let limbs = affine_to_32_limbs(&result);
-                if k > 0 {
-                    print!(", ");
-                }
-                print!("{}", format_u32_array_js(&limbs));
-            }
-            println!("],");
-        }
-
-        // near-modulus scalar (Fr - 1)
-        {
-            let fr = -Fr::one();
-            let result = (gen_proj * fr).into_affine();
-            let limbs = affine_to_32_limbs(&result);
-            println!(
-                "\"near-modulus scalar (Fr - 1)\": [{}],",
-                format_u32_array_js(&limbs)
-            );
-        }
-    }
 }

@@ -3823,8 +3823,6 @@ mod tests {
         );
         let (jolt_proof, _) = prover.prove();
 
-        println!("\n=== BlindFold R1CS Satisfaction Test (All 7 Stages) ===\n");
-
         // Process all 7 stages and verify each one
         let stage_proofs: Vec<(&str, &SumcheckInstanceProof<Fr, Bn254Curve, _>)> = vec![
             ("Stage 1 (Spartan Outer)", &jolt_proof.stage1_sumcheck_proof),
@@ -3855,7 +3853,6 @@ mod tests {
             let rounds = process_stage(stage_name, proof, &mut stage_transcript);
 
             if rounds.is_empty() {
-                println!("  {stage_name} - 0 rounds, skipping");
                 continue;
             }
 
@@ -3892,17 +3889,9 @@ mod tests {
                 }
             }
 
-            println!(
-                "  {stage_name} - {stage_rounds} rounds, {stage_constraints} constraints - SATISFIED"
-            );
             total_rounds += stage_rounds;
             total_constraints += stage_constraints;
         }
-
-        println!("\n=== Summary ===");
-        println!("Total rounds across all stages: {total_rounds}");
-        println!("Total constraints across all stages: {total_constraints}");
-        println!("All 6 stages satisfied!\n");
 
         // Ensure we processed a meaningful amount
         assert!(total_rounds > 0, "Expected at least some sumcheck rounds");
@@ -4101,15 +4090,6 @@ mod tests {
             result.is_ok(),
             "BlindFold protocol verification failed: {result:?}"
         );
-
-        println!("\n=== BlindFold Protocol E2E Test ===");
-        println!(
-            "R1CS size: {} constraints, {} variables",
-            r1cs.num_constraints, r1cs.num_vars
-        );
-        println!("Witness size: {} field elements", witness.len());
-        println!("Spartan sumcheck rounds: {}", proof.spartan_proof.len());
-        println!("Protocol verification: SUCCESS");
     }
 
     #[test]
