@@ -3091,7 +3091,6 @@ dependencies = [
  "serde_json",
  "sha2-guest",
  "sha3-chain-guest",
- "tracer",
  "tracing",
  "tracing-subscriber",
  "wasm-bindgen",

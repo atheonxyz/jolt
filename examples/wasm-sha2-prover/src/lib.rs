@@ -213,6 +213,7 @@ impl WasmProver {
         self.prove_with_inputs(&inputs)
     }
 
+    #[cfg(target_arch = "wasm32")]
     /// GPU-accelerated prove (async). Uses WebGPU for tier-2 pairings if available.
     async fn prove_with_inputs_gpu(&self, inputs: &[u8]) -> Result<ProveResult, JsValue> {
         use jolt_core::zkvm::prover::JoltCpuProver;
@@ -290,12 +291,14 @@ impl WasmProver {
         })
     }
 
+    #[cfg(target_arch = "wasm32")]
     pub async fn prove_sha2_gpu(&self, input: &[u8]) -> Result<ProveResult, JsValue> {
         let inputs = postcard::to_allocvec(&input)
             .map_err(|e| JsValue::from_str(&format!("Input serialization error: {e}")))?;
         self.prove_with_inputs_gpu(&inputs).await
     }
 
+    #[cfg(target_arch = "wasm32")]
     pub async fn prove_ecdsa_gpu(
         &self,
         z: &[u64],
@@ -336,6 +339,7 @@ impl WasmProver {
         self.prove_with_inputs_gpu(&inputs).await
     }
 
+    #[cfg(target_arch = "wasm32")]
     pub async fn prove_keccak_chain_gpu(
         &self,
         input: &[u8],

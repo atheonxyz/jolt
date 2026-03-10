@@ -82,7 +82,7 @@ const FILTERED_SPANS: &[&str] = &[
 ];
 
 fn is_filtered_span(name: &str) -> bool {
-    FILTERED_SPANS.iter().any(|&filtered| name == filtered)
+    FILTERED_SPANS.contains(&name)
 }
 
 impl<S> Layer<S> for ChromeTraceLayer

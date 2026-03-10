@@ -596,7 +596,7 @@ impl<
         (proof, debug_info)
     }
 
-    #[cfg(target_arch = "wasm32")]
+    #[cfg(all(feature = "webgpu-pairing", target_arch = "wasm32"))]
     #[allow(clippy::type_complexity)]
     #[tracing::instrument(skip_all)]
     pub async fn prove_with_gpu(
