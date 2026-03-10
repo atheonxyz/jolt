@@ -382,7 +382,11 @@ pub fn dispatch_gpu_multi_group_pairing(
     let mut total_gpu_pairs = 0usize;
 
     for (g1, g2) in groups {
-        assert_eq!(g1.len(), g2.len(), "G1 and G2 lengths must match within group");
+        assert_eq!(
+            g1.len(),
+            g2.len(),
+            "G1 and G2 lengths must match within group"
+        );
         let n = g1.len();
         let gpu_count = if n < MIN_HYBRID_PAIRS {
             n
@@ -451,9 +455,7 @@ pub fn dispatch_gpu_multi_group_pairing(
 }
 
 #[cfg(target_arch = "wasm32")]
-pub async fn resolve_gpu_multi_group_pairing(
-    handle: GpuMultiGroupPairingHandle,
-) -> Vec<ArkGT> {
+pub async fn resolve_gpu_multi_group_pairing(handle: GpuMultiGroupPairingHandle) -> Vec<ArkGT> {
     use js_sys::Uint32Array;
     use rayon::prelude::*;
     use wasm_bindgen::JsCast;

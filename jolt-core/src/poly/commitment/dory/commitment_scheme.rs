@@ -650,10 +650,10 @@ impl DoryCommitmentScheme {
             if use_gpu_pairing && n2 >= GPU_PAIRING_THRESHOLD && v2_scalars.is_none() {
                 // Batch all 4 pairings in ONE GPU dispatch (d1 + d2)
                 let gpu_handle = webgpu_pairing::dispatch_gpu_multi_group_pairing(&[
-                    (v1_l, g2_prime),  // d1_left
-                    (v1_r, g2_prime),  // d1_right
-                    (g1_prime, v2_l),  // d2_left
-                    (g1_prime, v2_r),  // d2_right
+                    (v1_l, g2_prime), // d1_left
+                    (v1_r, g2_prime), // d1_right
+                    (g1_prime, v2_l), // d2_left
+                    (g1_prime, v2_r), // d2_right
                 ]);
 
                 // CPU MSMs overlap with GPU dispatch
@@ -669,8 +669,8 @@ impl DoryCommitmentScheme {
             } else if use_gpu_pairing && n2 >= GPU_PAIRING_THRESHOLD {
                 // v2_scalars is Some (first round): batch d1 on GPU, d2 uses MSM + pair
                 let gpu_handle = webgpu_pairing::dispatch_gpu_multi_group_pairing(&[
-                    (v1_l, g2_prime),  // d1_left
-                    (v1_r, g2_prime),  // d1_right
+                    (v1_l, g2_prime), // d1_left
+                    (v1_r, g2_prime), // d1_right
                 ]);
 
                 // d2 via MSM + single pair (CPU) + MSMs, overlapping with GPU
@@ -744,8 +744,8 @@ impl DoryCommitmentScheme {
             if use_gpu_pairing && n2 >= GPU_PAIRING_THRESHOLD {
                 // Batch both pairings in ONE GPU dispatch
                 let gpu_handle = webgpu_pairing::dispatch_gpu_multi_group_pairing(&[
-                    (v1_l, v2_r),  // c_plus
-                    (v1_r, v2_l),  // c_minus
+                    (v1_l, v2_r), // c_plus
+                    (v1_r, v2_l), // c_minus
                 ]);
 
                 // CPU MSMs overlap with GPU dispatch
