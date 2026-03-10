@@ -2,7 +2,7 @@ use ark_serialize::CanonicalSerialize;
 use jolt_core::curve::Bn254Curve;
 use jolt_core::poly::commitment::dory::{ArkworksVerifierSetup, DoryCommitmentScheme};
 use jolt_core::zkvm::prover::JoltProverPreprocessing;
-use jolt_core::zkvm::verifier::{JoltSharedPreprocessing, JoltVerifierPreprocessing};
+use jolt_core::zkvm::verifier::{BlindfoldSetup, JoltSharedPreprocessing, JoltVerifierPreprocessing};
 use std::path::{Path, PathBuf};
 
 type ProverPrep = JoltProverPreprocessing<ark_bn254::Fr, Bn254Curve, DoryCommitmentScheme>;
@@ -16,7 +16,7 @@ struct ProgramSpec {
     compile: fn(&str) -> jolt_core::host::Program,
     preprocess_shared: fn(&mut jolt_core::host::Program) -> JoltSharedPreprocessing,
     preprocess_prover: fn(JoltSharedPreprocessing) -> ProverPrep,
-    preprocess_verifier: fn(JoltSharedPreprocessing, ArkworksVerifierSetup) -> VerifierPrep,
+    preprocess_verifier: fn(JoltSharedPreprocessing, ArkworksVerifierSetup, Option<BlindfoldSetup<Bn254Curve>>) -> VerifierPrep,
 }
 
 fn generate_program(www_dir: &Path, spec: &ProgramSpec) {
@@ -39,7 +39,7 @@ fn generate_program(www_dir: &Path, spec: &ProgramSpec) {
 
     println!("[{name}] Generating verifier preprocessing...");
     let verifier_setup = prover_preprocessing.generators.to_verifier_setup();
-    let verifier_preprocessing = (spec.preprocess_verifier)(shared, verifier_setup);
+    let verifier_preprocessing = (spec.preprocess_verifier)(shared, verifier_setup, None);
 
     let mut prover_bytes = Vec::new();
     prover_preprocessing
