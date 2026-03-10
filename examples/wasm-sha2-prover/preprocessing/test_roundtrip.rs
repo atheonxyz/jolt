@@ -10,16 +10,10 @@ type ProverPrep = JoltProverPreprocessing<ark_bn254::Fr, Bn254Curve, DoryCommitm
 type VerifierPrep = JoltVerifierPreprocessing<ark_bn254::Fr, Bn254Curve, DoryCommitmentScheme>;
 
 fn test_prover_roundtrip(bytes: &[u8]) -> Result<(), String> {
-    let total = bytes.len();
-    println!("\nTesting Prover Preprocessing Roundtrip");
-    println!("Total bytes: {total}");
+    let prep: ProverPrep =
+        CanonicalDeserialize::deserialize_uncompressed_unchecked(Cursor::new(bytes))
+            .map_err(|e| format!("Deserialize failed: {e}"))?;
 
-    println!("Deserializing ProverPreprocessing...");
-    let prep: ProverPrep = CanonicalDeserialize::deserialize_uncompressed_unchecked(Cursor::new(bytes))
-        .map_err(|e| format!("Deserialize failed: {e}"))?;
-    println!("  OK");
-
-    println!("Testing serialize -> deserialize roundtrip...");
     let mut reserialized = Vec::new();
     prep.serialize_uncompressed(&mut reserialized)
         .map_err(|e| format!("Reserialize failed: {e}"))?;
@@ -41,22 +35,15 @@ fn test_prover_roundtrip(bytes: &[u8]) -> Result<(), String> {
             }
         }
     }
-    println!("  OK - bytes match exactly");
 
     Ok(())
 }
 
 fn test_verifier_roundtrip(bytes: &[u8]) -> Result<(), String> {
-    let total = bytes.len();
-    println!("\nTesting Verifier Preprocessing Roundtrip");
-    println!("Total bytes: {total}");
+    let prep: VerifierPrep =
+        CanonicalDeserialize::deserialize_uncompressed_unchecked(Cursor::new(bytes))
+            .map_err(|e| format!("Deserialize failed: {e}"))?;
 
-    println!("Deserializing VerifierPreprocessing...");
-    let prep: VerifierPrep = CanonicalDeserialize::deserialize_uncompressed_unchecked(Cursor::new(bytes))
-        .map_err(|e| format!("Deserialize failed: {e}"))?;
-    println!("  OK");
-
-    println!("Testing serialize -> deserialize roundtrip...");
     let mut reserialized = Vec::new();
     prep.serialize_uncompressed(&mut reserialized)
         .map_err(|e| format!("Reserialize failed: {e}"))?;
@@ -78,7 +65,6 @@ fn test_verifier_roundtrip(bytes: &[u8]) -> Result<(), String> {
             }
         }
     }
-    println!("  OK - bytes match exactly");
 
     Ok(())
 }
@@ -98,29 +84,25 @@ fn main() {
 
     for (name, prover_file, verifier_file) in &programs {
         let prover_path = www_dir.join(prover_file);
-        println!("\n[{name}] Reading prover preprocessing from {prover_path:?}");
         let prover_bytes = std::fs::read(&prover_path).expect("Failed to read prover file");
 
         match test_prover_roundtrip(&prover_bytes) {
-            Ok(()) => println!("[{name}] Prover preprocessing: PASS"),
+            Ok(()) => {}
             Err(e) => {
-                println!("[{name}] Prover preprocessing: FAIL - {e}");
+                eprintln!("{e}");
                 std::process::exit(1);
             }
         }
 
         let verifier_path = www_dir.join(verifier_file);
-        println!("[{name}] Reading verifier preprocessing from {verifier_path:?}");
         let verifier_bytes = std::fs::read(&verifier_path).expect("Failed to read verifier file");
 
         match test_verifier_roundtrip(&verifier_bytes) {
-            Ok(()) => println!("[{name}] Verifier preprocessing: PASS"),
+            Ok(()) => {}
             Err(e) => {
-                println!("[{name}] Verifier preprocessing: FAIL - {e}");
+                eprintln!("{e}");
                 std::process::exit(1);
             }
         }
     }
-
-    println!("\nAll tests passed!");
 }

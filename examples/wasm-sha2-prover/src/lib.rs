@@ -358,10 +358,6 @@ impl WasmProver {
     }
 }
 
-// ---------------------------------------------------------------------------
-// CPU batch MSM — exposed to JS for GPU-vs-CPU comparison tests
-// ---------------------------------------------------------------------------
-
 /// CPU batch MSM using the same algorithm as Jolt's `commit_tier_1`:
 /// CPU-side batch MSM exposed to JS for the hybrid CPU+GPU pipeline.
 /// Uses rayon parallelism across batch rows, `msm_serial` per row.
@@ -378,10 +374,20 @@ pub fn cpu_batch_msm(
     num_points: u32,
     batch_size: u32,
 ) -> Vec<u32> {
-    let _ = points_flat;
-    let _ = scalars_flat;
-    let _ = num_points;
-    vec![0u32; batch_size as usize * 24]
+    #[cfg(target_arch = "wasm32")]
+    {
+        jolt_core::poly::commitment::dory::webgpu_msm::cpu_batch_msm_from_limbs(
+            points_flat,
+            scalars_flat,
+            num_points as usize,
+            batch_size as usize,
+        )
+    }
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        let _ = (points_flat, scalars_flat, num_points);
+        vec![0u32; batch_size as usize * 24]
+    }
 }
 
 #[wasm_bindgen]
