@@ -1,11 +1,12 @@
 use ark_serialize::CanonicalSerialize;
+use jolt_core::curve::Bn254Curve;
 use jolt_core::poly::commitment::dory::{ArkworksVerifierSetup, DoryCommitmentScheme};
 use jolt_core::zkvm::prover::JoltProverPreprocessing;
 use jolt_core::zkvm::verifier::{JoltSharedPreprocessing, JoltVerifierPreprocessing};
 use std::path::{Path, PathBuf};
 
-type ProverPrep = JoltProverPreprocessing<ark_bn254::Fr, DoryCommitmentScheme>;
-type VerifierPrep = JoltVerifierPreprocessing<ark_bn254::Fr, DoryCommitmentScheme>;
+type ProverPrep = JoltProverPreprocessing<ark_bn254::Fr, Bn254Curve, DoryCommitmentScheme>;
+type VerifierPrep = JoltVerifierPreprocessing<ark_bn254::Fr, Bn254Curve, DoryCommitmentScheme>;
 
 struct ProgramSpec {
     name: &'static str,

@@ -16,8 +16,8 @@ mod wasm_tracing;
 #[cfg(not(target_arch = "wasm32"))]
 pub static mut _HEAP_PTR: u8 = 0;
 
-type ProverPreprocessing = JoltProverPreprocessing<Fr, DoryCommitmentScheme>;
-type VerifierPreprocessing = JoltVerifierPreprocessing<Fr, DoryCommitmentScheme>;
+type ProverPreprocessing = JoltProverPreprocessing<Fr, Bn254Curve, DoryCommitmentScheme>;
+type VerifierPreprocessing = JoltVerifierPreprocessing<Fr, Bn254Curve, DoryCommitmentScheme>;
 
 #[wasm_bindgen(start)]
 pub fn wasm_main() {
@@ -57,27 +57,16 @@ pub struct WasmProver {
 impl WasmProver {
     #[wasm_bindgen(constructor)]
     pub fn new(preprocessing_bytes: &[u8], elf_bytes: &[u8]) -> Result<WasmProver, JsValue> {
-        use jolt_core::poly::commitment::dory::ArkworksProverSetup;
-        use jolt_core::zkvm::verifier::JoltSharedPreprocessing;
         use std::io::Cursor;
 
         let mut cursor = Cursor::new(preprocessing_bytes);
 
-        let generators = ArkworksProverSetup::deserialize_with_mode(
+        let preprocessing = ProverPreprocessing::deserialize_with_mode(
             &mut cursor,
             ark_serialize::Compress::No,
             ark_serialize::Validate::No,
         )
-        .map_err(|e| JsValue::from_str(&format!("ProverSetup deserialize error: {e}")))?;
-
-        let shared = JoltSharedPreprocessing::deserialize_with_mode(
-            &mut cursor,
-            ark_serialize::Compress::No,
-            ark_serialize::Validate::No,
-        )
-        .map_err(|e| JsValue::from_str(&format!("SharedPreprocessing deserialize error: {e}")))?;
-
-        let preprocessing = ProverPreprocessing { generators, shared };
+        .map_err(|e| JsValue::from_str(&format!("ProverPreprocessing deserialize error: {e}")))?;
 
         Ok(Self {
             preprocessing,
@@ -461,7 +450,7 @@ impl WasmVerifier {
         )
         .map_err(|e| JsValue::from_str(&format!("SharedPreprocessing deserialize error: {e}")))?;
 
-        let preprocessing = VerifierPreprocessing { generators, shared };
+        let preprocessing = VerifierPreprocessing::new(shared, generators, None);
 
         Ok(Self { preprocessing })
     }
