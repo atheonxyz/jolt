@@ -1090,6 +1090,26 @@ impl<
             );
         }
 
+        // Dispatch dense pairing BEFORE resolving onehot — the GPU can queue this
+        // behind the onehot work, so by the time we need dense pairing results,
+        // the GPU will have already computed them.
+        let use_gpu_pairing = webgpu_msm::is_gpu_msm_available();
+        let dense_gpu_pairing_handle = if use_gpu_pairing && !dense_gpu_row_comms.is_empty() {
+            let _dispatch_pair_span =
+                tracing::trace_span!("gpu_commit.dispatch_pairing.dense").entered();
+            let g1_refs: Vec<&[ArkG1]> = dense_gpu_row_comms
+                .iter()
+                .map(|(_, rc)| rc.as_slice())
+                .collect();
+            let max_rows = g1_refs.iter().map(|g| g.len()).max().unwrap_or(0);
+            let g2_bases: &[ArkG2] = &self.preprocessing.generators.g2_vec[..max_rows];
+            Some(webgpu_pairing::dispatch_gpu_batch_pairing(
+                &g1_refs, g2_bases,
+            ))
+        } else {
+            None
+        };
+
         // Resolve GPU OneHot gather
         let _resolve_onehot_span = tracing::trace_span!("gpu_commit.resolve_onehot").entered();
         let mut onehot_gpu_buffer: Option<wasm_bindgen::JsValue> = None;
@@ -1119,8 +1139,7 @@ impl<
         }
         drop(_resolve_onehot_span);
 
-        // GPU pairing
-        let use_gpu_pairing = webgpu_msm::is_gpu_msm_available();
+        // Dispatch onehot pairing (needs the GPU buffer from resolve_onehot)
         let onehot_gpu_pairing_handle =
             if use_gpu_pairing && !onehot_gpu_row_comms.is_empty() && onehot_gpu_buffer.is_some() {
                 let _dispatch_pair_span =
@@ -1144,40 +1163,8 @@ impl<
                 None
             };
 
-        let dense_gpu_pairing_handle = if use_gpu_pairing && !dense_gpu_row_comms.is_empty() {
-            let _dispatch_pair_span =
-                tracing::trace_span!("gpu_commit.dispatch_pairing.dense").entered();
-            let g1_refs: Vec<&[ArkG1]> = dense_gpu_row_comms
-                .iter()
-                .map(|(_, rc)| rc.as_slice())
-                .collect();
-            let max_rows = g1_refs.iter().map(|g| g.len()).max().unwrap_or(0);
-            let g2_bases: &[ArkG2] = &self.preprocessing.generators.g2_vec[..max_rows];
-            Some(webgpu_pairing::dispatch_gpu_batch_pairing(
-                &g1_refs, g2_bases,
-            ))
-        } else {
-            None
-        };
-
-        if let Some(handle) = onehot_gpu_pairing_handle {
-            let _resolve_pair_span =
-                tracing::trace_span!("gpu_commit.resolve_pairing.onehot_buffer").entered();
-            let commitments_gt: Vec<ArkGT> =
-                webgpu_pairing::resolve_gpu_batch_pairing_from_buffer(handle).await;
-            for ((poly_idx, _), commitment) in
-                onehot_gpu_row_comms.iter().zip(commitments_gt.into_iter())
-            {
-                commitments_by_index[*poly_idx] = Some(commitment);
-            }
-        } else {
-            for (poly_idx, row_comms) in &onehot_gpu_row_comms {
-                let g2_bases = &self.preprocessing.generators.g2_vec[..row_comms.len()];
-                let commitment = <BN254 as PairingCurve>::multi_pair_g2_setup(row_comms, g2_bases);
-                commitments_by_index[*poly_idx] = Some(commitment);
-            }
-        }
-
+        // Resolve dense pairing first (was dispatched before onehot resolve,
+        // so it may already be complete)
         if let Some(handle) = dense_gpu_pairing_handle {
             let _resolve_pair_span =
                 tracing::trace_span!("gpu_commit.resolve_pairing.dense").entered();
@@ -1191,6 +1178,25 @@ impl<
         } else {
             let _cpu_pair_span = tracing::trace_span!("gpu_commit.cpu_pairing_fallback").entered();
             for (poly_idx, row_comms) in &dense_gpu_row_comms {
+                let g2_bases = &self.preprocessing.generators.g2_vec[..row_comms.len()];
+                let commitment = <BN254 as PairingCurve>::multi_pair_g2_setup(row_comms, g2_bases);
+                commitments_by_index[*poly_idx] = Some(commitment);
+            }
+        }
+
+        // Resolve onehot pairing
+        if let Some(handle) = onehot_gpu_pairing_handle {
+            let _resolve_pair_span =
+                tracing::trace_span!("gpu_commit.resolve_pairing.onehot_buffer").entered();
+            let commitments_gt: Vec<ArkGT> =
+                webgpu_pairing::resolve_gpu_batch_pairing_from_buffer(handle).await;
+            for ((poly_idx, _), commitment) in
+                onehot_gpu_row_comms.iter().zip(commitments_gt.into_iter())
+            {
+                commitments_by_index[*poly_idx] = Some(commitment);
+            }
+        } else {
+            for (poly_idx, row_comms) in &onehot_gpu_row_comms {
                 let g2_bases = &self.preprocessing.generators.g2_vec[..row_comms.len()];
                 let commitment = <BN254 as PairingCurve>::multi_pair_g2_setup(row_comms, g2_bases);
                 commitments_by_index[*poly_idx] = Some(commitment);
