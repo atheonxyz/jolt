@@ -1,2 +1,2 @@
-[files]
-extend-exclude = ["examples/wasm-sha2-prover/www/index.html"]
+[default.extend-words]
+ba = "ba"
