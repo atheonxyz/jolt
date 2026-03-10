@@ -751,17 +751,6 @@ export async function executeGPUBatchMSM(pointsFlat, scalarsFlat, numPoints, sca
     return gpuBatchMSM(pointsFlat, scalarsFlat, numPoints, scalarBitWidth, batchSize);
 }
 
-export async function executeGPUBatchMSMChunked(pointsFlat, scalarsFlat, numPoints, scalarBitWidth, batchSize) {
-    return gpuBatchMSMChunked(pointsFlat, scalarsFlat, numPoints, scalarBitWidth, batchSize);
-}
-
-export async function executeGPUBatchMSMHybrid(pointsFlat, scalarsFlat, numPoints, scalarBitWidth, batchSize, cpuMsmFn) {
-    return gpuBatchMSMHybrid(pointsFlat, scalarsFlat, numPoints, scalarBitWidth, batchSize, cpuMsmFn, gpuBatchMSM);
-}
-
-export async function executeGPUBatchMSMChunkedHybrid(pointsFlat, scalarsFlat, numPoints, scalarBitWidth, batchSize, cpuMsmFn) {
-    return gpuBatchMSMHybrid(pointsFlat, scalarsFlat, numPoints, scalarBitWidth, batchSize, cpuMsmFn, gpuBatchMSMChunked);
-}
 
 // Register on globalThis for wasm-bindgen FFI
 if (typeof globalThis !== 'undefined') {
@@ -776,18 +765,4 @@ if (typeof globalThis !== 'undefined') {
         return executeGPUBatchMSM(pointsFlat, scalarsFlat, numPoints, scalarBitWidth, batchSize);
     };
 
-    globalThis.__jolt_gpu_batch_msm_chunked = async (pointsFlat, scalarsFlat, numPoints, scalarBitWidth, batchSize) => {
-        if (!_msmPipeline) throw new Error('MSM pipeline not initialized');
-        return executeGPUBatchMSMChunked(pointsFlat, scalarsFlat, numPoints, scalarBitWidth, batchSize);
-    };
-
-    globalThis.__jolt_gpu_batch_msm_hybrid = async (pointsFlat, scalarsFlat, numPoints, scalarBitWidth, batchSize, cpuMsmFn) => {
-        if (!_msmPipeline) throw new Error('MSM pipeline not initialized');
-        return executeGPUBatchMSMHybrid(pointsFlat, scalarsFlat, numPoints, scalarBitWidth, batchSize, cpuMsmFn);
-    };
-
-    globalThis.__jolt_gpu_batch_msm_chunked_hybrid = async (pointsFlat, scalarsFlat, numPoints, scalarBitWidth, batchSize, cpuMsmFn) => {
-        if (!_msmPipeline) throw new Error('MSM pipeline not initialized');
-        return executeGPUBatchMSMChunkedHybrid(pointsFlat, scalarsFlat, numPoints, scalarBitWidth, batchSize, cpuMsmFn);
-    };
 }

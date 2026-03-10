@@ -9,10 +9,10 @@ import init, {
     WasmVerifier,
 } from '../pkg/jolt_wasm_sha2_prover.js';
 // GPU imports — these JS modules still load fine, they just won't be called without the feature
-import { initGpuPairing, gpuBatchMultiPairing, gpuBatchMultiPairingFromBuffer, gpuCombineHints, gpuFlatMultiPairing, isGpuAvailable, getGpuDevice } from './gpu-pairing.js';
+import { initGpuPairing, gpuBatchMultiPairing, gpuBatchMultiPairingFromBuffer, gpuCombineHints, getGpuDevice } from './gpu-pairing.js';
 import { initGPUMSM, executeGPUBatchMSMHybrid } from './gpu-msm.js';
 import { initGpuG2, gpuG2FixedBaseScalarMul, gpuG2UploadTable, gpuG2ScalarMulCached, isGpuG2Available } from './gpu-g2.js';
-import { initGpuOnehot, gpuOnehotBatchG1Add, gpuOnehotGatherDirect, gpuOnehotGatherDirectRetainBuffer, isGpuOnehotAvailable } from './gpu-onehot.js';
+import { initGpuOnehot, gpuOnehotGatherDirect, gpuOnehotGatherDirectRetainBuffer } from './gpu-onehot.js';
 
 // Safari cannot reliably handle 4GB (65536 pages) shared WASM memory due to
 // WebKit's Gigacage security feature. Detect Safari and allocate with backoff.
@@ -109,14 +109,6 @@ self.onmessage = async (e) => {
                     );
                 };
 
-                // Register the flat multi-pairing function callable from WASM
-                globalThis.__jolt_gpu_multi_pairing = async (g1Flat, g2Flat, numPairs) => {
-                    return await gpuFlatMultiPairing(
-                        new Uint32Array(g1Flat),
-                        new Uint32Array(g2Flat),
-                        numPairs,
-                    );
-                };
 
                 // Register G2 fixed-base scalar mul callable from WASM
                 // Legacy: full table + scalar mul in one call
@@ -141,15 +133,6 @@ self.onmessage = async (e) => {
                 };
 
                 // Register OneHot batch G1 addition callable from WASM
-                globalThis.__jolt_gpu_onehot_batch_g1_add = async (basesFlat, packedIndices, numChunks, k, rowLen) => {
-                    return await gpuOnehotBatchG1Add(
-                        new Uint32Array(basesFlat),
-                        new Uint32Array(packedIndices),
-                        numChunks,
-                        k,
-                        rowLen,
-                    );
-                };
 
                 // Direct gather dispatch: Rust sends pre-built gather lists (no JS preprocessing)
                 globalThis.__jolt_gpu_onehot_gather_direct = async (basesFlat, gatherCols, jobs, numJobs) => {

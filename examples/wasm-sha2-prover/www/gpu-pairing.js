@@ -23,9 +23,6 @@ let _initialized = false;
 
 function divCeil(x, y) { return Math.ceil(x / y); }
 
-export function isGpuAvailable() {
-    return _initialized;
-}
 
 export function getGpuDevice() {
     return device;
@@ -460,87 +457,3 @@ export async function gpuCombineHints(pointsFlat, scalarsFlat, numRows, numPolys
     return resultData;
 }
 
-/**
- * Flat multi-pairing: compute a single ∏ e(P_i, Q_i) on GPU.
- * Simpler than gpuBatchMultiPairing — no group offsets/sizes needed.
- *
- * @param {Uint32Array} g1Flat - G1 points (G1_WORDS_PER_PAIR * numPairs u32s)
- * @param {Uint32Array} g2Flat - G2 points (G2_WORDS_PER_PAIR * numPairs u32s)
- * @param {number} numPairs - Number of (G1, G2) pairs
- * @returns {Promise<Uint32Array>} - FP12_WORDS u32s (one Fp12 Miller loop result)
- */
-export async function gpuFlatMultiPairing(g1Flat, g2Flat, numPairs) {
-    if (!_initialized) throw new Error('GPU not initialized');
-    if (numPairs === 0) return new Uint32Array(FP12_WORDS);
-
-    const g1Buffer = device.createBuffer({ size: g1Flat.byteLength, usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST });
-    queue.writeBuffer(g1Buffer, 0, g1Flat);
-    const g2Buffer = device.createBuffer({ size: g2Flat.byteLength, usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST });
-    queue.writeBuffer(g2Buffer, 0, g2Flat);
-
-    const resultsSize = numPairs * FP12_WORDS * 4;
-    const resultsBuffer = device.createBuffer({ size: resultsSize, usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC });
-
-    const millerParams = new Uint32Array([numPairs, 0, 0, 0]);
-    const millerParamsBuf = device.createBuffer({ size: 16, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST });
-    queue.writeBuffer(millerParamsBuf, 0, millerParams);
-
-    const encoder = device.createCommandEncoder();
-
-    // Miller loop — one thread per pair
-    const millerBG = device.createBindGroup({
-        layout: millerPipeline.getBindGroupLayout(0),
-        entries: [
-            { binding: 0, resource: { buffer: g1Buffer } },
-            { binding: 1, resource: { buffer: g2Buffer } },
-            { binding: 2, resource: { buffer: resultsBuffer } },
-            { binding: 3, resource: { buffer: millerParamsBuf } },
-        ],
-    });
-    const millerPass = encoder.beginComputePass();
-    millerPass.setPipeline(millerPipeline);
-    millerPass.setBindGroup(0, millerBG);
-    millerPass.dispatchWorkgroups(divCeil(numPairs, MILLER_WORKGROUP_SIZE));
-    millerPass.end();
-
-    // Tree reduction to single Fp12
-    let count = numPairs;
-    while (count > 1) {
-        const stride = divCeil(count, 2);
-        const numThreads = count - stride;
-        const rp = new Uint32Array([stride, numThreads, 0, 0]);
-        const rpBuf = device.createBuffer({ size: 16, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST });
-        queue.writeBuffer(rpBuf, 0, rp);
-        const rBG = device.createBindGroup({
-            layout: reducePipeline.getBindGroupLayout(0),
-            entries: [
-                { binding: 0, resource: { buffer: resultsBuffer } },
-                { binding: 1, resource: { buffer: rpBuf } },
-            ],
-        });
-        const rPass = encoder.beginComputePass();
-        rPass.setPipeline(reducePipeline);
-        rPass.setBindGroup(0, rBG);
-        rPass.dispatchWorkgroups(divCeil(numThreads, REDUCE_WORKGROUP_SIZE));
-        rPass.end();
-        count = stride;
-    }
-
-    // Readback single Fp12
-    const stagingBuffer = device.createBuffer({ size: FP12_WORDS * 4, usage: GPUBufferUsage.COPY_DST | GPUBufferUsage.MAP_READ });
-    encoder.copyBufferToBuffer(resultsBuffer, 0, stagingBuffer, 0, FP12_WORDS * 4);
-
-    queue.submit([encoder.finish()]);
-    await device.queue.onSubmittedWorkDone();
-    await stagingBuffer.mapAsync(GPUMapMode.READ);
-    const resultData = new Uint32Array(stagingBuffer.getMappedRange().slice(0));
-    stagingBuffer.unmap();
-
-    g1Buffer.destroy();
-    g2Buffer.destroy();
-    resultsBuffer.destroy();
-    millerParamsBuf.destroy();
-    stagingBuffer.destroy();
-
-    return resultData;
-}
