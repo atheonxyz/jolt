@@ -5,8 +5,7 @@
 
 use ark_bn254::{Fq, Fr, G1Affine, G1Projective};
 use ark_ff::biginteger::BigInt;
-use ark_ff::{Field, Fp, MontConfig, PrimeField, Zero};
-use std::sync::OnceLock;
+use ark_ff::{Fp, PrimeField, Zero};
 
 const NUM_LIMBS: usize = 8;
 
@@ -49,7 +48,10 @@ fn jacobian_from_limbs(limbs: &[u32]) -> G1Projective {
 /// Precomputed R^{-1} mod q for Montgomery form correction.
 /// When scalars are in Montgomery form (Fr), the MSM result is scaled by R.
 /// Multiply by R^{-1} to get the correct result.
+#[cfg(test)]
 fn get_r_inv() -> &'static Fr {
+    use ark_ff::MontConfig;
+    use std::sync::OnceLock;
     static R_INV: OnceLock<Fr> = OnceLock::new();
     R_INV.get_or_init(|| {
         let r_bigint = <ark_bn254::FrConfig as MontConfig<4>>::R;
@@ -61,6 +63,7 @@ fn get_r_inv() -> &'static Fr {
 }
 
 /// Apply R_inv correction: multiply a G1 point by R^{-1} scalar
+#[cfg(test)]
 fn apply_r_inv_correction(point: G1Projective) -> G1Projective {
     if point.is_zero() {
         return point;
@@ -78,6 +81,7 @@ mod js_bridge {
         /// Check if WebGPU MSM is available (initialized by JS)
         #[wasm_bindgen(js_namespace = ["globalThis"], js_name = "__jolt_gpu_msm_available")]
         pub fn js_gpu_msm_available() -> bool;
+
     }
 }
 
