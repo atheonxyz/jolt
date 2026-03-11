@@ -1,0 +1,120 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <meta charset="utf-8">
+    <title>GPU MSM Benchmark</title>
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <style>
+        * { box-sizing: border-box; margin: 0; padding: 0; }
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, monospace;
+            background: #0d1117; color: #c9d1d9;
+            max-width: 1000px; margin: 0 auto; padding: 1.5rem 1rem;
+        }
+        h1 { color: #e6edf3; font-size: 1.4rem; margin-bottom: 0.5rem; }
+        h2 { color: #8b949e; font-size: 1rem; margin: 1.5rem 0 0.75rem; text-transform: uppercase; letter-spacing: 0.05em; }
+        .subtitle { color: #8b949e; font-size: 0.85rem; margin-bottom: 1rem; }
+        .card {
+            background: #1c2128; border-radius: 8px; padding: 1.25rem;
+            margin: 0 0 1rem; border: 1px solid #30363d;
+        }
+        .workload-info { font-size: 0.8rem; line-height: 1.6; }
+        .workload-info dt { color: #8b949e; display: inline; }
+        .workload-info dd { color: #58a6ff; display: inline; margin-right: 1.5rem; }
+        table { width: 100%; border-collapse: collapse; font-size: 0.8rem; }
+        th { text-align: left; padding: 0.5rem 0.75rem; color: #8b949e; border-bottom: 1px solid #30363d; font-weight: 500; }
+        td { padding: 0.5rem 0.75rem; border-bottom: 1px solid #21262d; }
+        td.num { text-align: right; font-variant-numeric: tabular-nums; }
+        tr.jolt-row { background: rgba(88, 166, 255, 0.05); }
+        tr.running td { color: #e3b341; }
+        tr.done td.speedup { color: #3fb950; font-weight: 600; }
+        tr.done td.slower { color: #f85149; }
+        .status-badge {
+            display: inline-block; padding: 0.15rem 0.5rem; border-radius: 4px;
+            font-size: 0.75rem; font-weight: 500;
+        }
+        .status-badge.ok { background: #0d2818; color: #3fb950; }
+        .status-badge.err { background: #3d1114; color: #f85149; }
+        .status-badge.wait { background: #3b2e00; color: #e3b341; }
+        .status-badge.run { background: #0c2d6b; color: #58a6ff; }
+        button {
+            background: #238636; color: #fff; border: none; padding: 0.6rem 1.2rem;
+            border-radius: 6px; cursor: pointer; font-size: 0.85rem; font-weight: 500;
+        }
+        button:hover:not(:disabled) { background: #2ea043; }
+        button:disabled { background: #21262d; color: #484f58; cursor: not-allowed; }
+        .controls { display: flex; gap: 0.75rem; align-items: center; flex-wrap: wrap; }
+        #status { font-size: 0.85rem; }
+        pre.log {
+            background: #0d1117; color: #a5d6ff; padding: 0.75rem; border-radius: 6px;
+            border: 1px solid #30363d; font-size: 0.75rem; line-height: 1.5;
+            max-height: 300px; overflow-y: auto; white-space: pre-wrap; margin-top: 0.75rem;
+        }
+        .param-row { display: flex; gap: 0.5rem; align-items: center; flex-wrap: wrap; margin-bottom: 0.75rem; }
+        .param-row label { color: #8b949e; font-size: 0.8rem; min-width: 80px; }
+        .param-row select, .param-row input {
+            background: #0d1117; color: #c9d1d9; border: 1px solid #30363d;
+            padding: 0.35rem 0.5rem; border-radius: 4px; font-size: 0.8rem; font-family: monospace;
+        }
+    </style>
+</head>
+<body>
+    <h1>GPU MSM Benchmark</h1>
+    <p class="subtitle">Isolated WebGPU MSM (BN254 G1) — CSC + SMVP + PBPR + Horner pipeline</p>
+
+    <div class="card">
+        <h2 style="margin-top:0">Jolt MSM Workload (from code analysis)</h2>
+        <dl class="workload-info">
+            <dt>Program:</dt><dd>SHA-2 (~2¹⁵ cycles)</dd>
+            <dt>log_k_chunk:</dt><dd>4</dd>
+            <dt>K×T:</dt><dd>2¹⁹ = 16 × 32768</dd><br>
+            <dt>Matrix:</dt><dd>512 rows × 1024 cols (σ=10, ν=9)</dd>
+            <dt>Dense polys:</dt><dd>2 (RdInc, RamInc — i128 scalars)</dd><br>
+            <dt>MSM workload:</dt><dd>1024 MSMs of 1024 points each (all dense polys batched)</dd>
+            <dt>Scalar bits:</dt><dd>128 (i128 increment values)</dd>
+        </dl>
+    </div>
+
+    <div class="card">
+        <h2 style="margin-top:0">Controls</h2>
+        <div class="param-row">
+            <label>Warmup runs:</label>
+            <input type="number" id="warmup" value="2" min="0" max="10" style="width:60px">
+            <label>Bench runs:</label>
+            <input type="number" id="runs" value="5" min="1" max="20" style="width:60px">
+        </div>
+        <div class="controls">
+            <button id="btn-run" disabled>Run Full Benchmark</button>
+            <button id="btn-jolt" disabled style="background:#1f6feb">Run Jolt Workload Only</button>
+            <button id="btn-smvp" disabled style="background:#8957e5">SMVP WG Sweep</button>
+            <span id="status" class="status-badge wait">Initializing WebGPU...</span>
+        </div>
+    </div>
+
+    <div class="card">
+        <h2 style="margin-top:0">Results</h2>
+        <table id="results">
+            <thead>
+                <tr>
+                    <th>Label</th>
+                    <th style="text-align:right">Points</th>
+                    <th style="text-align:right">Batch</th>
+                    <th style="text-align:right">Scalar Bits</th>
+                    <th style="text-align:right">Window</th>
+                    <th style="text-align:right">GPU (ms)</th>
+                    <th style="text-align:right">Throughput</th>
+                    <th>Status</th>
+                </tr>
+            </thead>
+            <tbody id="results-body"></tbody>
+        </table>
+    </div>
+
+    <div class="card">
+        <h2 style="margin-top:0">Log</h2>
+        <pre class="log" id="log"></pre>
+    </div>
+
+    <script type="module" src="./bench-msm.js"></script>
+</body>
+</html>

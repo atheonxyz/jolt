@@ -4,12 +4,13 @@ override WG_SIZE: u32 = 64;
 @group(0) @binding(1) var<storage, read_write> results: array<BigInt>;
 @group(0) @binding(2) var<storage, read> params: array<u32>;
 
-fn load_g_point(idx: u32) -> G1Jacobian {
-    let base = 3u * idx;
-    var pt: G1Jacobian;
+fn load_g_point(idx: u32) -> G1XYZZ {
+    let base = 4u * idx;
+    var pt: G1XYZZ;
     pt.x = g_points[base];
     pt.y = g_points[base + 1u];
-    pt.z = g_points[base + 2u];
+    pt.zz = g_points[base + 2u];
+    pt.zzz = g_points[base + 3u];
     return pt;
 }
 
@@ -20,19 +21,19 @@ fn store_result(idx: u32, pt: G1Jacobian) {
     results[base + 2u] = pt.z;
 }
 
-fn reduce_subtask(msm_idx: u32, subtask_idx: u32, subtasks_per_msm: u32, b_wg_size: u32) -> G1Jacobian {
+fn reduce_subtask(msm_idx: u32, subtask_idx: u32, subtasks_per_msm: u32, b_wg_size: u32) -> G1XYZZ {
     let global_subtask = msm_idx * subtasks_per_msm + subtask_idx;
     let point_offset = global_subtask * b_wg_size;
-    var sum = g1_zero_mont();
+    var sum = xyzz_zero();
     var sum_initialized = false;
     for (var i = 0u; i < b_wg_size; i = i + 1u) {
         let pt = load_g_point(point_offset + i);
-        if (is_g1_zero(pt)) { continue; }
+        if (is_xyzz_zero(pt)) { continue; }
         if (!sum_initialized) {
             sum = pt;
             sum_initialized = true;
         } else {
-            sum = g1_add(sum, pt);
+            sum = xyzz_add(sum, pt);
         }
     }
     return sum;
@@ -57,18 +58,19 @@ fn horner_reduce(@builtin(global_invocation_id) gid: vec3<u32>) {
     var acc = reduce_subtask(msm_idx, subtasks_per_msm - 1u, subtasks_per_msm, b_wg_size);
 
     for (var i = i32(subtasks_per_msm) - 2; i >= 0; i = i - 1) {
-        if (!is_g1_zero(acc)) {
-            acc = g1_scalar_mul(acc, window_scalar);
+        if (!is_xyzz_zero(acc)) {
+            acc = xyzz_scalar_mul(acc, window_scalar);
         }
         let subtask_point = reduce_subtask(msm_idx, u32(i), subtasks_per_msm, b_wg_size);
-        if (!is_g1_zero(subtask_point)) {
-            if (is_g1_zero(acc)) {
+        if (!is_xyzz_zero(subtask_point)) {
+            if (is_xyzz_zero(acc)) {
                 acc = subtask_point;
             } else {
-                acc = g1_add(acc, subtask_point);
+                acc = xyzz_add(acc, subtask_point);
             }
         }
     }
 
-    store_result(msm_idx, acc);
+    // Convert XYZZ to Jacobian for output
+    store_result(msm_idx, xyzz_to_jacobian(acc));
 }

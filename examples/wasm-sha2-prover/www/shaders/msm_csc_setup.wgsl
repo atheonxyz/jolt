@@ -100,29 +100,62 @@ fn decompose_scalars(@builtin(global_invocation_id) gid: vec3<u32>) {
     }
 }
 
-// ── Kernel 2: prefix_sum ─────────────────────────────────────────────────────
+// ── Kernel 2: prefix_sum ─────────────────────────────────────────────────────────────────
+// Parallel prefix sum using workgroup-shared memory.
 // Each workgroup handles one subtask's column pointer array.
-// Sequential scan over numColumns+1 entries (numColumns ≤ 1024 for windowSize ≤ 10).
+// Step 1: All threads cooperatively load histogram from global atomics into shared memory.
+// Step 2: Thread 0 performs a sequential scan in shared memory (no global memory latency).
+// Step 3: All threads cooperatively write back to global memory.
+//
+// For window=10 (numColumns=1024, n=1025), this avoids ~1025 global atomic load/stores
+// by doing the scan entirely in fast workgroup-shared memory.
 //
 // Dispatch: (totalSubtasks, 1, 1) workgroups
 
-@compute @workgroup_size(1, 1, 1)
-fn prefix_sum(@builtin(workgroup_id) wg_id: vec3<u32>) {
+const PREFIX_SUM_WG: u32 = 256u;
+var<workgroup> shared_scan: array<u32, 1088>;
+
+@compute @workgroup_size(PREFIX_SUM_WG, 1, 1)
+fn prefix_sum(
+    @builtin(workgroup_id) wg_id: vec3<u32>,
+    @builtin(local_invocation_id) local_id: vec3<u32>,
+) {
+    let tid = local_id.x;
     let num_columns = params[1];
     let total_subtasks = params[5];
+    let n = num_columns + 1u;
 
     let subtask_idx = wg_id.x;
     if (subtask_idx >= total_subtasks) { return; }
 
-    let cp_base = subtask_idx * (num_columns + 1u);
+    let cp_base = subtask_idx * n;
 
-    // Sequential prefix sum
-    var running = atomicLoad(&col_ptr[cp_base]);
-    for (var c = 1u; c <= num_columns; c++) {
-        let prev = running;
-        let cur = atomicLoad(&col_ptr[cp_base + c]);
-        running = prev + cur;
-        atomicStore(&col_ptr[cp_base + c], running);
+    // Cooperative load: each thread loads ceil(n / PREFIX_SUM_WG) elements
+    let elems_per_thread = (n + PREFIX_SUM_WG - 1u) / PREFIX_SUM_WG;
+    for (var e = 0u; e < elems_per_thread; e++) {
+        let idx = tid + e * PREFIX_SUM_WG;
+        if (idx < n) {
+            shared_scan[idx] = atomicLoad(&col_ptr[cp_base + idx]);
+        }
+    }
+
+    workgroupBarrier();
+
+    // Thread 0 performs sequential inclusive prefix sum in shared memory
+    if (tid == 0u) {
+        for (var c = 1u; c < n; c++) {
+            shared_scan[c] += shared_scan[c - 1u];
+        }
+    }
+
+    workgroupBarrier();
+
+    // Cooperative write-back
+    for (var e = 0u; e < elems_per_thread; e++) {
+        let idx = tid + e * PREFIX_SUM_WG;
+        if (idx < n) {
+            atomicStore(&col_ptr[cp_base + idx], shared_scan[idx]);
+        }
     }
 }
 
