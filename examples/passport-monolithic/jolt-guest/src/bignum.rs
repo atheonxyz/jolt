@@ -6,8 +6,6 @@
 //! Guest verification functions (always compiled): mul_wide, verify_modmul, lt
 //! Advice-only functions (compute_advice only): div_rem_wide
 
-// ── Byte ↔ limb conversion ──────────────────────────────────────────────
-
 pub fn be_bytes_to_limbs_2048(bytes: &[u8; 256]) -> [u64; 32] {
     let mut limbs = [0u64; 32];
     be_bytes_to_limbs_inner(bytes, &mut limbs);
@@ -58,8 +56,6 @@ fn limbs_to_be_bytes_inner(limbs: &[u64], bytes: &mut [u8]) {
     }
 }
 
-// ── Schoolbook multiplication ───────────────────────────────────────────
-
 pub fn mul_wide_2048(a: &[u64; 32], b: &[u64; 32]) -> [u64; 64] {
     let mut result = [0u64; 64];
     mul_wide_inner(a, b, &mut result);
@@ -89,7 +85,57 @@ fn mul_wide_inner(a: &[u64], b: &[u64], result: &mut [u64]) {
     }
 }
 
-// ── Modmul verification: a * b == q * n + r ─────────────────────────────
+pub fn square_wide_2048(a: &[u64; 32]) -> [u64; 64] {
+    let mut result = [0u64; 64];
+    square_wide_inner(a, &mut result);
+    result
+}
+
+pub fn square_wide_4096(a: &[u64; 64]) -> [u64; 128] {
+    let mut result = [0u64; 128];
+    square_wide_inner(a, &mut result);
+    result
+}
+
+/// Squaring exploits symmetry: a[i]*a[j] == a[j]*a[i] for i != j,
+/// halving the number of multiplications (528 vs 1024 for 32 limbs).
+fn square_wide_inner(a: &[u64], result: &mut [u64]) {
+    let n = a.len();
+    for i in 0..result.len() {
+        result[i] = 0;
+    }
+
+    // Off-diagonal products: accumulate a[i]*a[j] for i < j
+    for i in 0..n {
+        let mut carry: u64 = 0;
+        for j in (i + 1)..n {
+            let prod =
+                (a[i] as u128) * (a[j] as u128) + (result[i + j] as u128) + (carry as u128);
+            result[i + j] = prod as u64;
+            carry = (prod >> 64) as u64;
+        }
+        result[i + n] = carry;
+    }
+
+    // Double the off-diagonal sum (each cross-term appears twice)
+    let mut carry: u64 = 0;
+    for i in 0..2 * n {
+        let doubled = (result[i] as u128) * 2 + (carry as u128);
+        result[i] = doubled as u64;
+        carry = (doubled >> 64) as u64;
+    }
+
+    // Add diagonal products: a[i]*a[i] at positions result[2*i]
+    let mut carry: u64 = 0;
+    for i in 0..n {
+        let prod = (a[i] as u128) * (a[i] as u128) + (result[2 * i] as u128) + (carry as u128);
+        result[2 * i] = prod as u64;
+        carry = (prod >> 64) as u64;
+        let sum = (result[2 * i + 1] as u128) + (carry as u128);
+        result[2 * i + 1] = sum as u64;
+        carry = (sum >> 64) as u64;
+    }
+}
 
 /// Verify a * b == q * n + r for 2048-bit operands (32 u64 limbs each).
 pub fn verify_modmul_2048(
@@ -117,6 +163,30 @@ pub fn verify_modmul_4096(
     verify_sum_eq(&ab, &qn, r)
 }
 
+/// Verify a^2 == q * n + r for 2048-bit operands using optimized squaring.
+pub fn verify_modsquare_2048(
+    a: &[u64; 32],
+    q: &[u64; 32],
+    n: &[u64; 32],
+    r: &[u64; 32],
+) -> bool {
+    let a2 = square_wide_2048(a);
+    let qn = mul_wide_2048(q, n);
+    verify_sum_eq(&a2, &qn, r)
+}
+
+/// Verify a^2 == q * n + r for 4096-bit operands using optimized squaring.
+pub fn verify_modsquare_4096(
+    a: &[u64; 64],
+    q: &[u64; 64],
+    n: &[u64; 64],
+    r: &[u64; 64],
+) -> bool {
+    let a2 = square_wide_4096(a);
+    let qn = mul_wide_4096(q, n);
+    verify_sum_eq(&a2, &qn, r)
+}
+
 /// Check wide == base + ext, where ext is zero-extended to the width of wide/base.
 fn verify_sum_eq(wide: &[u64], base: &[u64], ext: &[u64]) -> bool {
     let w = wide.len();
@@ -132,8 +202,6 @@ fn verify_sum_eq(wide: &[u64], base: &[u64], ext: &[u64]) -> bool {
     }
     carry == 0
 }
-
-// ── Comparison ──────────────────────────────────────────────────────────
 
 pub fn lt_2048(a: &[u64; 32], b: &[u64; 32]) -> bool {
     lt_inner(a, b)
@@ -154,8 +222,6 @@ fn lt_inner(a: &[u64], b: &[u64]) -> bool {
     }
     false
 }
-
-// ── Division (advice-only, not in proving trace) ────────────────────────
 
 #[cfg(feature = "compute_advice")]
 pub fn div_rem_wide_2048(

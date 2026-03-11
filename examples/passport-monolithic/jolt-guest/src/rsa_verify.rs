@@ -17,62 +17,28 @@ const SHA256_DIGEST_INFO: [u8; 19] = [
     0x05, 0x00, 0x04, 0x20,
 ];
 
-// ── Advice: per-step modular multiplication ─────────────────────────────
-
-/// Compute a single modular multiplication step: a * b mod n.
-/// Returns [q_bytes || r_bytes] where a*b = q*n + r and 0 <= r < n.
-/// Runs on host during compute_advice pass; guest reads from tape in proving pass.
 #[jolt::advice]
 fn modmul_2048_step(
-    a_bytes: &[u8; 256],
-    b_bytes: &[u8; 256],
-    n_bytes: &[u8; 256],
-) -> jolt::UntrustedAdvice<[u8; 512]> {
-    let a = bignum::be_bytes_to_limbs_2048(a_bytes);
-    let b = bignum::be_bytes_to_limbs_2048(b_bytes);
-    let n = bignum::be_bytes_to_limbs_2048(n_bytes);
-
-    let product = bignum::mul_wide_2048(&a, &b);
-    let (q, r) = bignum::div_rem_wide_2048(&product, &n);
-
-    let q_bytes = bignum::limbs_to_be_bytes_2048(&q);
-    let r_bytes = bignum::limbs_to_be_bytes_2048(&r);
-
-    let mut out = [0u8; 512];
-    out[..256].copy_from_slice(&q_bytes);
-    out[256..].copy_from_slice(&r_bytes);
-    out
+    a: &[u64; 32],
+    b: &[u64; 32],
+    n: &[u64; 32],
+) -> jolt::UntrustedAdvice<([u64; 32], [u64; 32])> {
+    let product = bignum::mul_wide_2048(a, b);
+    let (q, r) = bignum::div_rem_wide_2048(&product, n);
+    (q, r)
 }
 
-/// Same for 4096-bit operands.
 #[jolt::advice]
 fn modmul_4096_step(
-    a_bytes: &[u8; 512],
-    b_bytes: &[u8; 512],
-    n_bytes: &[u8; 512],
-) -> jolt::UntrustedAdvice<[u8; 1024]> {
-    let a = bignum::be_bytes_to_limbs_4096(a_bytes);
-    let b = bignum::be_bytes_to_limbs_4096(b_bytes);
-    let n = bignum::be_bytes_to_limbs_4096(n_bytes);
-
-    let product = bignum::mul_wide_4096(&a, &b);
-    let (q, r) = bignum::div_rem_wide_4096(&product, &n);
-
-    let q_bytes = bignum::limbs_to_be_bytes_4096(&q);
-    let r_bytes = bignum::limbs_to_be_bytes_4096(&r);
-
-    let mut out = [0u8; 1024];
-    out[..512].copy_from_slice(&q_bytes);
-    out[512..].copy_from_slice(&r_bytes);
-    out
+    a: &[u64; 64],
+    b: &[u64; 64],
+    n: &[u64; 64],
+) -> jolt::UntrustedAdvice<([u64; 64], [u64; 64])> {
+    let product = bignum::mul_wide_4096(a, b);
+    let (q, r) = bignum::div_rem_wide_4096(&product, n);
+    (q, r)
 }
 
-// ── Public verification functions ───────────────────────────────────────
-
-/// Verify RSA-2048 PKCS#1v1.5 SHA-256 signature using step-wise advice.
-///
-/// Decomposes sig^65537 mod n into 16 squarings + 1 multiply, each verified
-/// via check_advice! against the equation a*b == q*n + r with r < n.
 pub fn rsa_pkcs1v15_sha256_verify_2048(
     modulus: &[u8; 256],
     exponent: u32,
@@ -85,57 +51,32 @@ pub fn rsa_pkcs1v15_sha256_verify_2048(
     let sig_limbs = bignum::be_bytes_to_limbs_2048(signature);
     let mut current_limbs = sig_limbs;
 
-    // 16 squarings: sig -> sig^2 -> sig^4 -> ... -> sig^65536
     for _ in 0..16 {
-        let current_bytes = bignum::limbs_to_be_bytes_2048(&current_limbs);
-        let adv = modmul_2048_step(&current_bytes, &current_bytes, modulus);
-        let qr: [u8; 512] = *adv;
-
-        let mut q_bytes = [0u8; 256];
-        let mut r_bytes = [0u8; 256];
-        q_bytes.copy_from_slice(&qr[..256]);
-        r_bytes.copy_from_slice(&qr[256..]);
-
-        let q_limbs = bignum::be_bytes_to_limbs_2048(&q_bytes);
-        let r_limbs = bignum::be_bytes_to_limbs_2048(&r_bytes);
-
-        let modmul_ok = bignum::verify_modmul_2048(
-            &current_limbs,
+        let (q_limbs, r_limbs) = *modmul_2048_step(&current_limbs, &current_limbs, &n_limbs);
+        jolt::check_advice!(bignum::verify_modsquare_2048(
             &current_limbs,
             &q_limbs,
             &n_limbs,
             &r_limbs,
-        );
-        jolt::check_advice!(modmul_ok);
+        ));
         jolt::check_advice!(bignum::lt_2048(&r_limbs, &n_limbs));
-
         current_limbs = r_limbs;
     }
 
-    // Final multiply: sig^65536 * sig = sig^65537 mod n
-    let current_bytes = bignum::limbs_to_be_bytes_2048(&current_limbs);
-    let sig_bytes_copy = bignum::limbs_to_be_bytes_2048(&sig_limbs);
-    let adv = modmul_2048_step(&current_bytes, &sig_bytes_copy, modulus);
-    let qr: [u8; 512] = *adv;
-
-    let mut q_bytes = [0u8; 256];
-    let mut r_bytes = [0u8; 256];
-    q_bytes.copy_from_slice(&qr[..256]);
-    r_bytes.copy_from_slice(&qr[256..]);
-
-    let q_limbs = bignum::be_bytes_to_limbs_2048(&q_bytes);
-    let r_limbs = bignum::be_bytes_to_limbs_2048(&r_bytes);
-
-    let modmul_ok =
-        bignum::verify_modmul_2048(&current_limbs, &sig_limbs, &q_limbs, &n_limbs, &r_limbs);
-    jolt::check_advice!(modmul_ok);
+    let (q_limbs, r_limbs) = *modmul_2048_step(&current_limbs, &sig_limbs, &n_limbs);
+    jolt::check_advice!(bignum::verify_modmul_2048(
+        &current_limbs,
+        &sig_limbs,
+        &q_limbs,
+        &n_limbs,
+        &r_limbs,
+    ));
     jolt::check_advice!(bignum::lt_2048(&r_limbs, &n_limbs));
 
     let result_bytes = bignum::limbs_to_be_bytes_2048(&r_limbs);
     verify_pkcs1v15_padding(&result_bytes, msg_hash, 256);
 }
 
-/// Verify RSA-4096 PKCS#1v1.5 SHA-256 signature using step-wise advice.
 pub fn rsa_pkcs1v15_sha256_verify_4096(
     modulus: &[u8; 512],
     exponent: u32,
@@ -149,54 +90,30 @@ pub fn rsa_pkcs1v15_sha256_verify_4096(
     let mut current_limbs = sig_limbs;
 
     for _ in 0..16 {
-        let current_bytes = bignum::limbs_to_be_bytes_4096(&current_limbs);
-        let adv = modmul_4096_step(&current_bytes, &current_bytes, modulus);
-        let qr: [u8; 1024] = *adv;
-
-        let mut q_bytes = [0u8; 512];
-        let mut r_bytes = [0u8; 512];
-        q_bytes.copy_from_slice(&qr[..512]);
-        r_bytes.copy_from_slice(&qr[512..]);
-
-        let q_limbs = bignum::be_bytes_to_limbs_4096(&q_bytes);
-        let r_limbs = bignum::be_bytes_to_limbs_4096(&r_bytes);
-
-        let modmul_ok = bignum::verify_modmul_4096(
-            &current_limbs,
+        let (q_limbs, r_limbs) = *modmul_4096_step(&current_limbs, &current_limbs, &n_limbs);
+        jolt::check_advice!(bignum::verify_modsquare_4096(
             &current_limbs,
             &q_limbs,
             &n_limbs,
             &r_limbs,
-        );
-        jolt::check_advice!(modmul_ok);
+        ));
         jolt::check_advice!(bignum::lt_4096(&r_limbs, &n_limbs));
-
         current_limbs = r_limbs;
     }
 
-    let current_bytes = bignum::limbs_to_be_bytes_4096(&current_limbs);
-    let sig_bytes_copy = bignum::limbs_to_be_bytes_4096(&sig_limbs);
-    let adv = modmul_4096_step(&current_bytes, &sig_bytes_copy, modulus);
-    let qr: [u8; 1024] = *adv;
-
-    let mut q_bytes = [0u8; 512];
-    let mut r_bytes = [0u8; 512];
-    q_bytes.copy_from_slice(&qr[..512]);
-    r_bytes.copy_from_slice(&qr[512..]);
-
-    let q_limbs = bignum::be_bytes_to_limbs_4096(&q_bytes);
-    let r_limbs = bignum::be_bytes_to_limbs_4096(&r_bytes);
-
-    let modmul_ok =
-        bignum::verify_modmul_4096(&current_limbs, &sig_limbs, &q_limbs, &n_limbs, &r_limbs);
-    jolt::check_advice!(modmul_ok);
+    let (q_limbs, r_limbs) = *modmul_4096_step(&current_limbs, &sig_limbs, &n_limbs);
+    jolt::check_advice!(bignum::verify_modmul_4096(
+        &current_limbs,
+        &sig_limbs,
+        &q_limbs,
+        &n_limbs,
+        &r_limbs,
+    ));
     jolt::check_advice!(bignum::lt_4096(&r_limbs, &n_limbs));
 
     let result_bytes = bignum::limbs_to_be_bytes_4096(&r_limbs);
     verify_pkcs1v15_padding(&result_bytes, msg_hash, 512);
 }
-
-// ── PKCS#1v1.5 padding verification ─────────────────────────────────────
 
 /// Verify PKCS#1v1.5 padding for SHA-256.
 /// Expected format: 0x00 0x01 [0xFF padding] 0x00 [DigestInfo(19)] [Hash(32)]
