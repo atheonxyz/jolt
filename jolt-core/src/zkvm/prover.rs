@@ -973,6 +973,8 @@ impl<
         let (cpu_onehot_poly_ids, gpu_onehot_poly_ids) = onehot_poly_ids.split_at(num_cpu_onehot);
         let _ = cpu_onehot_poly_ids;
 
+        let use_gpu_pairing = webgpu_msm::is_gpu_msm_available();
+
         let _dispatch_span = tracing::trace_span!("gpu_commit.dispatch_onehot").entered();
         let g1_slice = unsafe {
             std::slice::from_raw_parts(
@@ -1045,6 +1047,8 @@ impl<
 
         let (poly_gather_data, poly_metadata): (Vec<_>, Vec<_>) =
             results.into_iter().unzip();
+
+        drop(_dispatch_span);
         let gpu_onehot_batch_handle = if !poly_gather_data.is_empty() {
             Some(webgpu_onehot::dispatch_gpu_onehot_batch_retain_buffer(
                 &bases_flat,
@@ -1053,10 +1057,41 @@ impl<
         } else {
             None
         };
-        drop(_dispatch_span);
 
-        // Dense polys: CPU tier-1 (runs while GPU OneHot computes)
-        let use_gpu_pairing = webgpu_msm::is_gpu_msm_available();
+        // Dispatch chained pairing IMMEDIATELY after onehot — this is the heavy
+        // Miller loop (67K pairs, ~1200ms).
+        let onehot_gpu_pairing_handle = if let Some(ref batch_handle) = gpu_onehot_batch_handle {
+            if use_gpu_pairing && batch_handle.pending_gpu_buffer.is_some() {
+                let _dispatch_pair_span =
+                    tracing::trace_span!("gpu_commit.dispatch_pairing.onehot_chained").entered();
+                let poly_layout: Vec<(usize, usize)> = batch_handle
+                    .poly_layout
+                    .iter()
+                    .map(|&(nc, k, _)| (nc, k))
+                    .collect();
+                let max_rows = poly_layout
+                    .iter()
+                    .map(|&(nc, k)| nc * k)
+                    .max()
+                    .unwrap_or(0);
+                let g2_bases: &[ArkG2] = &self.preprocessing.generators.g2_vec[..max_rows];
+                Some(webgpu_pairing::dispatch_gpu_batch_pairing_from_buffer_chained(
+                    batch_handle
+                        .pending_gpu_buffer
+                        .as_ref()
+                        .expect("pending gpu buffer must exist for chained dispatch"),
+                    batch_handle.pending_gpu_buffer_size,
+                    &poly_layout,
+                    g2_bases,
+                ))
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+
+        // Dense polys: CPU tier-1 (runs while GPU Miller loop computes)
         let mut commitments_by_index: Vec<Option<PCS::Commitment>> = vec![None; polys.len()];
         let mut hints_by_index: Vec<Option<PCS::OpeningProofHint>> = vec![None; polys.len()];
         let mut dense_gpu_row_comms: Vec<(usize, Vec<ArkG1>)> = Vec::new();
@@ -1106,7 +1141,8 @@ impl<
             );
         }
 
-        // Dispatch dense pairing FIRST — gets first position in GPU queue after onehot
+        // Dense pairing: fires after dense_tier1_cpu. Goes into GPU queue AFTER
+        // chained Miller loop — dense is small (640 pairs), finishes fast.
         let dense_gpu_pairing_handle = if use_gpu_pairing && !dense_gpu_row_comms.is_empty() {
             let _dispatch_pair_span =
                 tracing::trace_span!("gpu_commit.dispatch_pairing.dense").entered();
@@ -1119,40 +1155,6 @@ impl<
             Some(webgpu_pairing::dispatch_gpu_batch_pairing(
                 &g1_refs, g2_bases,
             ))
-        } else {
-            None
-        };
-
-        // GPU Pipeline Chaining: dispatch onehot pairing using the pending GPU buffer.
-        // No CPU serialization needed — 100% GPU. Goes into GPU queue AFTER dense pairing,
-        // so dense pairing gets processed first (it's smaller and resolves faster).
-        let onehot_gpu_pairing_handle = if let Some(ref batch_handle) = gpu_onehot_batch_handle {
-            if use_gpu_pairing && batch_handle.pending_gpu_buffer.is_some() {
-                let _dispatch_pair_span =
-                    tracing::trace_span!("gpu_commit.dispatch_pairing.onehot_chained").entered();
-                let poly_layout: Vec<(usize, usize)> = batch_handle
-                    .poly_layout
-                    .iter()
-                    .map(|&(nc, k, _)| (nc, k))
-                    .collect();
-                let max_rows = poly_layout
-                    .iter()
-                    .map(|&(nc, k)| nc * k)
-                    .max()
-                    .unwrap_or(0);
-                let g2_bases: &[ArkG2] = &self.preprocessing.generators.g2_vec[..max_rows];
-                Some(webgpu_pairing::dispatch_gpu_batch_pairing_from_buffer_chained(
-                    batch_handle
-                        .pending_gpu_buffer
-                        .as_ref()
-                        .expect("pending gpu buffer must exist for chained dispatch"),
-                    batch_handle.pending_gpu_buffer_size,
-                    &poly_layout,
-                    g2_bases,
-                ))
-            } else {
-                None
-            }
         } else {
             None
         };
