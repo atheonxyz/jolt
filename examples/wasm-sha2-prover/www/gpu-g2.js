@@ -20,12 +20,13 @@ let g2Device = null;
 let g2Queue = null;
 let g2Pipeline = null;
 let g2VarBasePipeline = null;
+let g2SrsFoldOptPipeline = null;
 let _g2Initialized = false;
 
 // Persistent cached table buffer (survives across scalar mul calls)
 let g2CachedTableBuffer = null;
 let g2CachedTableSize = 0; // byte length of cached table
-let g2SrsBuffer = null;
+let g2SrsBuffer = null;  // Affine format for optimized SRS fold
 let g2SrsCount = 0;
 
 // Reusable buffer pool for var-base fold dispatches (avoid per-dispatch alloc)
@@ -101,12 +102,16 @@ export async function initGpuG2(device) {
         const commonSrc = await (await fetch('shaders/bn254_common.wgsl')).text();
         const g2KernelSrc = await (await fetch('shaders/g2_fixed_base_mul.wgsl')).text();
         const vbKernelSrc = await (await fetch('shaders/g2_var_base_scalar_mul.wgsl')).text();
+        const srsFoldOptSrc = await (await fetch('shaders/g2_srs_fold_opt.wgsl')).text();
 
         const shaderModule = device.createShaderModule({
             code: commonSrc + '\n' + g2KernelSrc,
         });
         const vbShaderModule = device.createShaderModule({
             code: commonSrc + '\n' + vbKernelSrc,
+        });
+        const srsFoldOptModule = device.createShaderModule({
+            code: commonSrc + '\n' + srsFoldOptSrc,
         });
 
         g2Pipeline = device.createComputePipeline({
@@ -116,6 +121,10 @@ export async function initGpuG2(device) {
         g2VarBasePipeline = device.createComputePipeline({
             layout: 'auto',
             compute: { module: vbShaderModule, entryPoint: 'g2_var_base_scalar_mul' },
+        });
+        g2SrsFoldOptPipeline = device.createComputePipeline({
+            layout: 'auto',
+            compute: { module: srsFoldOptModule, entryPoint: 'g2_srs_fold_opt' },
         });
 
         _g2Initialized = true;
@@ -152,19 +161,19 @@ export function gpuG2UploadTable(tableLimbs) {
     console.log(`[gpu-g2] Table uploaded to GPU (${tableLimbs.byteLength} bytes, persistent)`);
 }
 
-export function gpuG2UploadSrs(jacobianLimbs) {
+export function gpuG2UploadSrs(affineLimbs) {
     if (!_g2Initialized) throw new Error('GPU G2 not initialized');
     if (g2SrsBuffer) {
         g2SrsBuffer.destroy();
         g2SrsBuffer = null;
     }
     g2SrsBuffer = g2Device.createBuffer({
-        size: jacobianLimbs.byteLength,
+        size: affineLimbs.byteLength,
         usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST,
     });
-    g2Queue.writeBuffer(g2SrsBuffer, 0, jacobianLimbs);
-    g2SrsCount = jacobianLimbs.length / G2_JACOBIAN_WORDS;
-    console.log(`[gpu-g2] SRS G2 uploaded (${g2SrsCount} points, ${jacobianLimbs.byteLength} bytes)`);
+    g2Queue.writeBuffer(g2SrsBuffer, 0, affineLimbs);
+    g2SrsCount = affineLimbs.length / G2_AFFINE_WORDS;
+    console.log(`[gpu-g2] SRS G2 uploaded in affine (${g2SrsCount} points, ${affineLimbs.byteLength} bytes)`);
 }
 
 export async function gpuG2SrsFold(addendsJacobianLimbs, scalarLimbs, numPoints) {
@@ -181,7 +190,7 @@ export async function gpuG2SrsFold(addendsJacobianLimbs, scalarLimbs, numPoints)
 
     const encoder = g2Device.createCommandEncoder();
     const bindGroup = g2Device.createBindGroup({
-        layout: g2VarBasePipeline.getBindGroupLayout(0),
+        layout: g2SrsFoldOptPipeline.getBindGroupLayout(0),
         entries: [
             { binding: 0, resource: { buffer: g2SrsBuffer } },
             { binding: 1, resource: { buffer: g2PoolAddends } },
@@ -192,7 +201,7 @@ export async function gpuG2SrsFold(addendsJacobianLimbs, scalarLimbs, numPoints)
     });
 
     const pass = encoder.beginComputePass();
-    pass.setPipeline(g2VarBasePipeline);
+    pass.setPipeline(g2SrsFoldOptPipeline);
     pass.setBindGroup(0, bindGroup);
     pass.dispatchWorkgroups(divCeil(numPoints, 64));
     pass.end();

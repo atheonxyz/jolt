@@ -283,6 +283,15 @@ pub struct GpuG2FoldHandle {
 }
 
 #[cfg(target_arch = "wasm32")]
+fn serialize_g2_affine_batch(points: &[ArkG2]) -> Vec<u32> {
+    let mut limbs = Vec::with_capacity(points.len() * G2_AFFINE_WORDS);
+    for point in points {
+        limbs.extend_from_slice(&g2_affine_to_limbs(&point.0.into_affine()));
+    }
+    limbs
+}
+
+#[cfg(target_arch = "wasm32")]
 fn serialize_g2_jacobian_batch(points: &[ArkG2]) -> Vec<u32> {
     let mut limbs = Vec::with_capacity(points.len() * G2_JACOBIAN_WORDS);
     for point in points {
@@ -293,8 +302,8 @@ fn serialize_g2_jacobian_batch(points: &[ArkG2]) -> Vec<u32> {
 
 #[cfg(target_arch = "wasm32")]
 pub fn gpu_g2_upload_srs(srs: &[ArkG2]) {
-    let jacobian_limbs = serialize_g2_jacobian_batch(srs);
-    js_bridge::js_gpu_g2_upload_srs(&jacobian_limbs);
+    let affine_limbs = serialize_g2_affine_batch(srs);
+    js_bridge::js_gpu_g2_upload_srs(&affine_limbs);
 }
 
 #[cfg(target_arch = "wasm32")]
