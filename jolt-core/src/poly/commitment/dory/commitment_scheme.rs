@@ -272,10 +272,10 @@ impl CommitmentScheme for DoryCommitmentScheme {
                 std::slice::from_raw_parts(rlc_hint.as_ptr() as *const G1Projective, rlc_hint.len())
             };
 
-            let _span = trace_span!("vector_scalar_mul_add_gamma_g1_online");
+            let _span = trace_span!("vector_scalar_mul_add_gamma_g1_mixed");
             let _enter = _span.enter();
 
-            jolt_optimizations::vector_scalar_mul_add_gamma_g1_online(
+            jolt_optimizations::vector_scalar_mul_add_gamma_g1_mixed(
                 row_commitments,
                 *coeff,
                 rlc_row_commitments,
@@ -642,12 +642,20 @@ impl DoryCommitmentScheme {
             super::webgpu_g2::gpu_g2_upload_srs(&setup.g2_vec[..max_n]);
         }
 
+        // Precompute windowed2 GLV tables for SRS G1 generators (used in Phase 1 folds).
+        let max_n = 1 << num_rounds;
+        let g1_windowed2_tables = {
+            let _span = trace_span!("precompute_g1_windowed2_tables").entered();
+            JoltG1Routines::precompute_windowed2(&setup.g1_vec[..max_n])
+        };
+        // G2 folds: use original online variants (precomputed G2 tables are ~9MB,
+        // causing cache pressure that hurts MSM performance more than the fold savings).
+
         for round in 0..num_rounds {
             let n = 1 << (num_rounds - round);
             let n2 = n / 2;
             let use_gpu_g2_fold =
                 super::webgpu_g2::is_gpu_g2_available() && n2 >= GPU_G2_FOLD_THRESHOLD;
-
             // --- compute_first_message ---
             let (v1_l, v1_r) = v1.split_at(n2);
             let (v2_l, v2_r) = v2.split_at(n2);
@@ -665,10 +673,9 @@ impl DoryCommitmentScheme {
                     (g1_prime, v2_r), // d2_right
                 ]);
 
-                // CPU MSMs overlap with GPU dispatch
+                // CPU MSMs overlap with GPU pairing dispatch.
                 e1_beta = JoltG1Routines::msm(&setup.g1_vec[..n], &s2);
                 e2_beta = JoltG2Routines::msm(&setup.g2_vec[..n], &s1);
-
                 let gpu_results = webgpu_pairing::resolve_gpu_multi_group_pairing(gpu_handle).await;
                 let mut it = gpu_results.into_iter();
                 d1_left = it.next().unwrap();
@@ -691,7 +698,6 @@ impl DoryCommitmentScheme {
                 d2_right = BN254::pair(&sum_right, g2_fin);
                 e1_beta = JoltG1Routines::msm(&setup.g1_vec[..n], &s2);
                 e2_beta = JoltG2Routines::msm(&setup.g2_vec[..n], &s1);
-
                 let gpu_results = webgpu_pairing::resolve_gpu_multi_group_pairing(gpu_handle).await;
                 let mut it = gpu_results.into_iter();
                 d1_left = it.next().unwrap();
@@ -715,7 +721,6 @@ impl DoryCommitmentScheme {
                 e1_beta = JoltG1Routines::msm(&setup.g1_vec[..n], &s2);
                 e2_beta = JoltG2Routines::msm(&setup.g2_vec[..n], &s1);
             }
-
             let first_msg = FirstReduceMessage {
                 d1_left,
                 d1_right,
@@ -740,20 +745,20 @@ impl DoryCommitmentScheme {
                 if use_gpu_g2_fold {
                     let gpu_handle =
                         super::webgpu_g2::gpu_g2_dispatch_srs_fold(&v2[..n], &beta_inv);
-                    JoltG1Routines::fixed_scalar_mul_bases_then_add(
-                        &setup.g1_vec[..n],
+                    JoltG1Routines::fixed_scalar_mul_bases_then_add_windowed2(
                         &mut v1,
                         &beta,
+                        &g1_windowed2_tables.windowed2_tables[..n],
                     );
                     let gpu_results = super::webgpu_g2::gpu_g2_resolve_fold(gpu_handle).await;
                     v2[..n].copy_from_slice(&gpu_results);
                 } else {
                     rayon::join(
                         || {
-                            JoltG1Routines::fixed_scalar_mul_bases_then_add(
-                                &setup.g1_vec[..n],
+                            JoltG1Routines::fixed_scalar_mul_bases_then_add_windowed2(
                                 &mut v1,
                                 &beta,
+                                &g1_windowed2_tables.windowed2_tables[..n],
                             )
                         },
                         || {
@@ -785,12 +790,11 @@ impl DoryCommitmentScheme {
                     (v1_r, v2_l), // c_minus
                 ]);
 
-                // CPU MSMs overlap with GPU dispatch
+                // CPU MSMs overlap with GPU pairing dispatch.
                 e1_plus = JoltG1Routines::msm(v1_l, s2_r);
                 e1_minus = JoltG1Routines::msm(v1_r, s2_l);
                 e2_plus = JoltG2Routines::msm(v2_r, s1_l);
                 e2_minus = JoltG2Routines::msm(v2_l, s1_r);
-
                 let gpu_results = webgpu_pairing::resolve_gpu_multi_group_pairing(gpu_handle).await;
                 let mut it = gpu_results.into_iter();
                 c_plus = it.next().unwrap();
@@ -803,7 +807,6 @@ impl DoryCommitmentScheme {
                 e2_plus = JoltG2Routines::msm(v2_r, s1_l);
                 e2_minus = JoltG2Routines::msm(v2_l, s1_r);
             };
-
             let second_msg = SecondReduceMessage {
                 c_plus,
                 c_minus,
@@ -842,7 +845,7 @@ impl DoryCommitmentScheme {
 
                 if use_gpu_g2_fold {
                     rayon::join(
-                        || JoltG1Routines::fixed_scalar_mul_vs_then_add(v1_l, v1_r, &alpha),
+                        || JoltG1Routines::fixed_scalar_mul_vs_then_add_mixed(v1_l, v1_r, &alpha),
                         || {
                             rayon::join(
                                 || JoltG1Routines::fold_field_vectors(s1_l, s1_r, &alpha),
@@ -859,7 +862,7 @@ impl DoryCommitmentScheme {
                     rayon::join(
                         || {
                             rayon::join(
-                                || JoltG1Routines::fixed_scalar_mul_vs_then_add(v1_l, v1_r, &alpha),
+                                || JoltG1Routines::fixed_scalar_mul_vs_then_add_mixed(v1_l, v1_r, &alpha),
                                 || {
                                     JoltG2Routines::fixed_scalar_mul_vs_then_add(
                                         v2_l, v2_r, &alpha_inv,
