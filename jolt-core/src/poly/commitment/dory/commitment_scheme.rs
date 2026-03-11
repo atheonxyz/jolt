@@ -2,6 +2,8 @@
 
 use super::dory_globals::{DoryGlobals, DoryLayout};
 use super::jolt_dory_routines::{JoltG1Routines, JoltG2Routines};
+#[cfg(all(feature = "webgpu-pairing", target_arch = "wasm32"))]
+use super::wrappers::ArkG2;
 use super::wrappers::{
     ark_to_jolt, jolt_to_ark, ArkDoryProof, ArkFr, ArkG1, ArkGT, ArkworksProverSetup,
     ArkworksVerifierSetup, JoltToDoryTranscript, BN254,
@@ -38,7 +40,11 @@ impl DoryOpeningProofHint {
         Self(row_commitments)
     }
 
-    fn into_rows(self) -> Vec<ArkG1> {
+    pub fn from_rows(row_commitments: Vec<ArkG1>) -> Self {
+        Self(row_commitments)
+    }
+
+    pub(crate) fn into_rows(self) -> Vec<ArkG1> {
         self.0
     }
 }
@@ -266,10 +272,10 @@ impl CommitmentScheme for DoryCommitmentScheme {
                 std::slice::from_raw_parts(rlc_hint.as_ptr() as *const G1Projective, rlc_hint.len())
             };
 
-            let _span = trace_span!("vector_scalar_mul_add_gamma_g1_online");
+            let _span = trace_span!("vector_scalar_mul_add_gamma_g1_mixed");
             let _enter = _span.enter();
 
-            jolt_optimizations::vector_scalar_mul_add_gamma_g1_online(
+            jolt_optimizations::vector_scalar_mul_add_gamma_g1_mixed(
                 row_commitments,
                 *coeff,
                 rlc_row_commitments,
@@ -438,6 +444,489 @@ where
             .collect();
         let h1 = C::G1::from(setup.0.h1);
         Some((g1s, h1))
+    }
+}
+
+#[cfg(all(feature = "webgpu-pairing", target_arch = "wasm32"))]
+impl DoryCommitmentScheme {
+    /// Extract row commitments from tier-1 chunks without computing the pairing.
+    /// This is the CPU-only part of `aggregate_chunks`.
+    pub fn collect_row_commitments(onehot_k: Option<usize>, chunks: &[Vec<ArkG1>]) -> Vec<ArkG1> {
+        let num_rows = DoryGlobals::get_max_num_rows();
+
+        if let Some(_K) = onehot_k {
+            let row_len = DoryGlobals::get_num_columns();
+            let T = DoryGlobals::get_T();
+            let rows_per_k = T / row_len;
+
+            let mut row_commitments = vec![ArkG1(G1Projective::zero()); num_rows];
+            for (chunk_index, commitments) in chunks.iter().enumerate() {
+                row_commitments
+                    .par_iter_mut()
+                    .skip(chunk_index)
+                    .step_by(rows_per_k)
+                    .zip(commitments.par_iter())
+                    .for_each(|(dest, src)| *dest = *src);
+            }
+            row_commitments
+        } else {
+            chunks.iter().flat_map(|chunk| chunk.clone()).collect()
+        }
+    }
+
+    /// Get a slice of G2 bases from the prover setup, needed for GPU pairing.
+    pub fn get_g2_bases(setup: &ArkworksProverSetup, len: usize) -> Vec<super::wrappers::ArkG2> {
+        setup.g2_vec[..len].to_vec()
+    }
+
+    pub async fn combine_hints_gpu(
+        hints: Vec<DoryOpeningProofHint>,
+        coeffs: &[ark_bn254::Fr],
+    ) -> DoryOpeningProofHint {
+        if !super::webgpu_pairing::is_gpu_combine_hints_available() {
+            return <Self as CommitmentScheme>::combine_hints(hints, coeffs);
+        }
+
+        let hint_rows: Vec<Vec<ArkG1>> = hints
+            .into_iter()
+            .map(DoryOpeningProofHint::into_rows)
+            .collect();
+        let handle = super::webgpu_pairing::dispatch_gpu_combine_hints(&hint_rows, coeffs);
+        let rows = super::webgpu_pairing::resolve_gpu_combine_hints(handle).await;
+        DoryOpeningProofHint::new(rows)
+    }
+
+    /// Compute v_vec (column evaluation scalars) for GPU G2 fixed-base scalar mul.
+    /// The returned scalars should be multiplied by h2 on GPU, then passed to `prove_with_gpu_v2`.
+    #[cfg(all(feature = "webgpu-pairing", target_arch = "wasm32"))]
+    pub fn compute_v_vec_for_gpu(
+        poly: &MultilinearPolynomial<ark_bn254::Fr>,
+        opening_point: &[ark_bn254::Fr],
+    ) -> Vec<ArkFr> {
+        use dory::MultilinearLagrange;
+
+        let num_cols = DoryGlobals::get_num_columns();
+        let num_rows = DoryGlobals::get_max_num_rows();
+        let sigma = num_cols.log_2();
+        let nu = num_rows.log_2();
+
+        let reordered_point = if DoryGlobals::get_layout() == DoryLayout::AddressMajor {
+            let log_T = DoryGlobals::get_T().log_2();
+            let log_K = opening_point.len().saturating_sub(log_T);
+            let (r_address, r_cycle) = opening_point.split_at(log_K);
+            [r_cycle, r_address].concat()
+        } else {
+            opening_point.to_vec()
+        };
+        let ark_point: Vec<ArkFr> = reordered_point
+            .iter()
+            .rev()
+            .map(|p| {
+                let f_val: ark_bn254::Fr = (*p).into();
+                jolt_to_ark(&f_val)
+            })
+            .collect();
+
+        let (left_vec, _right_vec) = poly.compute_evaluation_vectors(&ark_point, nu, sigma);
+        poly.vector_matrix_product(&left_vec, nu, sigma)
+    }
+
+    /// Prove with a GPU-precomputed v2 vector (G2 fixed-base scalar mul result).
+    /// This skips the expensive `M2::fixed_base_vector_scalar_mul` inside
+    /// `create_evaluation_proof`, replacing it with the pre-computed GPU result.
+    ///
+    /// Only supports Transparent (non-ZK) mode — WASM builds don't use ZK.
+    ///
+    /// When running on WASM with WebGPU pairing available, pairings in the
+    /// reduce-and-fold loop are offloaded to the GPU for rounds with
+    /// >= GPU_PAIRING_THRESHOLD points. Smaller rounds fall back to CPU pairings.
+    #[cfg(all(feature = "webgpu-pairing", target_arch = "wasm32"))]
+    pub async fn prove_with_gpu_v2<ProofTranscript: Transcript>(
+        setup: &ArkworksProverSetup,
+        poly: &MultilinearPolynomial<ark_bn254::Fr>,
+        opening_point: &[ark_bn254::Fr],
+        hint: Option<DoryOpeningProofHint>,
+        transcript: &mut ProofTranscript,
+        pre_computed_v2: Vec<ArkG2>,
+    ) -> (ArkDoryProof, Option<ark_bn254::Fr>) {
+        use super::webgpu_pairing;
+        use dory::primitives::arithmetic::{DoryRoutines, Field as DoryField, Group, PairingCurve};
+        use dory::primitives::transcript::Transcript as DoryTranscript;
+        use dory::{
+            FirstReduceMessage, MultilinearLagrange, ScalarProductMessage, SecondReduceMessage,
+            VMVMessage,
+        };
+
+        const GPU_PAIRING_THRESHOLD: usize = 64;
+        const GPU_G2_FOLD_THRESHOLD: usize = 128;
+
+        let _span = trace_span!("DoryCommitmentScheme::prove_with_gpu_v2").entered();
+
+        let use_gpu_pairing = webgpu_pairing::is_gpu_pairing_available();
+
+        let row_commitments = hint.map(|h| h.into_rows()).unwrap_or_else(|| {
+            let (_commitment, row_commitments) = Self::commit(poly, setup);
+            row_commitments.into_rows()
+        });
+
+        let num_cols = DoryGlobals::get_num_columns();
+        let num_rows = DoryGlobals::get_max_num_rows();
+        let sigma = num_cols.log_2();
+        let nu = num_rows.log_2();
+
+        let reordered_point = if DoryGlobals::get_layout() == DoryLayout::AddressMajor {
+            let log_T = DoryGlobals::get_T().log_2();
+            let log_K = opening_point.len().saturating_sub(log_T);
+            let (r_address, r_cycle) = opening_point.split_at(log_K);
+            [r_cycle, r_address].concat()
+        } else {
+            opening_point.to_vec()
+        };
+        let ark_point: Vec<ArkFr> = reordered_point
+            .iter()
+            .rev()
+            .map(|p| {
+                let f_val: ark_bn254::Fr = (*p).into();
+                jolt_to_ark(&f_val)
+            })
+            .collect();
+
+        let (left_vec, right_vec) = poly.compute_evaluation_vectors(&ark_point, nu, sigma);
+        let v_vec = poly.vector_matrix_product(&left_vec, nu, sigma);
+
+        let mut padded_row_commitments = row_commitments.clone();
+        if nu < sigma {
+            padded_row_commitments.resize(1 << sigma, <BN254 as PairingCurve>::G1::identity());
+        }
+
+        let g2_fin = &setup.g2_vec[0];
+
+        let t_vec_v = JoltG1Routines::msm(&padded_row_commitments, &v_vec);
+        let c = BN254::pair(&t_vec_v, g2_fin);
+
+        let d2 = BN254::pair(
+            &JoltG1Routines::msm(&setup.g1_vec[..1 << sigma], &v_vec),
+            g2_fin,
+        );
+
+        let e1 = JoltG1Routines::msm(&row_commitments, &left_vec);
+
+        let vmv_message = VMVMessage { c, d2, e1 };
+
+        let mut dory_transcript = JoltToDoryTranscript::<ProofTranscript>::new(transcript);
+        dory_transcript.append_serde(b"vmv_c", &vmv_message.c);
+        dory_transcript.append_serde(b"vmv_d2", &vmv_message.d2);
+        dory_transcript.append_serde(b"vmv_e1", &vmv_message.e1);
+
+        // Inline reduce-and-fold state (bypasses DoryProverState whose fields are private).
+        // Transparent mode: all blinds are zero, M::mask() is identity, M::sample() returns zero.
+        let mut v1 = padded_row_commitments;
+        let mut v2 = pre_computed_v2;
+        let mut v2_scalars: Option<Vec<ArkFr>> = Some(v_vec);
+        let mut padded_right_vec = right_vec;
+        let mut padded_left_vec = left_vec;
+        if nu < sigma {
+            padded_right_vec.resize(1 << sigma, ArkFr::zero());
+            padded_left_vec.resize(1 << sigma, ArkFr::zero());
+        }
+        let mut s1 = padded_right_vec;
+        let mut s2 = padded_left_vec;
+
+        let num_rounds = nu.max(sigma);
+        let mut first_messages = Vec::with_capacity(num_rounds);
+        let mut second_messages = Vec::with_capacity(num_rounds);
+
+        #[cfg(all(feature = "webgpu-pairing", target_arch = "wasm32"))]
+        if super::webgpu_g2::is_gpu_g2_available() {
+            let max_n = 1 << num_rounds;
+            super::webgpu_g2::gpu_g2_upload_srs(&setup.g2_vec[..max_n]);
+        }
+
+        // Precompute windowed2 GLV tables for SRS G1 generators (used in Phase 1 folds).
+        let max_n = 1 << num_rounds;
+        let g1_windowed2_tables = {
+            let _span = trace_span!("precompute_g1_windowed2_tables").entered();
+            JoltG1Routines::precompute_windowed2(&setup.g1_vec[..max_n])
+        };
+        // G2 folds: use original online variants (precomputed G2 tables are ~9MB,
+        // causing cache pressure that hurts MSM performance more than the fold savings).
+
+        for round in 0..num_rounds {
+            let n = 1 << (num_rounds - round);
+            let n2 = n / 2;
+            let use_gpu_g2_fold =
+                super::webgpu_g2::is_gpu_g2_available() && n2 >= GPU_G2_FOLD_THRESHOLD;
+            // --- compute_first_message ---
+            let (v1_l, v1_r) = v1.split_at(n2);
+            let (v2_l, v2_r) = v2.split_at(n2);
+            let g1_prime = &setup.g1_vec[..n2];
+            let g2_prime = &setup.g2_vec[..n2];
+
+            let (d1_left, d1_right, d2_left, d2_right, e1_beta, e2_beta);
+
+            if use_gpu_pairing && n2 >= GPU_PAIRING_THRESHOLD && v2_scalars.is_none() {
+                // Batch all 4 pairings in ONE GPU dispatch (d1 + d2)
+                let gpu_handle = webgpu_pairing::dispatch_gpu_multi_group_pairing(&[
+                    (v1_l, g2_prime), // d1_left
+                    (v1_r, g2_prime), // d1_right
+                    (g1_prime, v2_l), // d2_left
+                    (g1_prime, v2_r), // d2_right
+                ]);
+
+                // CPU MSMs overlap with GPU pairing dispatch.
+                e1_beta = JoltG1Routines::msm(&setup.g1_vec[..n], &s2);
+                e2_beta = JoltG2Routines::msm(&setup.g2_vec[..n], &s1);
+                let gpu_results = webgpu_pairing::resolve_gpu_multi_group_pairing(gpu_handle).await;
+                let mut it = gpu_results.into_iter();
+                d1_left = it.next().unwrap();
+                d1_right = it.next().unwrap();
+                d2_left = it.next().unwrap();
+                d2_right = it.next().unwrap();
+            } else if use_gpu_pairing && n2 >= GPU_PAIRING_THRESHOLD {
+                // v2_scalars is Some (first round): batch d1 on GPU, d2 uses MSM + pair
+                let gpu_handle = webgpu_pairing::dispatch_gpu_multi_group_pairing(&[
+                    (v1_l, g2_prime), // d1_left
+                    (v1_r, g2_prime), // d1_right
+                ]);
+
+                // d2 via MSM + single pair (CPU) + MSMs, overlapping with GPU
+                let scalars = v2_scalars.as_ref().unwrap();
+                let (s_l, s_r) = scalars.split_at(n2);
+                let sum_left = JoltG1Routines::msm(g1_prime, s_l);
+                let sum_right = JoltG1Routines::msm(g1_prime, s_r);
+                d2_left = BN254::pair(&sum_left, g2_fin);
+                d2_right = BN254::pair(&sum_right, g2_fin);
+                e1_beta = JoltG1Routines::msm(&setup.g1_vec[..n], &s2);
+                e2_beta = JoltG2Routines::msm(&setup.g2_vec[..n], &s1);
+                let gpu_results = webgpu_pairing::resolve_gpu_multi_group_pairing(gpu_handle).await;
+                let mut it = gpu_results.into_iter();
+                d1_left = it.next().unwrap();
+                d1_right = it.next().unwrap();
+            } else {
+                // CPU fallback
+                if let Some(scalars) = v2_scalars.as_ref() {
+                    let (s_l, s_r) = scalars.split_at(n2);
+                    let sum_left = JoltG1Routines::msm(g1_prime, s_l);
+                    let sum_right = JoltG1Routines::msm(g1_prime, s_r);
+                    d1_left = BN254::multi_pair_g2_setup(v1_l, g2_prime);
+                    d1_right = BN254::multi_pair_g2_setup(v1_r, g2_prime);
+                    d2_left = BN254::pair(&sum_left, g2_fin);
+                    d2_right = BN254::pair(&sum_right, g2_fin);
+                } else {
+                    d1_left = BN254::multi_pair_g2_setup(v1_l, g2_prime);
+                    d1_right = BN254::multi_pair_g2_setup(v1_r, g2_prime);
+                    d2_left = BN254::multi_pair_g1_setup(g1_prime, v2_l);
+                    d2_right = BN254::multi_pair_g1_setup(g1_prime, v2_r);
+                }
+                e1_beta = JoltG1Routines::msm(&setup.g1_vec[..n], &s2);
+                e2_beta = JoltG2Routines::msm(&setup.g2_vec[..n], &s1);
+            }
+            let first_msg = FirstReduceMessage {
+                d1_left,
+                d1_right,
+                d2_left,
+                d2_right,
+                e1_beta,
+                e2_beta,
+            };
+
+            dory_transcript.append_serde(b"d1_left", &first_msg.d1_left);
+            dory_transcript.append_serde(b"d1_right", &first_msg.d1_right);
+            dory_transcript.append_serde(b"d2_left", &first_msg.d2_left);
+            dory_transcript.append_serde(b"d2_right", &first_msg.d2_right);
+            dory_transcript.append_serde(b"e1_beta", &first_msg.e1_beta);
+            dory_transcript.append_serde(b"e2_beta", &first_msg.e2_beta);
+
+            let beta: ArkFr = dory_transcript.challenge_scalar(b"beta");
+
+            // --- apply_first_challenge ---
+            let beta_inv = beta.inv().expect("beta must be invertible");
+            {
+                if use_gpu_g2_fold {
+                    let gpu_handle =
+                        super::webgpu_g2::gpu_g2_dispatch_srs_fold(&v2[..n], &beta_inv);
+                    JoltG1Routines::fixed_scalar_mul_bases_then_add_windowed2(
+                        &mut v1,
+                        &beta,
+                        &g1_windowed2_tables.windowed2_tables[..n],
+                    );
+                    let gpu_results = super::webgpu_g2::gpu_g2_resolve_fold(gpu_handle).await;
+                    v2[..n].copy_from_slice(&gpu_results);
+                } else {
+                    rayon::join(
+                        || {
+                            JoltG1Routines::fixed_scalar_mul_bases_then_add_windowed2(
+                                &mut v1,
+                                &beta,
+                                &g1_windowed2_tables.windowed2_tables[..n],
+                            )
+                        },
+                        || {
+                            JoltG2Routines::fixed_scalar_mul_bases_then_add(
+                                &setup.g2_vec[..n],
+                                &mut v2,
+                                &beta_inv,
+                            )
+                        },
+                    );
+                }
+                v2_scalars = None;
+            }
+
+            first_messages.push(first_msg);
+
+            // --- compute_second_message ---
+            let (v1_l, v1_r) = v1.split_at(n2);
+            let (v2_l, v2_r) = v2.split_at(n2);
+            let (s1_l, s1_r) = s1.split_at(n2);
+            let (s2_l, s2_r) = s2.split_at(n2);
+
+            let (c_plus, c_minus, e1_plus, e1_minus, e2_plus, e2_minus);
+
+            if use_gpu_pairing && n2 >= GPU_PAIRING_THRESHOLD {
+                // Batch both pairings in ONE GPU dispatch
+                let gpu_handle = webgpu_pairing::dispatch_gpu_multi_group_pairing(&[
+                    (v1_l, v2_r), // c_plus
+                    (v1_r, v2_l), // c_minus
+                ]);
+
+                // CPU MSMs overlap with GPU pairing dispatch.
+                e1_plus = JoltG1Routines::msm(v1_l, s2_r);
+                e1_minus = JoltG1Routines::msm(v1_r, s2_l);
+                e2_plus = JoltG2Routines::msm(v2_r, s1_l);
+                e2_minus = JoltG2Routines::msm(v2_l, s1_r);
+                let gpu_results = webgpu_pairing::resolve_gpu_multi_group_pairing(gpu_handle).await;
+                let mut it = gpu_results.into_iter();
+                c_plus = it.next().unwrap();
+                c_minus = it.next().unwrap();
+            } else {
+                c_plus = BN254::multi_pair(v1_l, v2_r);
+                c_minus = BN254::multi_pair(v1_r, v2_l);
+                e1_plus = JoltG1Routines::msm(v1_l, s2_r);
+                e1_minus = JoltG1Routines::msm(v1_r, s2_l);
+                e2_plus = JoltG2Routines::msm(v2_r, s1_l);
+                e2_minus = JoltG2Routines::msm(v2_l, s1_r);
+            };
+            let second_msg = SecondReduceMessage {
+                c_plus,
+                c_minus,
+                e1_plus,
+                e1_minus,
+                e2_plus,
+                e2_minus,
+            };
+
+            dory_transcript.append_serde(b"c_plus", &second_msg.c_plus);
+            dory_transcript.append_serde(b"c_minus", &second_msg.c_minus);
+            dory_transcript.append_serde(b"e1_plus", &second_msg.e1_plus);
+            dory_transcript.append_serde(b"e1_minus", &second_msg.e1_minus);
+            dory_transcript.append_serde(b"e2_plus", &second_msg.e2_plus);
+            dory_transcript.append_serde(b"e2_minus", &second_msg.e2_minus);
+
+            let alpha: ArkFr = dory_transcript.challenge_scalar(b"alpha");
+
+            // --- apply_second_challenge: fold all vectors by half ---
+            let alpha_inv = alpha.inv().expect("alpha must be invertible");
+
+            let gpu_handle = if use_gpu_g2_fold {
+                Some(super::webgpu_g2::gpu_g2_dispatch_fold(
+                    &v2[..n2],
+                    &v2[n2..n],
+                    &alpha_inv,
+                ))
+            } else {
+                None
+            };
+
+            {
+                let (v1_l, v1_r) = v1.split_at_mut(n2);
+                let (s1_l, s1_r) = s1.split_at_mut(n2);
+                let (s2_l, s2_r) = s2.split_at_mut(n2);
+
+                if use_gpu_g2_fold {
+                    rayon::join(
+                        || JoltG1Routines::fixed_scalar_mul_vs_then_add_mixed(v1_l, v1_r, &alpha),
+                        || {
+                            rayon::join(
+                                || JoltG1Routines::fold_field_vectors(s1_l, s1_r, &alpha),
+                                || JoltG1Routines::fold_field_vectors(s2_l, s2_r, &alpha_inv),
+                            )
+                        },
+                    );
+                    if let Some(handle) = gpu_handle {
+                        let gpu_results = super::webgpu_g2::gpu_g2_resolve_fold(handle).await;
+                        v2[..n2].copy_from_slice(&gpu_results);
+                    }
+                } else {
+                    let (v2_l, v2_r) = v2.split_at_mut(n2);
+                    rayon::join(
+                        || {
+                            rayon::join(
+                                || JoltG1Routines::fixed_scalar_mul_vs_then_add_mixed(v1_l, v1_r, &alpha),
+                                || {
+                                    JoltG2Routines::fixed_scalar_mul_vs_then_add(
+                                        v2_l, v2_r, &alpha_inv,
+                                    )
+                                },
+                            )
+                        },
+                        || {
+                            rayon::join(
+                                || JoltG1Routines::fold_field_vectors(s1_l, s1_r, &alpha),
+                                || JoltG1Routines::fold_field_vectors(s2_l, s2_r, &alpha_inv),
+                            )
+                        },
+                    );
+                }
+            }
+            v1.truncate(n2);
+            v2.truncate(n2);
+            s1.truncate(n2);
+            s2.truncate(n2);
+
+            second_messages.push(second_msg);
+        }
+
+        // --- compute_final_message ---
+        let gamma: ArkFr = dory_transcript.challenge_scalar(b"gamma");
+        let gamma_inv = gamma.inv().expect("gamma must be invertible");
+
+        // Transparent mode: r_final1, r_final2 are zero
+        let gamma_s1 = gamma * s1[0];
+        let e1_final = v1[0] + gamma_s1 * setup.h1;
+
+        let gamma_inv_s2 = gamma_inv * s2[0];
+        let e2_final = v2[0] + setup.h2.scale(&gamma_inv_s2);
+
+        let final_message = ScalarProductMessage {
+            e1: e1_final,
+            e2: e2_final,
+        };
+
+        dory_transcript.append_serde(b"final_e1", &final_message.e1);
+        dory_transcript.append_serde(b"final_e2", &final_message.e2);
+        let _d = dory_transcript.challenge_scalar(b"d");
+
+        let proof = ArkDoryProof {
+            vmv_message,
+            first_messages,
+            second_messages,
+            final_message,
+            nu,
+            sigma,
+            #[cfg(feature = "zk")]
+            e2: None,
+            #[cfg(feature = "zk")]
+            y_com: None,
+            #[cfg(feature = "zk")]
+            sigma1_proof: None,
+            #[cfg(feature = "zk")]
+            sigma2_proof: None,
+            #[cfg(feature = "zk")]
+            scalar_product_proof: None,
+        };
+
+        (proof, None)
     }
 }
 

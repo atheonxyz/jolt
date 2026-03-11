@@ -1,0 +1,22 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<title>MSM Correctness Tests</title>
+<style>
+  body { font-family: monospace; background: #1a1a2e; color: #e0e0e0; padding: 20px; }
+  h1 { color: #7ec8e3; }
+  #status { font-size: 24px; font-weight: bold; padding: 8px 16px; border-radius: 4px; display: inline-block; }
+  .pass { background: #2d5a27; color: #7ddf64; }
+  .fail { background: #5a2727; color: #df6464; }
+  .running { background: #5a5a27; color: #dfdf64; }
+  #log { white-space: pre-wrap; font-size: 14px; line-height: 1.5; max-height: 80vh; overflow-y: auto; }
+</style>
+</head>
+<body>
+<h1>GPU MSM Correctness Tests</h1>
+<div><span id="status" class="running">Running...</span></div>
+<pre id="log"></pre>
+<script type="module" src="test-msm.js"></script>
+</body>
+</html>

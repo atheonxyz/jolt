@@ -46,7 +46,7 @@ use allocative::Allocative;
 #[cfg(feature = "allocative")]
 use allocative::FlameGraphBuilder;
 use common::constants::{REGISTER_COUNT, XLEN};
-use itertools::{zip_eq, Itertools};
+use itertools::Itertools;
 use rayon::prelude::*;
 use strum::{EnumCount, IntoEnumIterator};
 use tracer::instruction::{Cycle, Instruction};
@@ -466,45 +466,65 @@ impl<F: JoltField, T: Transcript> SumcheckInstanceProver<F, T>
             let in_n_vars = in_len.log_2();
 
             // Evaluations on [1, ..., degree - 2, inf] (for each stage).
+            let ra_len = self.ra.len();
             let mut evals_per_stage: [Vec<F>; N_STAGES] = (0..out_len)
                 .into_par_iter()
-                .map(|j_hi| {
-                    let mut ra_eval_pairs = vec![(F::zero(), F::zero()); self.ra.len()];
-                    let mut ra_prod_evals = vec![F::zero(); degree - 1];
-                    let mut evals_per_stage: [_; N_STAGES] =
-                        array::from_fn(|_| vec![F::UnreducedProductAccum::zero(); degree - 1]);
-
-                    for j_lo in 0..in_len {
-                        let j = j_lo + (j_hi << in_n_vars);
-
-                        for (i, ra_i) in self.ra.iter().enumerate() {
-                            let ra_i_eval_at_j_0 = ra_i.get_bound_coeff(j * 2);
-                            let ra_i_eval_at_j_1 = ra_i.get_bound_coeff(j * 2 + 1);
-                            ra_eval_pairs[i] = (ra_i_eval_at_j_0, ra_i_eval_at_j_1);
+                .fold(
+                    || {
+                        (
+                            array::from_fn(|_| vec![F::zero(); degree - 1]),
+                            vec![(F::zero(), F::zero()); ra_len],
+                            vec![F::zero(); degree - 1],
+                            array::from_fn::<_, N_STAGES, _>(|_| {
+                                vec![F::UnreducedProductAccum::zero(); degree - 1]
+                            }),
+                        )
+                    },
+                    |(mut stage_sums, mut ra_eval_pairs, mut ra_prod_evals, mut evals_per_stage_inner), j_hi| {
+                        for arr in evals_per_stage_inner.iter_mut() {
+                            arr.iter_mut()
+                                .for_each(|v| *v = F::UnreducedProductAccum::zero());
                         }
-                        // Eval prod_i ra_i(x).
-                        eval_linear_prod_assign(&ra_eval_pairs, &mut ra_prod_evals);
 
-                        for stage in 0..N_STAGES {
-                            let eq_in_eval = self.gruen_eq_polys[stage].E_in_current()[j_lo];
-                            for i in 0..degree - 1 {
-                                evals_per_stage[stage][i] +=
-                                    eq_in_eval.mul_to_product_accum(ra_prod_evals[i]);
+                        for j_lo in 0..in_len {
+                            let j = j_lo + (j_hi << in_n_vars);
+
+                            for (i, ra_i) in self.ra.iter().enumerate() {
+                                let ra_i_eval_at_j_0 = ra_i.get_bound_coeff(j * 2);
+                                let ra_i_eval_at_j_1 = ra_i.get_bound_coeff(j * 2 + 1);
+                                ra_eval_pairs[i] = (ra_i_eval_at_j_0, ra_i_eval_at_j_1);
+                            }
+                            eval_linear_prod_assign(&ra_eval_pairs, &mut ra_prod_evals);
+
+                            for stage in 0..N_STAGES {
+                                let eq_in_eval = self.gruen_eq_polys[stage].E_in_current()[j_lo];
+                                for i in 0..degree - 1 {
+                                    evals_per_stage_inner[stage][i] +=
+                                        eq_in_eval.mul_to_product_accum(ra_prod_evals[i]);
+                                }
                             }
                         }
-                    }
 
-                    array::from_fn(|stage| {
-                        let eq_out_eval = self.gruen_eq_polys[stage].E_out_current()[j_hi];
-                        evals_per_stage[stage]
-                            .iter()
-                            .map(|v| eq_out_eval * F::reduce_product_accum(*v))
-                            .collect()
-                    })
-                })
+                        for stage in 0..N_STAGES {
+                            let eq_out_eval = self.gruen_eq_polys[stage].E_out_current()[j_hi];
+                            for (s, v) in stage_sums[stage].iter_mut().zip(evals_per_stage_inner[stage].iter()) {
+                                *s += eq_out_eval * F::reduce_product_accum(*v);
+                            }
+                        }
+                        (stage_sums, ra_eval_pairs, ra_prod_evals, evals_per_stage_inner)
+                    },
+                )
+                .map(|(stage_sums, _, _, _)| stage_sums)
                 .reduce(
                     || array::from_fn(|_| vec![F::zero(); degree - 1]),
-                    |a, b| array::from_fn(|i| zip_eq(&a[i], &b[i]).map(|(a, b)| *a + *b).collect()),
+                    |mut a, b| {
+                        for stage in 0..N_STAGES {
+                            for (ai, bi) in a[stage].iter_mut().zip(b[stage].iter()) {
+                                *ai += *bi;
+                            }
+                        }
+                        a
+                    },
                 );
             // Multiply by bound values.
             let bound_val_evals = self.bound_val_evals.as_ref().unwrap();
@@ -551,12 +571,19 @@ impl<F: JoltField, T: Transcript> SumcheckInstanceProver<F, T>
                 self.init_log_t_rounds();
             }
         } else {
-            self.ra
-                .iter_mut()
-                .for_each(|ra| ra.bind_parallel(r_j, BindingOrder::LowToHigh));
-            self.gruen_eq_polys
-                .iter_mut()
-                .for_each(|poly| poly.bind(r_j));
+            // log(T) rounds: bind ra and gruen_eq_polys concurrently.
+            rayon::scope(|s| {
+                s.spawn(|_| {
+                    self.ra
+                        .par_iter_mut()
+                        .for_each(|ra| ra.bind_parallel(r_j, BindingOrder::LowToHigh));
+                });
+                s.spawn(|_| {
+                    self.gruen_eq_polys
+                        .par_iter_mut()
+                        .for_each(|poly| poly.bind(r_j));
+                });
+            });
         }
     }
 

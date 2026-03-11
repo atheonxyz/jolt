@@ -281,19 +281,15 @@ pub struct DoryOpeningState<F: JoltField> {
 }
 
 impl<F: JoltField> DoryOpeningState<F> {
-    /// Build streaming RLC polynomial from this state.
-    /// Streams directly from trace - no witness regeneration needed.
-    /// Advice polynomials are passed separately (not streamed from trace).
     #[tracing::instrument(skip_all)]
-    pub fn build_streaming_rlc<PCS: CommitmentScheme<Field = F>>(
+    pub fn build_streaming_rlc_poly_only<PCS: CommitmentScheme<Field = F>>(
         &self,
         one_hot_params: OneHotParams,
         trace_source: TraceSource,
         rlc_streaming_data: Arc<RLCStreamingData>,
         mut opening_hints: HashMap<CommittedPolynomial, PCS::OpeningProofHint>,
         advice_polys: HashMap<CommittedPolynomial, MultilinearPolynomial<F>>,
-    ) -> (MultilinearPolynomial<F>, PCS::OpeningProofHint) {
-        // Accumulate gamma coefficients per polynomial
+    ) -> (MultilinearPolynomial<F>, Vec<PCS::OpeningProofHint>, Vec<F>) {
         let mut rlc_map = BTreeMap::new();
         for (gamma, (poly, _claim)) in self.gamma_powers.iter().zip(self.polynomial_claims.iter()) {
             *rlc_map.entry(*poly).or_insert(F::zero()) += *gamma;
@@ -315,6 +311,29 @@ impl<F: JoltField> DoryOpeningState<F> {
             .into_keys()
             .map(|k| opening_hints.remove(&k).unwrap())
             .collect();
+
+        (joint_poly, hints, coeffs)
+    }
+
+    /// Build streaming RLC polynomial from this state.
+    /// Streams directly from trace - no witness regeneration needed.
+    /// Advice polynomials are passed separately (not streamed from trace).
+    #[tracing::instrument(skip_all)]
+    pub fn build_streaming_rlc<PCS: CommitmentScheme<Field = F>>(
+        &self,
+        one_hot_params: OneHotParams,
+        trace_source: TraceSource,
+        rlc_streaming_data: Arc<RLCStreamingData>,
+        opening_hints: HashMap<CommittedPolynomial, PCS::OpeningProofHint>,
+        advice_polys: HashMap<CommittedPolynomial, MultilinearPolynomial<F>>,
+    ) -> (MultilinearPolynomial<F>, PCS::OpeningProofHint) {
+        let (joint_poly, hints, coeffs) = self.build_streaming_rlc_poly_only::<PCS>(
+            one_hot_params,
+            trace_source,
+            rlc_streaming_data,
+            opening_hints,
+            advice_polys,
+        );
 
         let hint = PCS::combine_hints(hints, &coeffs);
 

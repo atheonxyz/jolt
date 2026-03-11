@@ -47,6 +47,13 @@ monitor = ["dep:sysinfo"]
 pprof = ["dep:pprof", "dep:prost"]
 test_incremental = []
 challenge-254-bit = []
+wasm-prover = ["prover"]
+webgpu-pairing = [
+    "wasm-prover",
+    "dep:wasm-bindgen",
+    "dep:wasm-bindgen-futures",
+    "dep:js-sys",
+]
 
 [dependencies]
 ark-bn254.workspace = true
@@ -95,6 +102,9 @@ pprof = { version = "0.15", features = [
     "frame-pointer",
 ], optional = true }
 prost = { version = "0.14", optional = true }
+wasm-bindgen = { workspace = true, optional = true }
+wasm-bindgen-futures = { workspace = true, optional = true }
+js-sys = { workspace = true, optional = true }
 
 [package.metadata.cargo-machete]
 ignored = ["prost"]

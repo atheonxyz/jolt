@@ -6,6 +6,14 @@
 mod commitment_scheme;
 mod dory_globals;
 mod jolt_dory_routines;
+#[cfg(feature = "webgpu-pairing")]
+pub mod webgpu_g2;
+#[cfg(feature = "webgpu-pairing")]
+pub mod webgpu_msm;
+#[cfg(feature = "webgpu-pairing")]
+pub mod webgpu_onehot;
+#[cfg(feature = "webgpu-pairing")]
+pub mod webgpu_pairing;
 mod wrappers;
 
 #[cfg(test)]
@@ -13,10 +21,10 @@ mod tests;
 
 #[cfg(feature = "zk")]
 pub use commitment_scheme::bind_opening_inputs_zk;
-pub use commitment_scheme::{bind_opening_inputs, DoryCommitmentScheme};
+pub use commitment_scheme::{bind_opening_inputs, DoryCommitmentScheme, DoryOpeningProofHint};
 pub use dory_globals::{DoryContext, DoryGlobals, DoryLayout};
 pub use jolt_dory_routines::{JoltG1Routines, JoltG2Routines};
 pub use wrappers::{
-    ArkDoryProof, ArkFr, ArkG1, ArkG2, ArkGT, ArkworksProverSetup, ArkworksVerifierSetup,
-    JoltFieldWrapper, BN254,
+    jolt_to_ark, ArkDoryProof, ArkFr, ArkG1, ArkG2, ArkGT, ArkworksProverSetup,
+    ArkworksVerifierSetup, JoltFieldWrapper, BN254,
 };

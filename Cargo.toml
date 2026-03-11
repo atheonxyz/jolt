@@ -86,6 +86,7 @@ members = [
     "examples/advice-demo/guest",
     "examples/sig-recovery/host",
     "examples/sig-recovery/guest",
+    "examples/wasm-sha2-prover",
     "zklean-extractor",
     "z3-verifier",
 ]
@@ -237,6 +238,12 @@ addr2line = "0.26.0"
 getrandom = { version = "0.2.16", default-features = false }
 getrandom_v02 = { version = "0.2.16", package = "getrandom", default-features = false }
 getrandom_v03 = { version = "0.3.3", package = "getrandom", default-features = false }
+wasm-bindgen = "0.2.100"
+wasm-bindgen-futures = "0.4.50"
+wasm-bindgen-rayon = "1.2.1"
+js-sys = "0.3.77"
+web-sys = "0.3.77"
+console_error_panic_hook = "0.1.7"
 
 # Build and Development
 ctor = { version = "0.6" }
