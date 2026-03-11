@@ -11,8 +11,16 @@ import init, {
 // GPU imports — these JS modules still load fine, they just won't be called without the feature
 import { initGpuPairing, gpuBatchMultiPairing, gpuBatchMultiPairingFromBuffer, gpuCombineHints, getGpuDevice } from './gpu-pairing.js';
 import { initGPUMSM, executeGPUBatchMSMHybrid } from './gpu-msm.js';
-import { initGpuG2, gpuG2FixedBaseScalarMul, gpuG2UploadTable, gpuG2ScalarMulCached } from './gpu-g2.js';
-import { initGpuOnehot, gpuOnehotGatherDirect, gpuOnehotGatherDirectRetainBuffer } from './gpu-onehot.js';
+import {
+    initGpuG2,
+    gpuG2FixedBaseScalarMul,
+    gpuG2UploadTable,
+    gpuG2UploadSrs,
+    gpuG2ScalarMulCached,
+    gpuG2VarBaseScalarMul,
+    gpuG2SrsFold,
+} from './gpu-g2.js';
+import { initGpuOnehot, gpuOnehotGatherDirect, gpuOnehotGatherDirectRetainBuffer, gpuOnehotGetPendingBuffer } from './gpu-onehot.js';
 
 // Safari cannot reliably handle 4GB (65536 pages) shared WASM memory due to
 // WebKit's Gigacage security feature. Detect Safari and allocate with backoff.
@@ -100,12 +108,13 @@ self.onmessage = async (e) => {
 
                 // Register the batch pairing function callable from WASM
                 // WASM calls this via wasm_bindgen extern import
-                globalThis.__jolt_gpu_batch_pairing = async (g1Flat, g2Flat, groupSizes, groupOffsets) => {
+                globalThis.__jolt_gpu_batch_pairing = async (g1Flat, g2Flat, groupSizes, groupOffsets, numG2Bases) => {
                     return await gpuBatchMultiPairing(
                         new Uint32Array(g1Flat),
                         new Uint32Array(g2Flat),
                         new Uint32Array(groupSizes),
                         new Uint32Array(groupOffsets),
+                        numG2Bases,
                     );
                 };
 
@@ -132,6 +141,27 @@ self.onmessage = async (e) => {
                     );
                 };
 
+                globalThis.__jolt_gpu_g2_var_base_scalar_mul = async (points, addends, scalar, numPoints) => {
+                    return await gpuG2VarBaseScalarMul(
+                        new Uint32Array(points),
+                        new Uint32Array(addends),
+                        new Uint32Array(scalar),
+                        numPoints,
+                    );
+                };
+
+                globalThis.__jolt_gpu_g2_upload_srs = (affineLimbs) => {
+                    gpuG2UploadSrs(new Uint32Array(affineLimbs));
+                };
+
+                globalThis.__jolt_gpu_g2_srs_fold = async (addends, scalar, numPoints) => {
+                    return await gpuG2SrsFold(
+                        new Uint32Array(addends),
+                        new Uint32Array(scalar),
+                        numPoints,
+                    );
+                };
+
                 // Register OneHot batch G1 addition callable from WASM
 
                 // Direct gather dispatch: Rust sends pre-built gather lists (no JS preprocessing)
@@ -153,7 +183,9 @@ self.onmessage = async (e) => {
                     );
                 };
 
-                globalThis.gpuBatchMultiPairingFromBufferFire = function(onehotBuffer, onehotBufferSize, polyLayoutFlat, totalAffinePoints, g2Flat, groupSizes, groupOffsets) {
+                globalThis.gpuOnehotGetPendingBuffer = gpuOnehotGetPendingBuffer;
+
+                globalThis.gpuBatchMultiPairingFromBufferFire = function(onehotBuffer, onehotBufferSize, polyLayoutFlat, totalAffinePoints, g2Flat, groupSizes, groupOffsets, numG2Bases) {
                     return gpuBatchMultiPairingFromBuffer(
                         onehotBuffer,
                         onehotBufferSize,
@@ -162,6 +194,7 @@ self.onmessage = async (e) => {
                         new Uint32Array(g2Flat),
                         new Uint32Array(groupSizes),
                         new Uint32Array(groupOffsets),
+                        numG2Bases,
                     );
                 };
 

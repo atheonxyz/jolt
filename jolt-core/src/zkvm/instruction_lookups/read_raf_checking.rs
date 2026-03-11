@@ -864,41 +864,53 @@ impl<F: JoltField, T: Transcript> SumcheckInstanceProver<F, T>
                 .E_out_current()
                 .par_iter()
                 .enumerate()
-                .map(|(j_out, e_out)| {
-                    // Each pair is a linear polynomial.
-                    let mut pairs = vec![(F::zero(), F::zero()); n_evals];
-                    let mut evals_acc = vec![F::UnreducedProductAccum::zero(); n_evals];
+                .fold(
+                    || {
+                        (
+                            vec![F::zero(); n_evals],
+                            vec![(F::zero(), F::zero()); n_evals],
+                            vec![F::UnreducedProductAccum::zero(); n_evals],
+                        )
+                    },
+                    |(mut sum_evals, mut pairs, mut evals_acc), (j_out, e_out)| {
+                        evals_acc
+                            .iter_mut()
+                            .for_each(|v| *v = F::UnreducedProductAccum::zero());
 
-                    for (j_in, e_in) in self.eq_r_reduction.E_in_current().iter().enumerate() {
-                        let j = self.eq_r_reduction.group_index(j_out, j_in);
+                        for (j_in, e_in) in self.eq_r_reduction.E_in_current().iter().enumerate() {
+                            let j = self.eq_r_reduction.group_index(j_out, j_in);
 
-                        let Some((val_pair, ra_pairs)) = pairs.split_first_mut() else {
-                            unreachable!()
-                        };
+                            let Some((val_pair, ra_pairs)) = pairs.split_first_mut() else {
+                                unreachable!()
+                            };
 
-                        let v_at_0 = combined_val.get_bound_coeff(2 * j);
-                        let v_at_1 = combined_val.get_bound_coeff(2 * j + 1);
-                        // Load linear poly: eq * combined_val.
-                        *val_pair = (*e_in * v_at_0, *e_in * v_at_1);
-                        // Load ra polys.
-                        zip(ra_pairs, ra_polys).for_each(|(pair, ra_poly)| {
-                            let eval_at_0 = ra_poly.get_bound_coeff(2 * j);
-                            let eval_at_1 = ra_poly.get_bound_coeff(2 * j + 1);
-                            *pair = (eval_at_0, eval_at_1);
-                        });
+                            let v_at_0 = combined_val.get_bound_coeff(2 * j);
+                            let v_at_1 = combined_val.get_bound_coeff(2 * j + 1);
+                            *val_pair = (*e_in * v_at_0, *e_in * v_at_1);
+                            zip(ra_pairs, ra_polys).for_each(|(pair, ra_poly)| {
+                                let eval_at_0 = ra_poly.get_bound_coeff(2 * j);
+                                let eval_at_1 = ra_poly.get_bound_coeff(2 * j + 1);
+                                *pair = (eval_at_0, eval_at_1);
+                            });
 
-                        // TODO: Use unreduced arithmetic in eval_linear_prod_assign.
-                        eval_linear_prod_accumulate(&pairs, &mut evals_acc);
-                    }
+                            eval_linear_prod_accumulate(&pairs, &mut evals_acc);
+                        }
 
-                    evals_acc
-                        .into_iter()
-                        .map(|v| F::reduce_product_accum(v) * e_out)
-                        .collect::<Vec<F>>()
-                })
+                        for (s, v) in sum_evals.iter_mut().zip(evals_acc.iter()) {
+                            *s += F::reduce_product_accum(*v) * e_out;
+                        }
+                        (sum_evals, pairs, evals_acc)
+                    },
+                )
+                .map(|(sum_evals, _, _)| sum_evals)
                 .reduce(
                     || vec![F::zero(); n_evals],
-                    |a, b| zip(a, b).map(|(a, b)| a + b).collect(),
+                    |mut a, b| {
+                        for (ai, bi) in a.iter_mut().zip(b.iter()) {
+                            *ai += *bi;
+                        }
+                        a
+                    },
                 );
 
             let current_scalar = self.eq_r_reduction.get_current_scalar();
@@ -959,19 +971,19 @@ impl<F: JoltField, T: Transcript> SumcheckInstanceProver<F, T>
                 self.init_log_t_rounds(self.params.gamma, self.params.gamma_sqr);
             }
         } else {
-            // log(T) rounds
-
-            self.eq_r_reduction.bind(r_j);
-            self.combined_val_polynomial
-                .as_mut()
-                .unwrap()
-                .bind_parallel(r_j, BindingOrder::LowToHigh);
-
-            self.ra_polys
-                .as_mut()
-                .unwrap()
-                .iter_mut()
-                .for_each(|poly| poly.bind_parallel(r_j, BindingOrder::LowToHigh));
+            // log(T) rounds: bind eq, combined_val, and ra_polys concurrently.
+            let eq = &mut self.eq_r_reduction;
+            let combined_val = self.combined_val_polynomial.as_mut().unwrap();
+            let ra_polys = self.ra_polys.as_mut().unwrap();
+            rayon::scope(|s| {
+                s.spawn(|_| eq.bind(r_j));
+                s.spawn(|_| combined_val.bind_parallel(r_j, BindingOrder::LowToHigh));
+                s.spawn(|_| {
+                    ra_polys
+                        .par_iter_mut()
+                        .for_each(|poly| poly.bind_parallel(r_j, BindingOrder::LowToHigh));
+                });
+            });
         }
     }
 

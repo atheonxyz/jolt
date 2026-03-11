@@ -24,6 +24,10 @@ let _onehotInitialized = false;
 let _cachedBasesBuffer = null;
 let _cachedBasesSize = 0;
 
+// Pending buffer: set synchronously during dispatch, before first await.
+// Allows chaining GPU operations (e.g. pairing) without waiting for onehot resolve.
+let _pendingGpuBuffer = null;
+let _pendingGpuBufferSize = 0;
 function divCeil(x, y) { return Math.ceil(x / y); }
 
 /**
@@ -244,6 +248,12 @@ export async function gpuOnehotGatherDirectRetainBuffer(basesFlat, gatherCols, j
     });
     encoder.copyBufferToBuffer(resultsBuffer, 0, stagingBuffer, 0, resultsSize);
 
+    // Set pending buffer BEFORE any await — this enables GPU pipeline chaining.
+    // The resultsBuffer exists on GPU and commands are submitted. Another shader
+    // can reference this buffer; WebGPU guarantees command ordering within a queue.
+    _pendingGpuBuffer = resultsBuffer;
+    _pendingGpuBufferSize = resultsSize;
+
     scanQueue.submit([encoder.finish()]);
     await scanDevice.queue.onSubmittedWorkDone();
 
@@ -261,4 +271,17 @@ export async function gpuOnehotGatherDirectRetainBuffer(basesFlat, gatherCols, j
         gpuBuffer: resultsBuffer,
         gpuBufferSize: resultsSize,
     };
+}
+
+
+/**
+ * Get the GPU buffer from the most recent onehot dispatch.
+ * MUST be called after gpuOnehotGatherDirectRetainBuffer dispatch returns
+ * (the Promise is created, sync code up to first await has executed).
+ * The buffer is valid for use in subsequent GPU dispatches (e.g. pairing)
+ * because WebGPU guarantees command ordering within a queue.
+ * @returns {{ gpuBuffer: GPUBuffer|null, gpuBufferSize: number }}
+ */
+export function gpuOnehotGetPendingBuffer() {
+    return { gpuBuffer: _pendingGpuBuffer, gpuBufferSize: _pendingGpuBufferSize };
 }

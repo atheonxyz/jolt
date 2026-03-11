@@ -922,66 +922,102 @@ impl<F: JoltField> OuterSharedState<F> {
         let res_unr = e_out
             .par_iter()
             .enumerate()
-            .map(|(out_idx, out_val)| {
-                let mut local_res_unr = vec![F::UnreducedProductAccum::zero(); three_pow_dim];
-                let mut buff_a: Vec<F> = vec![F::zero(); three_pow_dim];
-                let mut buff_b = vec![F::zero(); three_pow_dim];
-                let mut tmp = vec![F::zero(); three_pow_dim];
-                let mut grid_a = vec![F::zero(); jlen];
-                let mut grid_b = vec![F::zero(); jlen];
-                let mut acc_az = vec![SmallAccumU::<F>::zero(); jlen];
-                let mut acc_bz_first = vec![MedAccumS::<F>::zero(); jlen];
-                let mut acc_bz_second = vec![WideAccumS::<F>::zero(); jlen];
+            .fold(
+                || {
+                    (
+                        vec![F::UnreducedProductAccum::zero(); three_pow_dim],
+                        vec![F::UnreducedProductAccum::zero(); three_pow_dim],
+                        vec![F::zero(); three_pow_dim],
+                        vec![F::zero(); three_pow_dim],
+                        vec![F::zero(); three_pow_dim],
+                        vec![F::zero(); jlen],
+                        vec![F::zero(); jlen],
+                        vec![SmallAccumU::<F>::zero(); jlen],
+                        vec![MedAccumS::<F>::zero(); jlen],
+                        vec![WideAccumS::<F>::zero(); jlen],
+                    )
+                },
+                #[allow(clippy::type_complexity)]
+                |(
+                    mut acc,
+                    mut local_res_unr,
+                    mut buff_a,
+                    mut buff_b,
+                    mut tmp,
+                    mut grid_a,
+                    mut grid_b,
+                    mut acc_az,
+                    mut acc_bz_first,
+                    mut acc_bz_second,
+                ),
+                 (out_idx, out_val)| {
+                    local_res_unr
+                        .iter_mut()
+                        .for_each(|v| *v = F::UnreducedProductAccum::zero());
 
-                for (in_idx, in_val) in e_in.iter().enumerate() {
-                    let i = out_idx * e_in_len + in_idx;
+                    for (in_idx, in_val) in e_in.iter().enumerate() {
+                        let i = out_idx * e_in_len + in_idx;
 
-                    grid_a.fill(F::zero());
-                    grid_b.fill(F::zero());
-                    self.extrapolate_from_binary_grid_to_tertiary_grid(
-                        &mut acc_az,
-                        &mut acc_bz_first,
-                        &mut acc_bz_second,
-                        &mut grid_a,
-                        &mut grid_b,
-                        jlen,
-                        klen,
-                        i * jlen * klen,
-                        &scaled_w,
-                    );
+                        grid_a.fill(F::zero());
+                        grid_b.fill(F::zero());
+                        self.extrapolate_from_binary_grid_to_tertiary_grid(
+                            &mut acc_az,
+                            &mut acc_bz_first,
+                            &mut acc_bz_second,
+                            &mut grid_a,
+                            &mut grid_b,
+                            jlen,
+                            klen,
+                            i * jlen * klen,
+                            &scaled_w,
+                        );
 
-                    MultiquadraticPolynomial::<F>::expand_linear_grid_to_multiquadratic(
-                        &grid_a,
-                        &mut buff_a,
-                        &mut tmp,
-                        window_size,
-                    );
-                    MultiquadraticPolynomial::<F>::expand_linear_grid_to_multiquadratic(
-                        &grid_b,
-                        &mut buff_b,
-                        &mut tmp,
-                        window_size,
-                    );
+                        MultiquadraticPolynomial::<F>::expand_linear_grid_to_multiquadratic(
+                            &grid_a,
+                            &mut buff_a,
+                            &mut tmp,
+                            window_size,
+                        );
+                        MultiquadraticPolynomial::<F>::expand_linear_grid_to_multiquadratic(
+                            &grid_b,
+                            &mut buff_b,
+                            &mut tmp,
+                            window_size,
+                        );
 
-                    let e_in_val = *in_val;
-                    if window_size == 1 {
+                        let e_in_val = *in_val;
+                        if window_size == 1 {
                         local_res_unr[0] += e_in_val.mul_to_product_accum(buff_a[0] * buff_b[0]);
                         local_res_unr[2] += e_in_val.mul_to_product_accum(buff_a[2] * buff_b[2]);
-                    } else {
-                        for idx in 0..three_pow_dim {
-                            let val = buff_a[idx] * buff_b[idx];
+                        } else {
+                            for idx in 0..three_pow_dim {
+                                let val = buff_a[idx] * buff_b[idx];
                             local_res_unr[idx] += e_in_val.mul_to_product_accum(val);
+                            }
                         }
                     }
-                }
 
-                let e_out_val = *out_val;
-                for idx in 0..three_pow_dim {
-                    let inner_red = F::reduce_product_accum(local_res_unr[idx]);
-                    local_res_unr[idx] = e_out_val.mul_to_product_accum(inner_red);
-                }
-                local_res_unr
-            })
+                    let e_out_val = *out_val;
+                    for idx in 0..three_pow_dim {
+                        let inner_red = F::reduce_product_accum(local_res_unr[idx]);
+                        acc[idx] += e_out_val.mul_to_product_accum(inner_red);
+                    }
+
+                    (
+                        acc,
+                        local_res_unr,
+                        buff_a,
+                        buff_b,
+                        tmp,
+                        grid_a,
+                        grid_b,
+                        acc_az,
+                        acc_bz_first,
+                        acc_bz_second,
+                    )
+                },
+            )
+            .map(|tuple| tuple.0)
             .reduce(
                 || vec![F::UnreducedProductAccum::zero(); three_pow_dim],
                 |mut acc, local| {

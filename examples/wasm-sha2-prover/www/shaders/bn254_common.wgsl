@@ -296,26 +296,52 @@ fn ff_mul(a: BigInt, b: BigInt) -> BigInt {
 }
 
 fn ff_invert(a: BigInt) -> BigInt {
+    // Compute a^(p-2) mod p using 4-bit windowed exponentiation.
+    // p-2 = 0x30644e72_e131a029_b85045b6_8181585d_97816a91_6871ca8d_3c208c16_d87cfd45
+    // 4-bit window: precompute table[1..15], scan 64 nibbles.
+    // 325 mont_mul vs 362 naive (10% fewer ops).
     let exp: array<u32, 8> = array<u32, 8>(
         0x30644e72u, 0xe131a029u, 0xb85045b6u, 0x8181585du,
         0x97816a91u, 0x6871ca8du, 0x3c208c16u, 0xd87cfd45u
     );
 
-    var result = a;
+    // Precompute table[0..15]: table[i] = a^i (14 mont_mul)
+    var table: array<BigInt, 16>;
+    table[0] = bigint_zero(); // unused sentinel
+    table[1] = a;
+    for (var i = 2u; i < 16u; i = i + 1u) {
+        table[i] = mont_mul_cios(table[i - 1u], a);
+    }
 
-    for (var bit: i32 = 28; bit >= 0; bit = bit - 1) {
+    // First nibble is 0x3 — start result = a^3
+    var result = table[3];
+
+    // Process remaining 63 nibbles (252 bits)
+    // Nibble layout: exp[0] has nibbles at bits [31:28], [27:24], ..., [3:0]
+    // First nibble (bits [31:28] of exp[0]) is 0x3, already handled above.
+    // Continue from bits [27:24] of exp[0].
+    for (var ni = 1u; ni < 8u; ni = ni + 1u) {
+        let nib = (exp[0] >> (28u - ni * 4u)) & 0xFu;
         result = mont_mul_cios(result, result);
-        if (((exp[0] >> u32(bit)) & 1u) == 1u) {
-            result = mont_mul_cios(result, a);
+        result = mont_mul_cios(result, result);
+        result = mont_mul_cios(result, result);
+        result = mont_mul_cios(result, result);
+        if (nib != 0u) {
+            result = mont_mul_cios(result, table[nib]);
         }
     }
 
+    // Process remaining 7 limbs (56 nibbles = 224 bits)
     for (var limb = 1u; limb < 8u; limb = limb + 1u) {
         let e = exp[limb];
-        for (var bit: i32 = 31; bit >= 0; bit = bit - 1) {
+        for (var ni = 0u; ni < 8u; ni = ni + 1u) {
+            let nib = (e >> (28u - ni * 4u)) & 0xFu;
             result = mont_mul_cios(result, result);
-            if (((e >> u32(bit)) & 1u) == 1u) {
-                result = mont_mul_cios(result, a);
+            result = mont_mul_cios(result, result);
+            result = mont_mul_cios(result, result);
+            result = mont_mul_cios(result, result);
+            if (nib != 0u) {
+                result = mont_mul_cios(result, table[nib]);
             }
         }
     }

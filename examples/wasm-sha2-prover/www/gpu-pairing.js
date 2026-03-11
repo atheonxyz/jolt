@@ -10,7 +10,7 @@ const NUM_LIMBS = 8;
 const FP12_WORDS = 12 * NUM_LIMBS; // 96 u32s per Fp12
 const G1_WORDS_PER_PAIR = 2 * NUM_LIMBS;  // 16
 const G2_WORDS_PER_PAIR = 4 * NUM_LIMBS;  // 32
-const MILLER_WORKGROUP_SIZE = 128;
+const MILLER_WORKGROUP_SIZE = 64;
 const REDUCE_WORKGROUP_SIZE = 256;
 
 let device = null;
@@ -102,7 +102,7 @@ export async function initGpuPairing() {
  * @param {Uint32Array} groupOffsets - Pair offset for each group
  * @returns {Promise<Uint32Array>} - Fp12 Miller loop results, FP12_WORDS per group
  */
-export async function gpuBatchMultiPairing(g1Flat, g2Flat, groupSizes, groupOffsets) {
+export async function gpuBatchMultiPairing(g1Flat, g2Flat, groupSizes, groupOffsets, numG2Bases) {
     if (!_initialized) throw new Error('GPU not initialized. Call initGpuPairing() first.');
 
     const totalPairs = g1Flat.length / G1_WORDS_PER_PAIR;
@@ -125,7 +125,7 @@ export async function gpuBatchMultiPairing(g1Flat, g2Flat, groupSizes, groupOffs
         usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC,
     });
 
-    const millerParams = new Uint32Array([totalPairs, 0, 0, 0]);
+    const millerParams = new Uint32Array([totalPairs, numG2Bases || (g2Flat.length / G2_WORDS_PER_PAIR), 0, 0]);
     const millerParamsBuf = device.createBuffer({
         size: 16, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
     });
@@ -216,6 +216,7 @@ export async function gpuBatchMultiPairingFromBuffer(
     g2Flat,
     groupSizes,
     groupOffsets,
+    numG2Bases,
 ) {
     if (!_initialized) throw new Error('GPU not initialized. Call initGpuPairing() first.');
     if (!jac2affinePipeline) throw new Error('[gpu-pairing] jac2affine pipeline not initialized');
@@ -270,7 +271,8 @@ export async function gpuBatchMultiPairingFromBuffer(
         usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC,
     });
 
-    const millerParams = new Uint32Array([totalPairs, 0, 0, 0]);
+    const numG2 = numG2Bases || (g2Flat.length / G2_WORDS_PER_PAIR);
+    const millerParams = new Uint32Array([totalPairs, numG2, 0, 0]);
     const millerParamsBuf = device.createBuffer({
         size: 16,
         usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,

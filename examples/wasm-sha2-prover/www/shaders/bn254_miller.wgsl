@@ -7,13 +7,13 @@
 
 struct MillerParams {
     num_pairs: u32,
-    _pad0: u32,
+    num_g2_bases: u32,
     _pad1: u32,
     _pad2: u32,
 }
 @group(0) @binding(3) var<uniform> params: MillerParams;
 
-@compute @workgroup_size(128)
+@compute @workgroup_size(64)
 fn miller_loop_kernel(@builtin(global_invocation_id) gid: vec3<u32>) {
     let tid = gid.x;
     if (tid >= params.num_pairs) { return; }
@@ -26,7 +26,8 @@ fn miller_loop_kernel(@builtin(global_invocation_id) gid: vec3<u32>) {
         p_y.limbs[i] = g1_points[g1_offset + 8u + i];
     }
 
-    let g2_offset = tid * 4u * 8u;
+    let g2_index = tid % params.num_g2_bases;
+    let g2_offset = g2_index * 4u * 8u;
     var Q: G2Affine;
     for (var i = 0u; i < 8u; i = i + 1u) {
         Q.x.c0.limbs[i] = g2_points[g2_offset + i];

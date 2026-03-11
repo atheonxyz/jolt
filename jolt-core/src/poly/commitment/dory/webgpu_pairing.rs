@@ -177,6 +177,7 @@ mod js_bridge {
             g2_flat: &[u32],
             group_sizes: &[u32],
             group_offsets: &[u32],
+            num_g2_bases: u32,
         ) -> JsValue;
 
         #[wasm_bindgen(js_namespace = ["globalThis"], js_name = "__jolt_gpu_pairing_available")]
@@ -188,6 +189,7 @@ mod js_bridge {
             g2_flat: &[u32],
             group_sizes: &[u32],
             group_offsets: &[u32],
+            num_g2_bases: u32,
         ) -> JsValue;
 
         #[wasm_bindgen(js_namespace = globalThis)]
@@ -199,6 +201,7 @@ mod js_bridge {
             g2_flat: &[u32],
             group_sizes: &[u32],
             group_offsets: &[u32],
+            num_g2_bases: u32,
         ) -> JsValue;
 
     }
@@ -417,6 +420,7 @@ pub fn dispatch_gpu_multi_group_pairing(
         &g2_flat,
         &gpu_group_sizes,
         &gpu_group_offsets,
+        total_gpu_pairs as u32,
     );
     let promise: js_sys::Promise = promise_js.unchecked_into();
     let gpu_future = wasm_bindgen_futures::JsFuture::from(promise);
@@ -451,14 +455,18 @@ pub async fn resolve_gpu_multi_group_pairing(handle: GpuMultiGroupPairingHandle)
     use rayon::prelude::*;
     use wasm_bindgen::JsCast;
 
-    let result_js = handle
-        .gpu_future
-        .await
-        .expect("GPU multi-group pairing Promise rejected");
+    let result_js = {
+        let _gpu_wait = tracing::trace_span!("pairing.gpu_wait").entered();
+        handle
+            .gpu_future
+            .await
+            .expect("GPU multi-group pairing Promise rejected")
+    };
     let result_u32_array: Uint32Array =
         result_js.dyn_into().expect("Expected Uint32Array from GPU");
     let result_words: Vec<u32> = result_u32_array.to_vec();
 
+    let _final_exp_span = tracing::trace_span!("pairing.final_exp", groups = handle.num_groups).entered();
     (0..handle.num_groups)
         .into_par_iter()
         .map(|g| {
@@ -531,18 +539,16 @@ pub fn dispatch_gpu_batch_pairing(
         .collect();
 
     let mut g1_flat = Vec::with_capacity(total_gpu_pairs * 2 * NUM_LIMBS);
-    let mut g2_flat = Vec::with_capacity(total_gpu_pairs * 4 * NUM_LIMBS);
-    for (g, &gc) in gpu_counts.iter().enumerate() {
+    for g in 0..g1_groups.len() {
         g1_flat.extend_from_slice(&per_group_g1[g]);
-        let g2_words = gc * 4 * NUM_LIMBS;
-        g2_flat.extend_from_slice(&g2_max_serialized[..g2_words]);
     }
 
     let promise_js = js_bridge::js_gpu_batch_pairing_fire(
         &g1_flat,
-        &g2_flat,
+        &g2_max_serialized,
         &gpu_group_sizes,
         &gpu_group_offsets,
+        max_gpu_count as u32,
     );
     let promise: js_sys::Promise = promise_js.unchecked_into();
     let gpu_future = wasm_bindgen_futures::JsFuture::from(promise);
@@ -637,20 +643,16 @@ pub fn dispatch_gpu_batch_pairing_from_buffer(
     }
 
     let g2_max_serialized = serialize_g2_points(&g2_bases[..max_gpu_count]);
-    let mut g2_flat = Vec::with_capacity(total_gpu_pairs * 4 * NUM_LIMBS);
-    for &gc in gpu_counts.iter() {
-        let g2_words = gc * 4 * NUM_LIMBS;
-        g2_flat.extend_from_slice(&g2_max_serialized[..g2_words]);
-    }
 
     let promise_js = js_bridge::gpuBatchMultiPairingFromBufferFire(
         gpu_buffer,
         gpu_buffer_size as u32,
         &poly_layout_flat,
         total_affine_points as u32,
-        &g2_flat,
+        &g2_max_serialized,
         &gpu_group_sizes,
         &gpu_group_offsets,
+        max_gpu_count as u32,
     );
     let promise: js_sys::Promise = promise_js.unchecked_into();
     let gpu_future = wasm_bindgen_futures::JsFuture::from(promise);
@@ -671,6 +673,66 @@ pub fn dispatch_gpu_batch_pairing_from_buffer(
             }
         })
         .collect();
+
+    GpuBatchPairingFromBufferHandle {
+        gpu_future,
+        cpu_millers,
+        num_groups,
+    }
+}
+
+#[cfg(target_arch = "wasm32")]
+pub fn dispatch_gpu_batch_pairing_from_buffer_chained(
+    gpu_buffer: &wasm_bindgen::JsValue,
+    gpu_buffer_size: usize,
+    poly_layout: &[(usize, usize)],
+    g2_bases: &[ArkG2],
+) -> GpuBatchPairingFromBufferHandle {
+    use wasm_bindgen::JsCast;
+
+    let num_groups = poly_layout.len();
+
+    let mut poly_layout_flat = Vec::with_capacity(num_groups * 4);
+    let mut jac_offset = 0usize;
+    let mut affine_offset = 0usize;
+    let mut total_affine_points = 0usize;
+    let mut gpu_group_sizes = Vec::with_capacity(num_groups);
+    let mut gpu_group_offsets = Vec::with_capacity(num_groups);
+    let mut total_gpu_pairs = 0usize;
+    let mut max_gpu_count = 0usize;
+
+    for &(num_chunks, k) in poly_layout {
+        let points = num_chunks * k;
+        poly_layout_flat.push(num_chunks as u32);
+        poly_layout_flat.push(k as u32);
+        poly_layout_flat.push(jac_offset as u32);
+        poly_layout_flat.push(affine_offset as u32);
+        jac_offset += points;
+        affine_offset += points;
+        total_affine_points += points;
+        gpu_group_sizes.push(points as u32);
+        gpu_group_offsets.push(total_gpu_pairs as u32);
+        max_gpu_count = max_gpu_count.max(points);
+        total_gpu_pairs += points;
+    }
+
+    let g2_max_serialized = serialize_g2_points(&g2_bases[..max_gpu_count]);
+
+    let promise_js = js_bridge::gpuBatchMultiPairingFromBufferFire(
+        gpu_buffer,
+        gpu_buffer_size as u32,
+        &poly_layout_flat,
+        total_affine_points as u32,
+        &g2_max_serialized,
+        &gpu_group_sizes,
+        &gpu_group_offsets,
+        max_gpu_count as u32,
+    );
+    let promise: js_sys::Promise = promise_js.unchecked_into();
+    let gpu_future = wasm_bindgen_futures::JsFuture::from(promise);
+
+    // 100% GPU — no CPU fallback (CPU is idle during this chained dispatch)
+    let cpu_millers: Vec<Option<Fq12>> = vec![None; num_groups];
 
     GpuBatchPairingFromBufferHandle {
         gpu_future,
@@ -721,14 +783,18 @@ pub async fn resolve_gpu_batch_pairing_from_buffer(
     use rayon::prelude::*;
     use wasm_bindgen::JsCast;
 
-    let result_js = handle
-        .gpu_future
-        .await
-        .expect("GPU batch pairing-from-buffer Promise rejected");
+    let result_js = {
+        let _gpu_wait = tracing::trace_span!("pairing_buf.gpu_wait").entered();
+        handle
+            .gpu_future
+            .await
+            .expect("GPU batch pairing-from-buffer Promise rejected")
+    };
     let result_u32_array: Uint32Array =
         result_js.dyn_into().expect("Expected Uint32Array from GPU");
     let result_words: Vec<u32> = result_u32_array.to_vec();
 
+    let _final_exp_span = tracing::trace_span!("pairing_buf.final_exp", groups = handle.num_groups).entered();
     (0..handle.num_groups)
         .into_par_iter()
         .map(|g| {

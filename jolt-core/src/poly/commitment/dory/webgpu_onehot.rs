@@ -83,6 +83,9 @@ mod js_bridge {
 
         #[wasm_bindgen(js_namespace = ["globalThis"], js_name = "__jolt_gpu_onehot_available")]
         pub fn js_gpu_onehot_available() -> bool;
+
+        #[wasm_bindgen(js_namespace = globalThis)]
+        pub fn gpuOnehotGetPendingBuffer() -> JsValue;
     }
 }
 
@@ -199,7 +202,11 @@ pub fn build_gather_lists(
 #[cfg(target_arch = "wasm32")]
 pub struct GpuOnehotBatchHandle {
     promise: wasm_bindgen::JsValue,
-    poly_layout: Vec<(usize, usize, usize)>,
+    pub poly_layout: Vec<(usize, usize, usize)>,
+    /// GPU buffer handle available immediately after dispatch (before resolve).
+    /// Can be passed to pairing dispatch for GPU pipeline chaining.
+    pub pending_gpu_buffer: Option<wasm_bindgen::JsValue>,
+    pub pending_gpu_buffer_size: usize,
 }
 
 #[cfg(target_arch = "wasm32")]
@@ -244,9 +251,29 @@ pub fn dispatch_gpu_onehot_batch_retain_buffer(
         total_jobs as u32,
     );
 
+    // After the Fire call returns, JS has executed synchronously up to the first
+    // `await`. All GPU buffers are created and commands are submitted. We can
+    // retrieve the pending buffer handle for GPU pipeline chaining.
+    let pending_js = js_bridge::gpuOnehotGetPendingBuffer();
+    let pending_gpu_buffer = js_sys::Reflect::get(
+        &pending_js,
+        &wasm_bindgen::JsValue::from_str("gpuBuffer"),
+    )
+    .ok()
+    .filter(|v| !v.is_null() && !v.is_undefined());
+    let pending_gpu_buffer_size = js_sys::Reflect::get(
+        &pending_js,
+        &wasm_bindgen::JsValue::from_str("gpuBufferSize"),
+    )
+    .ok()
+    .and_then(|v| v.as_f64())
+    .unwrap_or(0.0) as usize;
+
     GpuOnehotBatchHandle {
         promise,
         poly_layout,
+        pending_gpu_buffer,
+        pending_gpu_buffer_size,
     }
 }
 
@@ -257,40 +284,53 @@ pub async fn resolve_gpu_onehot_batch_with_buffer(
     use js_sys::{Reflect, Uint32Array};
     use wasm_bindgen::JsCast;
 
-    let result_js = wasm_bindgen_futures::JsFuture::from(js_sys::Promise::from(handle.promise))
-        .await
-        .expect("GPU OneHot batch promise rejected");
+    // Phase 1: JS promise await (GPU compute + onSubmittedWorkDone + mapAsync + readback)
+    let result_js = {
+        let _span = tracing::trace_span!("resolve_onehot.js_await").entered();
+        wasm_bindgen_futures::JsFuture::from(js_sys::Promise::from(handle.promise))
+            .await
+            .expect("GPU OneHot batch promise rejected")
+    };
 
-    let cpu_data_key = wasm_bindgen::JsValue::from_str("cpuData");
-    let gpu_buffer_key = wasm_bindgen::JsValue::from_str("gpuBuffer");
-    let gpu_buffer_size_key = wasm_bindgen::JsValue::from_str("gpuBufferSize");
+    // Phase 2: Extract JS fields + copy Uint32Array → Vec<u32> (JS→WASM transfer)
+    let (result_words, gpu_buffer, gpu_buffer_size_js) = {
+        let _span = tracing::trace_span!("resolve_onehot.to_vec").entered();
+        let cpu_data_key = wasm_bindgen::JsValue::from_str("cpuData");
+        let gpu_buffer_key = wasm_bindgen::JsValue::from_str("gpuBuffer");
+        let gpu_buffer_size_key = wasm_bindgen::JsValue::from_str("gpuBufferSize");
 
-    let cpu_data_js = Reflect::get(&result_js, &cpu_data_key)
-        .expect("Missing cpuData field in GPU OneHot batch result");
-    let gpu_buffer = Reflect::get(&result_js, &gpu_buffer_key)
-        .expect("Missing gpuBuffer field in GPU OneHot batch result");
-    let gpu_buffer_size_js = Reflect::get(&result_js, &gpu_buffer_size_key)
-        .expect("Missing gpuBufferSize field in GPU OneHot batch result");
+        let cpu_data_js = Reflect::get(&result_js, &cpu_data_key)
+            .expect("Missing cpuData field in GPU OneHot batch result");
+        let gpu_buffer = Reflect::get(&result_js, &gpu_buffer_key)
+            .expect("Missing gpuBuffer field in GPU OneHot batch result");
+        let gpu_buffer_size_js = Reflect::get(&result_js, &gpu_buffer_size_key)
+            .expect("Missing gpuBufferSize field in GPU OneHot batch result");
 
-    let result_u32_array: Uint32Array = cpu_data_js
-        .dyn_into()
-        .expect("Expected Uint32Array cpuData from GPU OneHot batch");
-    let result_words: Vec<u32> = result_u32_array.to_vec();
+        let result_u32_array: Uint32Array = cpu_data_js
+            .dyn_into()
+            .expect("Expected Uint32Array cpuData from GPU OneHot batch");
+        let result_words: Vec<u32> = result_u32_array.to_vec();
+        (result_words, gpu_buffer, gpu_buffer_size_js)
+    };
 
-    let cpu_results: Vec<Vec<Vec<G1Projective>>> = handle
-        .poly_layout
-        .iter()
-        .map(|&(num_chunks, k, output_offset)| {
-            let start_word = output_offset * G1_JACOBIAN_WORDS;
-            let num_outputs = num_chunks * k;
-            let end_word = start_word + num_outputs * G1_JACOBIAN_WORDS;
-            deserialize_results(
-                &result_words[start_word..end_word.min(result_words.len())],
-                num_chunks,
-                k,
-            )
-        })
-        .collect();
+    // Phase 3: Deserialize u32 words → G1Projective points (67,584 points for ECDSA)
+    let cpu_results: Vec<Vec<Vec<G1Projective>>> = {
+        let _span = tracing::trace_span!("resolve_onehot.deserialize").entered();
+        handle
+            .poly_layout
+            .iter()
+            .map(|&(num_chunks, k, output_offset)| {
+                let start_word = output_offset * G1_JACOBIAN_WORDS;
+                let num_outputs = num_chunks * k;
+                let end_word = start_word + num_outputs * G1_JACOBIAN_WORDS;
+                deserialize_results(
+                    &result_words[start_word..end_word.min(result_words.len())],
+                    num_chunks,
+                    k,
+                )
+            })
+            .collect()
+    };
 
     let gpu_buffer_size = gpu_buffer_size_js
         .as_f64()

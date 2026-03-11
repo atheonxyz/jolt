@@ -12,19 +12,69 @@
 // only upload the scalars, eliminating table transfer overhead.
 
 const NUM_LIMBS = 8;
+const G2_AFFINE_WORDS = 4 * NUM_LIMBS;
 const G2_JACOBIAN_WORDS = 6 * NUM_LIMBS; // 48 u32s per G2Jacobian
 const G2_WORKGROUP_SIZE = 128;
 
 let g2Device = null;
 let g2Queue = null;
 let g2Pipeline = null;
+let g2VarBasePipeline = null;
 let _g2Initialized = false;
 
 // Persistent cached table buffer (survives across scalar mul calls)
 let g2CachedTableBuffer = null;
 let g2CachedTableSize = 0; // byte length of cached table
+let g2SrsBuffer = null;
+let g2SrsCount = 0;
 
+// Reusable buffer pool for var-base fold dispatches (avoid per-dispatch alloc)
+let g2PoolPoints = null;    // STORAGE + COPY_DST (for var-base: both points inputs)
+let g2PoolAddends = null;   // STORAGE + COPY_DST
+let g2PoolResults = null;   // STORAGE + COPY_SRC
+let g2PoolStaging = null;   // COPY_DST + MAP_READ
+let g2PoolScalar = null;    // STORAGE + COPY_DST (32 bytes, fixed)
+let g2PoolParams = null;    // UNIFORM + COPY_DST (16 bytes, fixed)
+let g2PoolMaxPoints = 0;    // current pool capacity
 function divCeil(x, y) { return Math.ceil(x / y); }
+
+function ensurePool(numPoints) {
+    if (numPoints <= g2PoolMaxPoints) return;
+    if (g2PoolPoints) g2PoolPoints.destroy();
+    if (g2PoolAddends) g2PoolAddends.destroy();
+    if (g2PoolResults) g2PoolResults.destroy();
+    if (g2PoolStaging) g2PoolStaging.destroy();
+    const dataSize = numPoints * G2_JACOBIAN_WORDS * 4;
+    g2PoolPoints = g2Device.createBuffer({
+        size: dataSize,
+        usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST,
+    });
+    g2PoolAddends = g2Device.createBuffer({
+        size: dataSize,
+        usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST,
+    });
+    g2PoolResults = g2Device.createBuffer({
+        size: dataSize,
+        usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC,
+    });
+    g2PoolStaging = g2Device.createBuffer({
+        size: dataSize,
+        usage: GPUBufferUsage.COPY_DST | GPUBufferUsage.MAP_READ,
+    });
+    if (!g2PoolScalar) {
+        g2PoolScalar = g2Device.createBuffer({
+            size: 32,
+            usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST,
+        });
+    }
+    if (!g2PoolParams) {
+        g2PoolParams = g2Device.createBuffer({
+            size: 16,
+            usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
+        });
+    }
+    g2PoolMaxPoints = numPoints;
+}
 
 export function isGpuG2Available() {
     return _g2Initialized;
@@ -50,14 +100,22 @@ export async function initGpuG2(device) {
 
         const commonSrc = await (await fetch('shaders/bn254_common.wgsl')).text();
         const g2KernelSrc = await (await fetch('shaders/g2_fixed_base_mul.wgsl')).text();
+        const vbKernelSrc = await (await fetch('shaders/g2_var_base_scalar_mul.wgsl')).text();
 
         const shaderModule = device.createShaderModule({
             code: commonSrc + '\n' + g2KernelSrc,
+        });
+        const vbShaderModule = device.createShaderModule({
+            code: commonSrc + '\n' + vbKernelSrc,
         });
 
         g2Pipeline = device.createComputePipeline({
             layout: 'auto',
             compute: { module: shaderModule, entryPoint: 'g2_fixed_base_scalar_mul' },
+        });
+        g2VarBasePipeline = device.createComputePipeline({
+            layout: 'auto',
+            compute: { module: vbShaderModule, entryPoint: 'g2_var_base_scalar_mul' },
         });
 
         _g2Initialized = true;
@@ -92,6 +150,61 @@ export function gpuG2UploadTable(tableLimbs) {
     g2Queue.writeBuffer(g2CachedTableBuffer, 0, tableLimbs);
     g2CachedTableSize = tableLimbs.byteLength;
     console.log(`[gpu-g2] Table uploaded to GPU (${tableLimbs.byteLength} bytes, persistent)`);
+}
+
+export function gpuG2UploadSrs(jacobianLimbs) {
+    if (!_g2Initialized) throw new Error('GPU G2 not initialized');
+    if (g2SrsBuffer) {
+        g2SrsBuffer.destroy();
+        g2SrsBuffer = null;
+    }
+    g2SrsBuffer = g2Device.createBuffer({
+        size: jacobianLimbs.byteLength,
+        usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST,
+    });
+    g2Queue.writeBuffer(g2SrsBuffer, 0, jacobianLimbs);
+    g2SrsCount = jacobianLimbs.length / G2_JACOBIAN_WORDS;
+    console.log(`[gpu-g2] SRS G2 uploaded (${g2SrsCount} points, ${jacobianLimbs.byteLength} bytes)`);
+}
+
+export async function gpuG2SrsFold(addendsJacobianLimbs, scalarLimbs, numPoints) {
+    if (!_g2Initialized) throw new Error('GPU G2 not initialized');
+    if (!g2SrsBuffer) throw new Error('No SRS buffer. Call gpuG2UploadSrs() first');
+    if (numPoints === 0) return new Uint32Array(0);
+
+    ensurePool(numPoints);
+    const resultsSize = numPoints * G2_JACOBIAN_WORDS * 4;
+
+    g2Queue.writeBuffer(g2PoolAddends, 0, addendsJacobianLimbs);
+    g2Queue.writeBuffer(g2PoolScalar, 0, scalarLimbs);
+    g2Queue.writeBuffer(g2PoolParams, 0, new Uint32Array([numPoints]));
+
+    const encoder = g2Device.createCommandEncoder();
+    const bindGroup = g2Device.createBindGroup({
+        layout: g2VarBasePipeline.getBindGroupLayout(0),
+        entries: [
+            { binding: 0, resource: { buffer: g2SrsBuffer } },
+            { binding: 1, resource: { buffer: g2PoolAddends } },
+            { binding: 2, resource: { buffer: g2PoolResults } },
+            { binding: 3, resource: { buffer: g2PoolScalar } },
+            { binding: 4, resource: { buffer: g2PoolParams } },
+        ],
+    });
+
+    const pass = encoder.beginComputePass();
+    pass.setPipeline(g2VarBasePipeline);
+    pass.setBindGroup(0, bindGroup);
+    pass.dispatchWorkgroups(divCeil(numPoints, 64));
+    pass.end();
+
+    encoder.copyBufferToBuffer(g2PoolResults, 0, g2PoolStaging, 0, resultsSize);
+    g2Queue.submit([encoder.finish()]);
+    await g2Device.queue.onSubmittedWorkDone();
+    await g2PoolStaging.mapAsync(GPUMapMode.READ, 0, resultsSize);
+    const resultData = new Uint32Array(g2PoolStaging.getMappedRange(0, resultsSize).slice(0));
+    g2PoolStaging.unmap();
+
+    return resultData;
 }
 
 /**
@@ -165,6 +278,53 @@ export async function gpuG2ScalarMulCached(scalarLimbs, numScalars) {
     resultsBuffer.destroy();
     paramsBuf.destroy();
     stagingBuffer.destroy();
+
+    return resultData;
+}
+
+export async function gpuG2VarBaseScalarMul(pointsLimbs, addendsLimbs, scalarLimbs, numPoints) {
+    if (!_g2Initialized) throw new Error('GPU G2 not initialized. Call initGpuG2() first.');
+    if (numPoints === 0) return new Uint32Array(0);
+
+    if (pointsLimbs.length !== numPoints * G2_JACOBIAN_WORDS) {
+        throw new Error(`pointsLimbs length mismatch: got ${pointsLimbs.length}, expected ${numPoints * G2_JACOBIAN_WORDS}`);
+    }
+    if (addendsLimbs.length !== numPoints * G2_JACOBIAN_WORDS) {
+        throw new Error(`addendsLimbs length mismatch: got ${addendsLimbs.length}, expected ${numPoints * G2_JACOBIAN_WORDS}`);
+    }
+
+    ensurePool(numPoints);
+    const resultsSize = numPoints * G2_JACOBIAN_WORDS * 4;
+
+    g2Queue.writeBuffer(g2PoolPoints, 0, pointsLimbs);
+    g2Queue.writeBuffer(g2PoolAddends, 0, addendsLimbs);
+    g2Queue.writeBuffer(g2PoolScalar, 0, scalarLimbs);
+    g2Queue.writeBuffer(g2PoolParams, 0, new Uint32Array([numPoints]));
+
+    const encoder = g2Device.createCommandEncoder();
+    const bindGroup = g2Device.createBindGroup({
+        layout: g2VarBasePipeline.getBindGroupLayout(0),
+        entries: [
+            { binding: 0, resource: { buffer: g2PoolPoints } },
+            { binding: 1, resource: { buffer: g2PoolAddends } },
+            { binding: 2, resource: { buffer: g2PoolResults } },
+            { binding: 3, resource: { buffer: g2PoolScalar } },
+            { binding: 4, resource: { buffer: g2PoolParams } },
+        ],
+    });
+
+    const pass = encoder.beginComputePass();
+    pass.setPipeline(g2VarBasePipeline);
+    pass.setBindGroup(0, bindGroup);
+    pass.dispatchWorkgroups(divCeil(numPoints, 64));
+    pass.end();
+
+    encoder.copyBufferToBuffer(g2PoolResults, 0, g2PoolStaging, 0, resultsSize);
+    g2Queue.submit([encoder.finish()]);
+    await g2Device.queue.onSubmittedWorkDone();
+    await g2PoolStaging.mapAsync(GPUMapMode.READ, 0, resultsSize);
+    const resultData = new Uint32Array(g2PoolStaging.getMappedRange(0, resultsSize).slice(0));
+    g2PoolStaging.unmap();
 
     return resultData;
 }

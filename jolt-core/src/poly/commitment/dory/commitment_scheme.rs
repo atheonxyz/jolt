@@ -558,6 +558,7 @@ impl DoryCommitmentScheme {
         };
 
         const GPU_PAIRING_THRESHOLD: usize = 64;
+        const GPU_G2_FOLD_THRESHOLD: usize = 128;
 
         let _span = trace_span!("DoryCommitmentScheme::prove_with_gpu_v2").entered();
 
@@ -635,9 +636,17 @@ impl DoryCommitmentScheme {
         let mut first_messages = Vec::with_capacity(num_rounds);
         let mut second_messages = Vec::with_capacity(num_rounds);
 
+        #[cfg(all(feature = "webgpu-pairing", target_arch = "wasm32"))]
+        if super::webgpu_g2::is_gpu_g2_available() {
+            let max_n = 1 << num_rounds;
+            super::webgpu_g2::gpu_g2_upload_srs(&setup.g2_vec[..max_n]);
+        }
+
         for round in 0..num_rounds {
             let n = 1 << (num_rounds - round);
             let n2 = n / 2;
+            let use_gpu_g2_fold =
+                super::webgpu_g2::is_gpu_g2_available() && n2 >= GPU_G2_FOLD_THRESHOLD;
 
             // --- compute_first_message ---
             let (v1_l, v1_r) = v1.split_at(n2);
@@ -727,9 +736,37 @@ impl DoryCommitmentScheme {
 
             // --- apply_first_challenge ---
             let beta_inv = beta.inv().expect("beta must be invertible");
-            JoltG1Routines::fixed_scalar_mul_bases_then_add(&setup.g1_vec[..n], &mut v1, &beta);
-            JoltG2Routines::fixed_scalar_mul_bases_then_add(&setup.g2_vec[..n], &mut v2, &beta_inv);
-            v2_scalars = None;
+            {
+                if use_gpu_g2_fold {
+                    let gpu_handle =
+                        super::webgpu_g2::gpu_g2_dispatch_srs_fold(&v2[..n], &beta_inv);
+                    JoltG1Routines::fixed_scalar_mul_bases_then_add(
+                        &setup.g1_vec[..n],
+                        &mut v1,
+                        &beta,
+                    );
+                    let gpu_results = super::webgpu_g2::gpu_g2_resolve_fold(gpu_handle).await;
+                    v2[..n].copy_from_slice(&gpu_results);
+                } else {
+                    rayon::join(
+                        || {
+                            JoltG1Routines::fixed_scalar_mul_bases_then_add(
+                                &setup.g1_vec[..n],
+                                &mut v1,
+                                &beta,
+                            )
+                        },
+                        || {
+                            JoltG2Routines::fixed_scalar_mul_bases_then_add(
+                                &setup.g2_vec[..n],
+                                &mut v2,
+                                &beta_inv,
+                            )
+                        },
+                    );
+                }
+                v2_scalars = None;
+            }
 
             first_messages.push(first_msg);
 
@@ -788,28 +825,60 @@ impl DoryCommitmentScheme {
             // --- apply_second_challenge: fold all vectors by half ---
             let alpha_inv = alpha.inv().expect("alpha must be invertible");
 
+            let gpu_handle = if use_gpu_g2_fold {
+                Some(super::webgpu_g2::gpu_g2_dispatch_fold(
+                    &v2[..n2],
+                    &v2[n2..n],
+                    &alpha_inv,
+                ))
+            } else {
+                None
+            };
+
             {
                 let (v1_l, v1_r) = v1.split_at_mut(n2);
-                JoltG1Routines::fixed_scalar_mul_vs_then_add(v1_l, v1_r, &alpha);
+                let (s1_l, s1_r) = s1.split_at_mut(n2);
+                let (s2_l, s2_r) = s2.split_at_mut(n2);
+
+                if use_gpu_g2_fold {
+                    rayon::join(
+                        || JoltG1Routines::fixed_scalar_mul_vs_then_add(v1_l, v1_r, &alpha),
+                        || {
+                            rayon::join(
+                                || JoltG1Routines::fold_field_vectors(s1_l, s1_r, &alpha),
+                                || JoltG1Routines::fold_field_vectors(s2_l, s2_r, &alpha_inv),
+                            )
+                        },
+                    );
+                    if let Some(handle) = gpu_handle {
+                        let gpu_results = super::webgpu_g2::gpu_g2_resolve_fold(handle).await;
+                        v2[..n2].copy_from_slice(&gpu_results);
+                    }
+                } else {
+                    let (v2_l, v2_r) = v2.split_at_mut(n2);
+                    rayon::join(
+                        || {
+                            rayon::join(
+                                || JoltG1Routines::fixed_scalar_mul_vs_then_add(v1_l, v1_r, &alpha),
+                                || {
+                                    JoltG2Routines::fixed_scalar_mul_vs_then_add(
+                                        v2_l, v2_r, &alpha_inv,
+                                    )
+                                },
+                            )
+                        },
+                        || {
+                            rayon::join(
+                                || JoltG1Routines::fold_field_vectors(s1_l, s1_r, &alpha),
+                                || JoltG1Routines::fold_field_vectors(s2_l, s2_r, &alpha_inv),
+                            )
+                        },
+                    );
+                }
             }
             v1.truncate(n2);
-
-            {
-                let (v2_l, v2_r) = v2.split_at_mut(n2);
-                JoltG2Routines::fixed_scalar_mul_vs_then_add(v2_l, v2_r, &alpha_inv);
-            }
             v2.truncate(n2);
-
-            {
-                let (s1_l, s1_r) = s1.split_at_mut(n2);
-                JoltG1Routines::fold_field_vectors(s1_l, s1_r, &alpha);
-            }
             s1.truncate(n2);
-
-            {
-                let (s2_l, s2_r) = s2.split_at_mut(n2);
-                JoltG1Routines::fold_field_vectors(s2_l, s2_r, &alpha_inv);
-            }
             s2.truncate(n2);
 
             second_messages.push(second_msg);
