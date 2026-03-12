@@ -46,7 +46,7 @@ use allocative::Allocative;
 #[cfg(feature = "allocative")]
 use allocative::FlameGraphBuilder;
 use common::constants::{REGISTER_COUNT, XLEN};
-use itertools::{zip_eq, Itertools};
+use itertools::Itertools;
 use rayon::prelude::*;
 use strum::{EnumCount, IntoEnumIterator};
 use tracer::instruction::{Cycle, Instruction};
@@ -451,7 +451,7 @@ impl<F: JoltField, T: Transcript> SumcheckInstanceProver<F, T>
                 let [eval_at_0, eval_at_2] = evals;
                 let eval_at_1 = self.prev_round_claims[stage] - eval_at_0;
                 let round_poly = UniPoly::from_evals(&[eval_at_0, eval_at_1, eval_at_2]);
-                agg_round_poly += &(&round_poly * self.params.gamma_powers[stage]);
+                agg_round_poly.mul_add_assign(&round_poly, self.params.gamma_powers[stage]);
                 round_polys[stage] = round_poly;
             }
 
@@ -466,45 +466,83 @@ impl<F: JoltField, T: Transcript> SumcheckInstanceProver<F, T>
             let in_n_vars = in_len.log_2();
 
             // Evaluations on [1, ..., degree - 2, inf] (for each stage).
+            // Uses fold_with to reuse scratch buffers across iterations within
+            // each rayon task, eliminating per-element heap allocations.
+            struct BytecodeScratch<F: JoltField> {
+                ra_eval_pairs: Vec<(F, F)>,
+                ra_prod_evals: Vec<F>,
+                stage_acc: [Vec<F::UnreducedProductAccum>; N_STAGES],
+                result: [Vec<F>; N_STAGES],
+            }
+            impl<F: JoltField> Clone for BytecodeScratch<F> {
+                fn clone(&self) -> Self {
+                    Self {
+                        ra_eval_pairs: self.ra_eval_pairs.clone(),
+                        ra_prod_evals: self.ra_prod_evals.clone(),
+                        stage_acc: self.stage_acc.clone(),
+                        result: self.result.clone(),
+                    }
+                }
+            }
+            let ra_len = self.ra.len();
+            let deg_m1 = degree - 1;
             let mut evals_per_stage: [Vec<F>; N_STAGES] = (0..out_len)
                 .into_par_iter()
-                .map(|j_hi| {
-                    let mut ra_eval_pairs = vec![(F::zero(), F::zero()); self.ra.len()];
-                    let mut ra_prod_evals = vec![F::zero(); degree - 1];
-                    let mut evals_per_stage: [_; N_STAGES] =
-                        array::from_fn(|_| vec![F::UnreducedProductAccum::zero(); degree - 1]);
-
-                    for j_lo in 0..in_len {
-                        let j = j_lo + (j_hi << in_n_vars);
-
-                        for (i, ra_i) in self.ra.iter().enumerate() {
-                            let ra_i_eval_at_j_0 = ra_i.get_bound_coeff(j * 2);
-                            let ra_i_eval_at_j_1 = ra_i.get_bound_coeff(j * 2 + 1);
-                            ra_eval_pairs[i] = (ra_i_eval_at_j_0, ra_i_eval_at_j_1);
+                .fold_with(
+                    BytecodeScratch {
+                        ra_eval_pairs: vec![(F::zero(), F::zero()); ra_len],
+                        ra_prod_evals: vec![F::zero(); deg_m1],
+                        stage_acc: array::from_fn(|_| {
+                            vec![F::UnreducedProductAccum::zero(); deg_m1]
+                        }),
+                        result: array::from_fn(|_| vec![F::zero(); deg_m1]),
+                    },
+                    |mut scratch, j_hi| {
+                        for sa in scratch.stage_acc.iter_mut() {
+                            sa.iter_mut()
+                                .for_each(|v| *v = F::UnreducedProductAccum::zero());
                         }
-                        // Eval prod_i ra_i(x).
-                        eval_linear_prod_assign(&ra_eval_pairs, &mut ra_prod_evals);
 
-                        for stage in 0..N_STAGES {
-                            let eq_in_eval = self.gruen_eq_polys[stage].E_in_current()[j_lo];
-                            for i in 0..degree - 1 {
-                                evals_per_stage[stage][i] +=
-                                    eq_in_eval.mul_to_product_accum(ra_prod_evals[i]);
+                        for j_lo in 0..in_len {
+                            let j = j_lo + (j_hi << in_n_vars);
+
+                            for (i, ra_i) in self.ra.iter().enumerate() {
+                                scratch.ra_eval_pairs[i] =
+                                    (ra_i.get_bound_coeff(j * 2), ra_i.get_bound_coeff(j * 2 + 1));
+                            }
+                            eval_linear_prod_assign(
+                                &scratch.ra_eval_pairs,
+                                &mut scratch.ra_prod_evals,
+                            );
+
+                            for stage in 0..N_STAGES {
+                                let eq_in_eval = self.gruen_eq_polys[stage].E_in_current()[j_lo];
+                                for i in 0..deg_m1 {
+                                    scratch.stage_acc[stage][i] +=
+                                        eq_in_eval.mul_to_product_accum(scratch.ra_prod_evals[i]);
+                                }
                             }
                         }
-                    }
 
-                    array::from_fn(|stage| {
-                        let eq_out_eval = self.gruen_eq_polys[stage].E_out_current()[j_hi];
-                        evals_per_stage[stage]
-                            .iter()
-                            .map(|v| eq_out_eval * F::reduce_product_accum(*v))
-                            .collect()
-                    })
-                })
+                        for stage in 0..N_STAGES {
+                            let eq_out_eval = self.gruen_eq_polys[stage].E_out_current()[j_hi];
+                            for i in 0..deg_m1 {
+                                scratch.result[stage][i] += eq_out_eval
+                                    * F::reduce_product_accum(scratch.stage_acc[stage][i]);
+                            }
+                        }
+                        scratch
+                    },
+                )
+                .map(|scratch| scratch.result)
                 .reduce(
-                    || array::from_fn(|_| vec![F::zero(); degree - 1]),
-                    |a, b| array::from_fn(|i| zip_eq(&a[i], &b[i]).map(|(a, b)| *a + *b).collect()),
+                    || array::from_fn(|_| vec![F::zero(); deg_m1]),
+                    |mut a, b| {
+                        for i in 0..N_STAGES {
+                            a[i].iter_mut().zip(b[i].iter()).for_each(|(a, b)| *a += *b);
+                        }
+                        a
+                    },
                 );
             // Multiply by bound values.
             let bound_val_evals = self.bound_val_evals.as_ref().unwrap();
@@ -519,7 +557,7 @@ impl<F: JoltField, T: Transcript> SumcheckInstanceProver<F, T>
             for (stage, evals) in evals_per_stage.iter().enumerate() {
                 let claim = self.prev_round_claims[stage];
                 let round_poly = self.gruen_eq_polys[stage].gruen_poly_from_evals(evals, claim);
-                agg_round_poly += &(&round_poly * self.params.gamma_powers[stage]);
+                agg_round_poly.mul_add_assign(&round_poly, self.params.gamma_powers[stage]);
                 round_polys[stage] = round_poly;
             }
 

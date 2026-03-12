@@ -83,8 +83,33 @@ where
         bases: &[Self::MulBase],
         scalars: &[Self::ScalarField],
     ) -> Result<Self, ProofVerifyError> {
-        ArkVariableBaseMSM::msm_serial(bases, scalars)
-            .map_err(|_bad_index| ProofVerifyError::KeyLengthError(bases.len(), scalars.len()))
+        if bases.len() != scalars.len() {
+            return Err(ProofVerifyError::KeyLengthError(bases.len(), scalars.len()));
+        }
+
+        // On native, arkworks Pippenger uses rayon effectively for large inputs.
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            if bases.len() >= 64 {
+                ArkVariableBaseMSM::msm(bases, scalars).map_err(|_bad_index| {
+                    ProofVerifyError::KeyLengthError(bases.len(), scalars.len())
+                })
+            } else {
+                ArkVariableBaseMSM::msm_serial(bases, scalars).map_err(|_bad_index| {
+                    ProofVerifyError::KeyLengthError(bases.len(), scalars.len())
+                })
+            }
+        }
+        #[cfg(target_arch = "wasm32")]
+        {
+            // On WASM, arkworks' Pippenger uses rayon internally which adds massive
+            // overhead via web worker synchronization. Custom single-threaded Pippenger
+            // was also tested but is slower due to WASM's expensive group arithmetic
+            // making bucket accumulation/reduction costlier than serial double-and-add.
+            // Serial msm_serial is fastest for all sizes on WASM.
+            ArkVariableBaseMSM::msm_serial(bases, scalars)
+                .map_err(|_bad_index| ProofVerifyError::KeyLengthError(bases.len(), scalars.len()))
+        }
     }
 
     #[tracing::instrument(skip_all)]

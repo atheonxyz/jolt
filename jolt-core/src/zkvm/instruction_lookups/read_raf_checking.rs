@@ -859,46 +859,72 @@ impl<F: JoltField, T: Transcript> SumcheckInstanceProver<F, T>
             let combined_val = self.combined_val_polynomial.as_ref().unwrap();
             let n_evals = ra_polys.len() + 1;
 
+            // Scratch buffers reused across iterations within each rayon task,
+            // eliminating per-element heap allocations.
+            struct FoldScratch<F: JoltField> {
+                pairs: Vec<(F, F)>,
+                evals_acc: Vec<F::UnreducedProductAccum>,
+                result: Vec<F>,
+            }
+            impl<F: JoltField> Clone for FoldScratch<F> {
+                fn clone(&self) -> Self {
+                    Self {
+                        pairs: self.pairs.clone(),
+                        evals_acc: self.evals_acc.clone(),
+                        result: self.result.clone(),
+                    }
+                }
+            }
+
             let mut sum_evals = self
                 .eq_r_reduction
                 .E_out_current()
                 .par_iter()
                 .enumerate()
-                .map(|(j_out, e_out)| {
-                    // Each pair is a linear polynomial.
-                    let mut pairs = vec![(F::zero(), F::zero()); n_evals];
-                    let mut evals_acc = vec![F::UnreducedProductAccum::zero(); n_evals];
+                .fold_with(
+                    FoldScratch {
+                        pairs: vec![(F::zero(), F::zero()); n_evals],
+                        evals_acc: vec![F::UnreducedProductAccum::zero(); n_evals],
+                        result: vec![F::zero(); n_evals],
+                    },
+                    |mut scratch, (j_out, e_out)| {
+                        scratch
+                            .evals_acc
+                            .iter_mut()
+                            .for_each(|v| *v = F::UnreducedProductAccum::zero());
 
-                    for (j_in, e_in) in self.eq_r_reduction.E_in_current().iter().enumerate() {
-                        let j = self.eq_r_reduction.group_index(j_out, j_in);
+                        for (j_in, e_in) in self.eq_r_reduction.E_in_current().iter().enumerate() {
+                            let j = self.eq_r_reduction.group_index(j_out, j_in);
 
-                        let Some((val_pair, ra_pairs)) = pairs.split_first_mut() else {
-                            unreachable!()
-                        };
+                            let Some((val_pair, ra_pairs)) = scratch.pairs.split_first_mut() else {
+                                unreachable!()
+                            };
 
-                        let v_at_0 = combined_val.get_bound_coeff(2 * j);
-                        let v_at_1 = combined_val.get_bound_coeff(2 * j + 1);
-                        // Load linear poly: eq * combined_val.
-                        *val_pair = (*e_in * v_at_0, *e_in * v_at_1);
-                        // Load ra polys.
-                        zip(ra_pairs, ra_polys).for_each(|(pair, ra_poly)| {
-                            let eval_at_0 = ra_poly.get_bound_coeff(2 * j);
-                            let eval_at_1 = ra_poly.get_bound_coeff(2 * j + 1);
-                            *pair = (eval_at_0, eval_at_1);
-                        });
+                            let v_at_0 = combined_val.get_bound_coeff(2 * j);
+                            let v_at_1 = combined_val.get_bound_coeff(2 * j + 1);
+                            *val_pair = (*e_in * v_at_0, *e_in * v_at_1);
+                            zip(ra_pairs, ra_polys).for_each(|(pair, ra_poly)| {
+                                let eval_at_0 = ra_poly.get_bound_coeff(2 * j);
+                                let eval_at_1 = ra_poly.get_bound_coeff(2 * j + 1);
+                                *pair = (eval_at_0, eval_at_1);
+                            });
 
-                        // TODO: Use unreduced arithmetic in eval_linear_prod_assign.
-                        eval_linear_prod_accumulate(&pairs, &mut evals_acc);
-                    }
+                            eval_linear_prod_accumulate(&scratch.pairs, &mut scratch.evals_acc);
+                        }
 
-                    evals_acc
-                        .into_iter()
-                        .map(|v| F::reduce_product_accum(v) * e_out)
-                        .collect::<Vec<F>>()
-                })
+                        for (r, ea) in scratch.result.iter_mut().zip(scratch.evals_acc.iter()) {
+                            *r += F::reduce_product_accum(*ea) * e_out;
+                        }
+                        scratch
+                    },
+                )
+                .map(|scratch| scratch.result)
                 .reduce(
                     || vec![F::zero(); n_evals],
-                    |a, b| zip(a, b).map(|(a, b)| a + b).collect(),
+                    |mut a, b| {
+                        a.iter_mut().zip(b.iter()).for_each(|(a, b)| *a += *b);
+                        a
+                    },
                 );
 
             let current_scalar = self.eq_r_reduction.get_current_scalar();
@@ -921,11 +947,25 @@ impl<F: JoltField, T: Transcript> SumcheckInstanceProver<F, T>
             let phase = round / log_m;
             rayon::scope(|s| {
                 s.spawn(|_| {
-                    self.suffix_polys.par_iter_mut().for_each(|polys| {
-                        polys
-                            .par_iter_mut()
-                            .for_each(|poly| poly.bind_parallel(r_j, BindingOrder::HighToLow))
-                    });
+                    let poly_len = self
+                        .suffix_polys
+                        .first()
+                        .and_then(|p| p.first())
+                        .map(|p| p.len())
+                        .unwrap_or(0);
+                    if poly_len <= 4096 {
+                        for polys in self.suffix_polys.iter_mut() {
+                            for poly in polys.iter_mut() {
+                                poly.bind(r_j, BindingOrder::HighToLow);
+                            }
+                        }
+                    } else {
+                        self.suffix_polys.par_iter_mut().for_each(|polys| {
+                            polys
+                                .par_iter_mut()
+                                .for_each(|poly| poly.bind_parallel(r_j, BindingOrder::HighToLow))
+                        });
+                    }
                 });
                 s.spawn(|_| self.identity_ps.bind(r_j));
                 s.spawn(|_| self.right_operand_ps.bind(r_j));
@@ -1114,6 +1154,7 @@ impl<F: JoltField> InstructionReadRafSumcheckProver<F> {
 
         let len = self.suffix_polys[0][0].len();
         let log_len = len.log_2();
+        let half_len = len / 2;
 
         let r_x = if j % 2 == 1 {
             self.r.last().copied()
@@ -1121,56 +1162,72 @@ impl<F: JoltField> InstructionReadRafSumcheckProver<F> {
             None
         };
 
-        let [eval_0, eval_2_left, eval_2_right] = (0..len / 2)
+        let num_prefixes = Prefixes::COUNT;
+        let max_suffixes = self.suffix_polys.iter().map(|s| s.len()).max().unwrap_or(0);
+
+        struct ReadCheckScratch<F: JoltField> {
+            prefixes_c0: Vec<PrefixEval<F>>,
+            prefixes_c2: Vec<PrefixEval<F>>,
+            suffixes_left: Vec<F>,
+            suffixes_right: Vec<F>,
+            result: [F::UnreducedMulU64; 3],
+        }
+        impl<F: JoltField> Clone for ReadCheckScratch<F> {
+            fn clone(&self) -> Self {
+                Self {
+                    prefixes_c0: self.prefixes_c0.clone(),
+                    prefixes_c2: self.prefixes_c2.clone(),
+                    suffixes_left: self.suffixes_left.clone(),
+                    suffixes_right: self.suffixes_right.clone(),
+                    result: self.result,
+                }
+            }
+        }
+
+        let [eval_0, eval_2_left, eval_2_right] = (0..half_len)
             .into_par_iter()
-            .flat_map_iter(|b| {
-                let b = LookupBits::new(b as u128, log_len - 1);
-                let prefixes_c0: Vec<_> = Prefixes::iter()
-                    .map(|prefix| {
-                        prefix.prefix_mle::<XLEN, F, F::Challenge>(
+            .fold_with(
+                ReadCheckScratch {
+                    prefixes_c0: vec![PrefixEval::from(F::zero()); num_prefixes],
+                    prefixes_c2: vec![PrefixEval::from(F::zero()); num_prefixes],
+                    suffixes_left: vec![F::zero(); max_suffixes],
+                    suffixes_right: vec![F::zero(); max_suffixes],
+                    result: [F::UnreducedMulU64::zero(); 3],
+                },
+                |mut scratch, b_raw| {
+                    let b = LookupBits::new(b_raw as u128, log_len - 1);
+                    for (i, prefix) in Prefixes::iter().enumerate() {
+                        scratch.prefixes_c0[i] = prefix.prefix_mle::<XLEN, F, F::Challenge>(
                             &self.prefix_checkpoints,
                             r_x,
                             0,
                             b,
                             j,
-                        )
-                    })
-                    .collect();
-                let prefixes_c2: Vec<_> = Prefixes::iter()
-                    .map(|prefix| {
-                        prefix.prefix_mle::<XLEN, F, F::Challenge>(
+                        );
+                        scratch.prefixes_c2[i] = prefix.prefix_mle::<XLEN, F, F::Challenge>(
                             &self.prefix_checkpoints,
                             r_x,
                             2,
                             b,
                             j,
-                        )
-                    })
-                    .collect();
-                lookup_tables
-                    .iter()
-                    .zip(self.suffix_polys.iter())
-                    .map(move |(table, suffixes)| {
-                        let suffixes_left: Vec<_> =
-                            suffixes.iter().map(|suffix| suffix[b.into()]).collect();
-                        let suffixes_right: Vec<_> = suffixes
-                            .iter()
-                            .map(|suffix| suffix[usize::from(b) + len / 2])
-                            .collect();
-                        [
-                            table.combine(&prefixes_c0, &suffixes_left),
-                            table.combine(&prefixes_c2, &suffixes_left),
-                            table.combine(&prefixes_c2, &suffixes_right),
-                        ]
-                    })
-            })
-            .fold_with([F::UnreducedMulU64::zero(); 3], |running, new| {
-                [
-                    running[0] + new[0].to_unreduced(),
-                    running[1] + new[1].to_unreduced(),
-                    running[2] + new[2].to_unreduced(),
-                ]
-            })
+                        );
+                    }
+                    for (table, suffixes) in lookup_tables.iter().zip(self.suffix_polys.iter()) {
+                        let n_suf = suffixes.len();
+                        for (k, suffix) in suffixes.iter().enumerate() {
+                            scratch.suffixes_left[k] = suffix[usize::from(b)];
+                            scratch.suffixes_right[k] = suffix[usize::from(b) + half_len];
+                        }
+                        let sl = &scratch.suffixes_left[..n_suf];
+                        let sr = &scratch.suffixes_right[..n_suf];
+                        scratch.result[0] += table.combine(&scratch.prefixes_c0, sl).to_unreduced();
+                        scratch.result[1] += table.combine(&scratch.prefixes_c2, sl).to_unreduced();
+                        scratch.result[2] += table.combine(&scratch.prefixes_c2, sr).to_unreduced();
+                    }
+                    scratch
+                },
+            )
+            .map(|s| s.result)
             .reduce(
                 || [F::UnreducedMulU64::zero(); 3],
                 |running, new| {

@@ -19,6 +19,7 @@ use crate::utils::profiling::print_current_memory_usage;
 use ark_serialize::*;
 #[cfg(feature = "zk")]
 use rand_core::CryptoRngCore;
+use rayon::prelude::*;
 use std::marker::PhantomData;
 
 pub use crate::subprotocols::univariate_skip::UniSkipFirstRoundProof;
@@ -81,6 +82,15 @@ impl BatchedSumcheck {
         let mut compressed_polys: Vec<CompressedUniPoly<F>> = Vec::with_capacity(max_num_rounds);
         let two_inv = F::from_u64(2).inverse().unwrap();
 
+        // Precompute per-instance round metadata to avoid vtable dispatch per round.
+        let instance_meta: Vec<(usize, usize)> = sumcheck_instances
+            .iter()
+            .map(|s| {
+                let nr = s.num_rounds();
+                (s.round_offset(max_num_rounds), nr)
+            })
+            .collect();
+
         for round in 0..max_num_rounds {
             #[cfg(not(target_arch = "wasm32"))]
             {
@@ -89,31 +99,24 @@ impl BatchedSumcheck {
             }
 
             let univariate_polys: Vec<UniPoly<F>> = sumcheck_instances
-                .iter_mut()
-                .zip(individual_claims.iter())
-                .map(|(sumcheck, previous_claim)| {
-                    let num_rounds = sumcheck.num_rounds();
-                    let offset = sumcheck.round_offset(max_num_rounds);
+                .par_iter_mut()
+                .zip(individual_claims.par_iter())
+                .zip(instance_meta.par_iter())
+                .map(|((sumcheck, previous_claim), &(offset, num_rounds))| {
                     let active = round >= offset && round < offset + num_rounds;
                     if active {
                         sumcheck.compute_message(round - offset, *previous_claim)
                     } else {
-                        // Variable is "dummy" for this instance: polynomial is independent of it,
-                        // so the round univariate is constant with H(0)=H(1)=previous_claim/2.
                         UniPoly::from_coeff(vec![*previous_claim * two_inv])
                     }
                 })
                 .collect();
 
-            // Linear combination of individual univariate polynomials
-            let batched_univariate_poly: UniPoly<F> =
-                univariate_polys.iter().zip(&batching_coeffs).fold(
-                    UniPoly::from_coeff(vec![]),
-                    |mut batched_poly, (poly, &coeff)| {
-                        batched_poly += &(poly * coeff);
-                        batched_poly
-                    },
-                );
+            // Linear combination of individual univariate polynomials (fused mul-add, no intermediates)
+            let mut batched_univariate_poly = UniPoly::from_coeff(vec![]);
+            for (poly, &coeff) in univariate_polys.iter().zip(&batching_coeffs) {
+                batched_univariate_poly.mul_add_assign(poly, coeff);
+            }
 
             let compressed_poly = batched_univariate_poly.compress();
 
@@ -140,14 +143,15 @@ impl BatchedSumcheck {
                 batched_claim = batched_univariate_poly.evaluate(&r_j);
             }
 
-            for sumcheck in sumcheck_instances.iter_mut() {
-                let num_rounds = sumcheck.num_rounds();
-                let offset = sumcheck.round_offset(max_num_rounds);
-                let active = round >= offset && round < offset + num_rounds;
-                if active {
-                    sumcheck.ingest_challenge(r_j, round - offset);
-                }
-            }
+            sumcheck_instances
+                .par_iter_mut()
+                .zip(instance_meta.par_iter())
+                .for_each(|(sumcheck, &(offset, num_rounds))| {
+                    let active = round >= offset && round < offset + num_rounds;
+                    if active {
+                        sumcheck.ingest_challenge(r_j, round - offset);
+                    }
+                });
 
             compressed_polys.push(compressed_poly);
         }
@@ -241,6 +245,16 @@ impl BatchedSumcheck {
         let mut poly_coeffs: Vec<Vec<F>> = Vec::with_capacity(max_num_rounds);
         let mut blinding_factors: Vec<F> = Vec::with_capacity(max_num_rounds);
         let mut poly_degrees: Vec<usize> = Vec::with_capacity(max_num_rounds);
+        let two_inv = F::from_u64(2).inverse().unwrap();
+
+        // Precompute per-instance round metadata to avoid vtable dispatch per round.
+        let instance_meta: Vec<(usize, usize)> = sumcheck_instances
+            .iter()
+            .map(|s| {
+                let nr = s.num_rounds();
+                (s.round_offset(max_num_rounds), nr)
+            })
+            .collect();
 
         for round in 0..max_num_rounds {
             #[cfg(not(target_arch = "wasm32"))]
@@ -250,30 +264,23 @@ impl BatchedSumcheck {
             }
 
             let univariate_polys: Vec<UniPoly<F>> = sumcheck_instances
-                .iter_mut()
-                .zip(individual_claims.iter())
-                .map(|(sumcheck, previous_claim)| {
-                    let num_rounds = sumcheck.num_rounds();
-                    let offset = sumcheck.round_offset(max_num_rounds);
+                .par_iter_mut()
+                .zip(individual_claims.par_iter())
+                .zip(instance_meta.par_iter())
+                .map(|((sumcheck, previous_claim), &(offset, num_rounds))| {
                     let active = round >= offset && round < offset + num_rounds;
                     if active {
                         sumcheck.compute_message(round - offset, *previous_claim)
                     } else {
-                        // Dummy round: polynomial is constant with H(0)=H(1)=previous_claim/2.
-                        let two_inv = F::from_u64(2).inverse().unwrap();
                         UniPoly::from_coeff(vec![*previous_claim * two_inv])
                     }
                 })
                 .collect();
 
-            let batched_univariate_poly: UniPoly<F> =
-                univariate_polys.iter().zip(&batching_coeffs).fold(
-                    UniPoly::from_coeff(vec![]),
-                    |mut batched_poly, (poly, &coeff)| {
-                        batched_poly += &(poly * coeff);
-                        batched_poly
-                    },
-                );
+            let mut batched_univariate_poly = UniPoly::from_coeff(vec![]);
+            for (poly, &coeff) in univariate_polys.iter().zip(&batching_coeffs) {
+                batched_univariate_poly.mul_add_assign(poly, coeff);
+            }
 
             let blinding = F::random(rng);
             let commitment = pedersen_gens.commit(&batched_univariate_poly.coeffs, &blinding);
@@ -288,14 +295,15 @@ impl BatchedSumcheck {
                 .zip(univariate_polys.into_iter())
                 .for_each(|(claim, poly)| *claim = poly.evaluate(&r_j));
 
-            for sumcheck in sumcheck_instances.iter_mut() {
-                let num_rounds = sumcheck.num_rounds();
-                let offset = sumcheck.round_offset(max_num_rounds);
-                let active = round >= offset && round < offset + num_rounds;
-                if active {
-                    sumcheck.ingest_challenge(r_j, round - offset);
-                }
-            }
+            sumcheck_instances
+                .par_iter_mut()
+                .zip(instance_meta.par_iter())
+                .for_each(|(sumcheck, &(offset, num_rounds))| {
+                    let active = round >= offset && round < offset + num_rounds;
+                    if active {
+                        sumcheck.ingest_challenge(r_j, round - offset);
+                    }
+                });
 
             round_commitments_g1.push(commitment);
             poly_degrees.push(batched_univariate_poly.coeffs.len() - 1);
