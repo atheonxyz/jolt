@@ -5,7 +5,6 @@
 //   gpuG2UploadTable(tableLimbs)                            — upload table to persistent GPU buffer
 //   gpuG2ScalarMulCached(scalarLimbs, numScalars)           — scalar mul using cached table
 //   gpuG2FixedBaseScalarMul(tableLimbs, scalarLimbs, numScalars) — legacy: full table + scalar mul
-//   isGpuG2Available()                                      — check if GPU G2 was initialized
 //
 // Table caching: The precomputed table (~198KB) is uploaded once via gpuG2UploadTable()
 // and kept as a persistent GPUBuffer. Subsequent scalar mul calls via gpuG2ScalarMulCached()
@@ -75,10 +74,6 @@ function ensurePool(numPoints) {
         });
     }
     g2PoolMaxPoints = numPoints;
-}
-
-export function isGpuG2Available() {
-    return _g2Initialized;
 }
 
 /**

@@ -8,17 +8,25 @@
 //!   CPU computes 5% in parallel (via Rayon worker threads), results are combined
 //!   before final exponentiation
 
-use ark_bn254::{Bn254, Fq, Fq12, Fq2, Fq6, Fr, G1Affine, G1Projective, G2Affine};
-use ark_ec::pairing::{MillerLoopOutput, Pairing};
+use ark_bn254::{Fq, Fq12, Fq2, Fq6, G1Affine, G2Affine};
 use ark_ec::CurveGroup;
 use ark_ff::biginteger::{BigInt, BigInteger};
-use ark_ff::{Field, PrimeField, Zero};
+use ark_ff::{Field, Zero};
 
-use super::wrappers::{ArkG1, ArkG2, ArkGT};
+#[cfg(target_arch = "wasm32")]
+use ark_bn254::{Bn254, G1Projective};
+#[cfg(target_arch = "wasm32")]
+use ark_ec::pairing::{MillerLoopOutput, Pairing};
+
+#[cfg(target_arch = "wasm32")]
+use super::wrappers::ArkGT;
+use super::wrappers::{ArkG1, ArkG2};
 
 const NUM_LIMBS: usize = 8;
 const LOG_LIMB_SIZE: u32 = 32;
+#[cfg(target_arch = "wasm32")]
 const FP12_WORDS: usize = 12 * NUM_LIMBS; // 96
+#[cfg(target_arch = "wasm32")]
 const G1_JACOBIAN_WORDS: usize = 24;
 
 fn bigint4_to_limbs(val: &BigInt<4>) -> [u32; NUM_LIMBS] {
@@ -221,38 +229,7 @@ pub struct GpuCombineHintsHandle {
 }
 
 #[cfg(target_arch = "wasm32")]
-fn fq_to_limbs(f: &Fq) -> [u32; NUM_LIMBS] {
-    let mut out = [0u32; NUM_LIMBS];
-    let words = (f.0).0;
-    for i in 0..4 {
-        out[i * 2] = words[i] as u32;
-        out[i * 2 + 1] = (words[i] >> 32) as u32;
-    }
-    out
-}
-
-#[cfg(target_arch = "wasm32")]
-fn fr_to_raw_limbs(scalar: &Fr) -> [u32; NUM_LIMBS] {
-    let mut out = [0u32; NUM_LIMBS];
-    let bigint = scalar.into_bigint();
-    let words = bigint.0;
-    for i in 0..4 {
-        out[i * 2] = words[i] as u32;
-        out[i * 2 + 1] = (words[i] >> 32) as u32;
-    }
-    out
-}
-
-#[cfg(target_arch = "wasm32")]
-fn limbs8_to_fq(limbs: &[u32]) -> Fq {
-    let bigint = BigInt::<4>::new([
-        ((limbs[1] as u64) << 32) | (limbs[0] as u64),
-        ((limbs[3] as u64) << 32) | (limbs[2] as u64),
-        ((limbs[5] as u64) << 32) | (limbs[4] as u64),
-        ((limbs[7] as u64) << 32) | (limbs[6] as u64),
-    ]);
-    Fq::new_unchecked(bigint)
-}
+use super::webgpu_utils::{fq_to_limbs, fr_to_raw_limbs, limbs8_to_fq};
 
 #[cfg(target_arch = "wasm32")]
 pub fn dispatch_gpu_combine_hints(

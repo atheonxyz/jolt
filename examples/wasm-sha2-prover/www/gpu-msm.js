@@ -755,19 +755,8 @@ export async function executeGPUBatchMSM(pointsFlat, scalarsFlat, numPoints, sca
     return gpuBatchMSM(pointsFlat, scalarsFlat, numPoints, scalarBitWidth, batchSize);
 }
 
-export async function executeGPUBatchMSMWithGLV(pointsFlat, scalarsFlat, numPoints, scalarBitWidth, batchSize) {
-    return gpuBatchMSMWithGLV(pointsFlat, scalarsFlat, numPoints, scalarBitWidth, batchSize);
-}
-
 export async function executeGPUBatchMSMHybrid(pointsFlat, scalarsFlat, numPoints, scalarBitWidth, batchSize, cpuMsmFn) {
     return gpuBatchMSMHybrid(pointsFlat, scalarsFlat, numPoints, scalarBitWidth, batchSize, cpuMsmFn, gpuBatchMSMWithGLV);
-}
-
-export function setSmvpWorkgroupSize(size) {
-    if (![32, 64, 128, 256].includes(size)) {
-        throw new Error(`[gpu-msm] Invalid SMVP workgroup size: ${size}. Must be 32, 64, 128, or 256.`);
-    }
-    _smvpWgSize = size;
 }
 
 

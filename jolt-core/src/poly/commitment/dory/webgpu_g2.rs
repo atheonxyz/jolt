@@ -10,50 +10,29 @@
 //! - Public API: `dispatch_gpu_g2_scalar_mul` / `resolve_gpu_g2_scalar_mul` for
 //!   overlapping GPU work with CPU computation
 
-use ark_bn254::{Fq, Fq2, Fr, G2Affine, G2Projective};
+use ark_bn254::{Fq2, Fr, G2Affine, G2Projective};
 use ark_ec::CurveGroup;
-use ark_ff::biginteger::BigInt;
-use ark_ff::{AdditiveGroup, Field, PrimeField, Zero};
+use ark_ff::AdditiveGroup;
 
-use super::wrappers::ArkG2;
-
+#[cfg(target_arch = "wasm32")]
 use std::cell::RefCell;
 
-const NUM_LIMBS: usize = 8;
+#[cfg(target_arch = "wasm32")]
+use super::webgpu_utils::limbs8_to_fq;
+use super::webgpu_utils::{fq_to_limbs, fr_to_raw_limbs, FQ_LIMBS};
+#[cfg(target_arch = "wasm32")]
+use super::wrappers::ArkG2;
+#[cfg(target_arch = "wasm32")]
+use ark_ff::{Field, Zero};
+
+const NUM_LIMBS: usize = FQ_LIMBS;
 const WINDOW_SIZE: usize = 5;
 const NUM_WINDOWS: usize = 51; // ceil(254 / 5)
 const TABLE_ENTRIES: usize = 31; // 2^5 - 1
 const G2_AFFINE_WORDS: usize = 4 * NUM_LIMBS; // x.c0, x.c1, y.c0, y.c1
+#[cfg(target_arch = "wasm32")]
 const G2_JACOBIAN_WORDS: usize = 6 * NUM_LIMBS; // x.c0, x.c1, y.c0, y.c1, z.c0, z.c1
 
-/// Serialize an Fq element to 8 u32 limbs (Montgomery form, little-endian).
-/// Directly splits the internal u64 limbs into u32 pairs.
-#[inline(always)]
-fn fq_to_limbs(f: &Fq) -> [u32; NUM_LIMBS] {
-    let mut out = [0u32; NUM_LIMBS];
-    let words = (f.0).0;
-    for i in 0..4 {
-        out[i * 2] = words[i] as u32;
-        out[i * 2 + 1] = (words[i] >> 32) as u32;
-    }
-    out
-}
-
-/// Deserialize an Fq element from 8 u32 limbs (Montgomery form).
-/// Uses `Fp(bigint, PhantomData)` to directly set Montgomery representation
-/// without re-Montgomery-ifying (same as Fq::new_unchecked).
-#[inline(always)]
-fn limbs8_to_fq(limbs: &[u32]) -> Fq {
-    let bigint = BigInt::<4>::new([
-        (limbs[1] as u64) << 32 | limbs[0] as u64,
-        (limbs[3] as u64) << 32 | limbs[2] as u64,
-        (limbs[5] as u64) << 32 | limbs[4] as u64,
-        (limbs[7] as u64) << 32 | limbs[6] as u64,
-    ]);
-    Fq::new_unchecked(bigint)
-}
-
-/// Serialize an Fq2 element to 16 u32 limbs: [c0_limbs..., c1_limbs...]
 fn fq2_to_limbs(f: &Fq2) -> [u32; 2 * NUM_LIMBS] {
     let mut out = [0u32; 2 * NUM_LIMBS];
     let c0 = fq_to_limbs(&f.c0);
@@ -63,27 +42,12 @@ fn fq2_to_limbs(f: &Fq2) -> [u32; 2 * NUM_LIMBS] {
     out
 }
 
-/// Serialize a G2Affine point to limbs: [x.c0, x.c1, y.c0, y.c1]
 fn g2_affine_to_limbs(point: &G2Affine) -> [u32; G2_AFFINE_WORDS] {
     let mut out = [0u32; G2_AFFINE_WORDS];
     let x_limbs = fq2_to_limbs(&point.x);
     let y_limbs = fq2_to_limbs(&point.y);
     out[..2 * NUM_LIMBS].copy_from_slice(&x_limbs);
     out[2 * NUM_LIMBS..].copy_from_slice(&y_limbs);
-    out
-}
-
-/// Convert a scalar (Fr) to raw bit representation (non-Montgomery) as NUM_LIMBS u32s.
-/// The GPU kernel extracts bit windows directly from the scalar representation,
-/// so we need raw bits (via into_bigint which de-Montgomery-ifies).
-fn fr_to_raw_limbs(scalar: &Fr) -> [u32; NUM_LIMBS] {
-    let mut out = [0u32; NUM_LIMBS];
-    let bigint = scalar.into_bigint();
-    let words = bigint.0;
-    for i in 0..4 {
-        out[i * 2] = words[i] as u32;
-        out[i * 2 + 1] = (words[i] >> 32) as u32;
-    }
     out
 }
 
@@ -130,10 +94,7 @@ pub fn serialize_fr_scalars_raw(scalars: &[Fr]) -> Vec<u32> {
     out
 }
 
-/// Parse a G2 Jacobian result from u32 limbs back to G2Projective.
-///
-/// The GPU returns Jacobian coordinates (X:Y:Z) in Montgomery form.
-/// We reconstruct the Arkworks G2Projective: convert Jacobian to affine first.
+#[cfg(target_arch = "wasm32")]
 fn parse_g2_jacobian(limbs: &[u32]) -> G2Projective {
     let x_c0 = limbs8_to_fq(&limbs[0..NUM_LIMBS]);
     let x_c1 = limbs8_to_fq(&limbs[NUM_LIMBS..2 * NUM_LIMBS]);

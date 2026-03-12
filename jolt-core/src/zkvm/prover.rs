@@ -1229,13 +1229,10 @@ impl<
         // and let Stage 8 use the CPU-serialized hints via dispatch_gpu_combine_hints.
         if let Some(buffer) = onehot_gpu_buffer {
             use wasm_bindgen::JsCast;
-            let _ = js_sys::Reflect::get(
-                &buffer,
-                &wasm_bindgen::JsValue::from_str("destroy"),
-            )
-            .ok()
-            .and_then(|f| f.dyn_into::<js_sys::Function>().ok())
-            .and_then(|destroy_fn: js_sys::Function| destroy_fn.call0(&buffer).ok());
+            let _ = js_sys::Reflect::get(&buffer, &wasm_bindgen::JsValue::from_str("destroy"))
+                .ok()
+                .and_then(|f| f.dyn_into::<js_sys::Function>().ok())
+                .and_then(|destroy_fn: js_sys::Function| destroy_fn.call0(&buffer).ok());
         }
 
         let commitments: Vec<PCS::Commitment> = commitments_by_index

@@ -13,50 +13,17 @@
 //!
 //! This is the WebGPU counterpart of the Metal `metal_onehot_hybrid` gather kernel.
 
-use ark_bn254::{Fq, G1Affine, G1Projective};
+use ark_bn254::G1Affine;
+#[cfg(target_arch = "wasm32")]
+use ark_bn254::G1Projective;
 use ark_ec::AffineRepr;
-use ark_ff::biginteger::BigInt;
-use ark_ff::{Fp, Zero};
 
-const NUM_LIMBS: usize = 8;
+use super::webgpu_utils::{g1_affine_to_limbs, FQ_LIMBS};
+
+const NUM_LIMBS: usize = FQ_LIMBS;
 const G1_AFFINE_WORDS: usize = 2 * NUM_LIMBS; // 16 u32s per G1Affine
+#[cfg(target_arch = "wasm32")]
 const G1_JACOBIAN_WORDS: usize = 3 * NUM_LIMBS; // 24 u32s per G1Jacobian
-
-fn g1_affine_to_limbs(point: &G1Affine) -> [u32; G1_AFFINE_WORDS] {
-    let mut out = [0u32; G1_AFFINE_WORDS];
-    let x_words = (point.x.0).0;
-    let y_words = (point.y.0).0;
-    for i in 0..4 {
-        out[i * 2] = x_words[i] as u32;
-        out[i * 2 + 1] = (x_words[i] >> 32) as u32;
-    }
-    for i in 0..4 {
-        out[8 + i * 2] = y_words[i] as u32;
-        out[8 + i * 2 + 1] = (y_words[i] >> 32) as u32;
-    }
-    out
-}
-
-#[inline(always)]
-fn limbs8_to_fq(limbs: &[u32]) -> Fq {
-    let bigint = BigInt::<4>::new([
-        (limbs[1] as u64) << 32 | limbs[0] as u64,
-        (limbs[3] as u64) << 32 | limbs[2] as u64,
-        (limbs[5] as u64) << 32 | limbs[4] as u64,
-        (limbs[7] as u64) << 32 | limbs[6] as u64,
-    ]);
-    Fp(bigint, std::marker::PhantomData)
-}
-
-fn jacobian_from_limbs(limbs: &[u32]) -> G1Projective {
-    let x = limbs8_to_fq(&limbs[0..8]);
-    let y = limbs8_to_fq(&limbs[8..16]);
-    let z = limbs8_to_fq(&limbs[16..24]);
-    if z.is_zero() {
-        return G1Projective::default();
-    }
-    G1Projective::new_unchecked(x, y, z)
-}
 
 #[cfg(target_arch = "wasm32")]
 mod js_bridge {
@@ -113,11 +80,14 @@ fn serialize_bases(bases: &[G1Affine], row_len: usize) -> Vec<u32> {
     bases_flat
 }
 
+#[cfg(target_arch = "wasm32")]
 fn deserialize_results(
     result_words: &[u32],
     num_chunks: usize,
     k: usize,
 ) -> Vec<Vec<G1Projective>> {
+    use super::webgpu_utils::jacobian_from_limbs;
+
     let mut output = Vec::with_capacity(num_chunks);
     for c in 0..num_chunks {
         let mut row = Vec::with_capacity(k);

@@ -1,50 +1,15 @@
 //! WebGPU-accelerated batch MSM bridge for WASM builds.
 //!
-//! Provides serialization of G1 points to u32 limbs for GPU transfer,
-//! deserialization of Jacobian G1 results, and a CPU fallback MSM using arkworks.
+//! Provides a CPU fallback MSM using arkworks and two's complement correction
+//! for negative i128 scalars encoded as 128-bit unsigned values.
 
-use ark_bn254::{Fq, Fr, G1Affine, G1Projective};
-use ark_ff::biginteger::BigInt;
-use ark_ff::{Fp, Zero};
+use ark_bn254::{Fr, G1Affine, G1Projective};
+use ark_ff::Zero;
 use std::sync::OnceLock;
 
+use super::webgpu_utils::limbs8_to_fq;
+
 const SCALAR_LIMBS: usize = 4;
-
-/// Convert Fq (base field) from 8 u32 limbs (little-endian)
-#[inline(always)]
-fn limbs8_to_fq(limbs: &[u32]) -> Fq {
-    let bigint = BigInt::<4>::new([
-        (limbs[1] as u64) << 32 | limbs[0] as u64,
-        (limbs[3] as u64) << 32 | limbs[2] as u64,
-        (limbs[5] as u64) << 32 | limbs[4] as u64,
-        (limbs[7] as u64) << 32 | limbs[6] as u64,
-    ]);
-    Fp(bigint, std::marker::PhantomData)
-}
-
-/// Serialize G1 affine point to 16 u32s (x:8 + y:8, Montgomery form)
-fn g1_affine_to_limbs(point: &G1Affine) -> [u32; 16] {
-    let mut out = [0u32; 16];
-    let x_words = (point.x.0).0;
-    let y_words = (point.y.0).0;
-    for i in 0..4 {
-        out[i * 2] = x_words[i] as u32;
-        out[i * 2 + 1] = (x_words[i] >> 32) as u32;
-    }
-    for i in 0..4 {
-        out[8 + i * 2] = y_words[i] as u32;
-        out[8 + i * 2 + 1] = (y_words[i] >> 32) as u32;
-    }
-    out
-}
-
-/// Deserialize Jacobian G1 result from 24 u32s (x:8, y:8, z:8 in Montgomery form)
-fn jacobian_from_limbs(limbs: &[u32]) -> G1Projective {
-    let x = limbs8_to_fq(&limbs[0..8]);
-    let y = limbs8_to_fq(&limbs[8..16]);
-    let z = limbs8_to_fq(&limbs[16..24]);
-    G1Projective::new_unchecked(x, y, z)
-}
 
 /// Precomputed 2^128 mod r (BN254 scalar field order) for two's complement correction.
 /// When encoding negative i128 as two's complement (2^128 + val), the GPU result
@@ -97,24 +62,6 @@ pub fn is_gpu_msm_available() -> bool {
     false
 }
 
-/// Convert an i128 scalar to 4 u32 limbs (128-bit two's complement).
-///
-/// Positive values: direct binary representation (fits in 128 bits).
-/// Negative values: two's complement = 2^128 + val (unsigned 128-bit).
-/// The GPU decomposes these as unsigned integers. For negative scalars, the result
-/// includes an extra `2^128 * P_i` term that must be corrected after the GPU returns.
-#[inline]
-pub fn i128_to_4limbs(val: i128) -> [u32; 4] {
-    // Two's complement representation is just the raw bytes of i128
-    let bits = val as u128;
-    [
-        bits as u32,
-        (bits >> 32) as u32,
-        (bits >> 64) as u32,
-        (bits >> 96) as u32,
-    ]
-}
-
 /// Compute the two's complement correction for a batch of MSMs.
 ///
 /// When negative i128 scalars are encoded as two's complement (2^128 + val),
@@ -134,87 +81,6 @@ pub fn apply_twos_complement_corrections(
             *result -= *neg_sum * two_pow_128;
         }
     }
-}
-
-/// Serialize G1 affine bases to a flat u32 buffer (16 u32s per point, Montgomery form).
-pub fn serialize_g1_bases(bases: &[G1Affine]) -> Vec<u32> {
-    let mut out = Vec::with_capacity(bases.len() * 16);
-    for b in bases {
-        out.extend_from_slice(&g1_affine_to_limbs(b));
-    }
-    out
-}
-
-/// Handle for an in-flight GPU batch MSM computation.
-#[cfg(target_arch = "wasm32")]
-pub struct GpuBatchMsmHandle {
-    gpu_future: wasm_bindgen_futures::JsFuture,
-    batch_size: usize,
-}
-
-/// Dispatch a batched MSM to the GPU. All MSMs share the same bases (points_flat).
-/// Each MSM has `num_points` scalars in `scalars_flat` (4 u32s per scalar, 128-bit
-/// two's complement). Returns a handle for later collection with `resolve_gpu_batch_msm`.
-#[cfg(target_arch = "wasm32")]
-pub fn dispatch_gpu_batch_msm(
-    points_flat: &[u32],
-    scalars_flat: &[u32],
-    num_points: usize,
-    batch_size: usize,
-) -> GpuBatchMsmHandle {
-    let promise = js_bridge::js_gpu_batch_msm(
-        points_flat,
-        scalars_flat,
-        num_points as u32,
-        128,
-        batch_size as u32,
-    );
-    let gpu_future = wasm_bindgen_futures::JsFuture::from(js_sys::Promise::from(promise));
-    GpuBatchMsmHandle {
-        gpu_future,
-        batch_size,
-    }
-}
-
-/// Await GPU batch MSM results and deserialize to G1 projective points.
-/// Applies two's complement correction for negative scalars.
-///
-/// `neg_sums`: one G1Projective per batch item — the sum of bases where the scalar
-/// was negative. Pass an empty slice to skip correction (all-positive scalars).
-#[cfg(target_arch = "wasm32")]
-pub async fn resolve_gpu_batch_msm(
-    handle: GpuBatchMsmHandle,
-    neg_sums: &[G1Projective],
-) -> Vec<super::wrappers::ArkG1> {
-    use js_sys::Uint32Array;
-    use wasm_bindgen::JsCast;
-
-    let result = handle.gpu_future.await.expect("GPU batch MSM failed");
-    let u32_array = result
-        .dyn_into::<Uint32Array>()
-        .expect("GPU MSM result should be Uint32Array");
-    let flat: Vec<u32> = u32_array.to_vec();
-
-    assert_eq!(
-        flat.len(),
-        handle.batch_size * 24,
-        "GPU MSM result size mismatch: expected {} u32s, got {}",
-        handle.batch_size * 24,
-        flat.len()
-    );
-
-    // Raw integer scalars → no Montgomery R factor in the result.
-    // Only need two's complement correction for negative scalars.
-    let mut results: Vec<G1Projective> = flat
-        .chunks_exact(24)
-        .map(|chunk| jacobian_from_limbs(chunk))
-        .collect();
-
-    if !neg_sums.is_empty() {
-        apply_twos_complement_corrections(&mut results, neg_sums);
-    }
-
-    results.into_iter().map(super::wrappers::ArkG1).collect()
 }
 
 /// CPU batch MSM using arkworks `VariableBaseMSM::msm_serial` with rayon
@@ -294,33 +160,31 @@ pub fn cpu_batch_msm_from_limbs(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use ark_bn254::{Fr, G1Affine, G1Projective};
+    use crate::poly::commitment::dory::webgpu_utils::{
+        g1_affine_to_limbs, jacobian_from_limbs, limbs8_to_fq,
+    };
+    use ark_bn254::{Fq, Fr, G1Affine, G1Projective};
     use ark_ec::{AffineRepr, CurveGroup, VariableBaseMSM};
     use ark_ff::{One, Zero};
 
-    /// Print MSM reference values as u32 limbs (JS format) for use in browser tests.
-    /// Computes scalar multiples of the generator and verifies MSM results.
+    fn i128_to_4limbs(val: i128) -> [u32; 4] {
+        let v = val as u128;
+        [
+            v as u32,
+            (v >> 32) as u32,
+            (v >> 64) as u32,
+            (v >> 96) as u32,
+        ]
+    }
+
     #[test]
     fn msm_reference_values_correctness() {
         let g = G1Affine::generator();
         let g_proj = G1Projective::from(g);
 
-        // Compute multiples: 2G, 3G, 4G, 5G
         let g2 = (g_proj + g_proj).into_affine();
         let g3 = (g_proj + g_proj + g_proj).into_affine();
         let g5 = (g_proj + g_proj + g_proj + g_proj + g_proj).into_affine();
-
-        // Print G1 generator as JS limbs
-        let g_limbs = g1_affine_to_limbs(&g);
-
-        // Print 2G
-        let g2_limbs = g1_affine_to_limbs(&g2);
-
-        // Print 3G
-        let g3_limbs = g1_affine_to_limbs(&g3);
-
-        // Print 5G
-        let g5_limbs = g1_affine_to_limbs(&g5);
 
         // MSM test 1: 2*G + 3*(2G) + 1*(3G) = 2G + 6G + 3G = 11G
         let bases_1 = vec![g, g2, g3];
@@ -331,9 +195,6 @@ mod tests {
             msm_1, expected_11g,
             "MSM(2*G + 3*2G + 1*3G) should equal 11G"
         );
-
-        let msm_1_affine = msm_1.into_affine();
-        let msm_1_limbs = g1_affine_to_limbs(&msm_1_affine);
 
         // MSM test 2: 1*G + 2*(2G) + 3*(3G) + 4*(4G) + 5*(5G)
         //           = 1G + 4G + 9G + 16G + 25G = 55G
@@ -352,9 +213,6 @@ mod tests {
             msm_2, expected_55g,
             "MSM(1*G + 2*2G + 3*3G + 4*4G + 5*5G) should equal 55G"
         );
-
-        let msm_2_affine = msm_2.into_affine();
-        let msm_2_limbs = g1_affine_to_limbs(&msm_2_affine);
     }
 
     /// Verify G1 point serialization/deserialization roundtrip.
@@ -457,7 +315,6 @@ mod tests {
         let g = G1Affine::generator();
         let g_proj = G1Projective::from(g);
         let g2 = (g_proj + g_proj).into_affine();
-        let g3 = (g_proj + g_proj + g_proj).into_affine();
 
         // i128_to_4limbs: positive values
         let limbs_5 = i128_to_4limbs(5);
@@ -474,9 +331,9 @@ mod tests {
         // GPU computes: 5*G + (2^128-3)*2G = 5G - 6G + 2^128*2G = -G + 2^128*2G
         let expected = g_proj * Fr::from(5u64) - G1Projective::from(g2) * Fr::from(3u64);
 
-        let two_pow_128 = *get_two_pow_128_mod_r();
+        let _two_pow_128 = *get_two_pow_128_mod_r();
         let gpu_simulated =
-            g_proj * Fr::from(5u64) + G1Projective::from(g2) * Fr::from((-3i128 as u128));
+            g_proj * Fr::from(5u64) + G1Projective::from(g2) * Fr::from(-3i128 as u128);
         let neg_sum = G1Projective::from(g2); // only g2 had a negative scalar
 
         let mut results = vec![gpu_simulated];

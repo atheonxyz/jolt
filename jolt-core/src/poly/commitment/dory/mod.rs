@@ -14,6 +14,8 @@ pub mod webgpu_msm;
 pub mod webgpu_onehot;
 #[cfg(feature = "webgpu-pairing")]
 pub mod webgpu_pairing;
+#[cfg(feature = "webgpu-pairing")]
+mod webgpu_utils;
 mod wrappers;
 
 #[cfg(test)]
