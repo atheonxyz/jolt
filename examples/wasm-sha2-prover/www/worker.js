@@ -9,15 +9,15 @@ import init, {
     WasmVerifier,
 } from '../pkg/jolt_wasm_sha2_prover.js';
 // GPU imports — these JS modules still load fine, they just won't be called without the feature
-import { initGpuPairing, gpuBatchMultiPairing, gpuBatchMultiPairingFromBuffer, gpuCombineHints, getGpuDevice } from './gpu-pairing.js';
-import { initGPUMSM, executeGPUBatchMSMHybrid } from './gpu-msm.js';
+import { initGpuPairing, gpuBatchMultiPairing, gpuBatchMultiPairingFromBuffer, gpuCombineHints, getGpuDevice } from './gpu/pairing.js';
+import { initGPUMSM, executeGPUBatchMSMHybrid } from './gpu/msm.js';
 import {
     initGpuG2,
     gpuG2FixedBaseScalarMul,
     gpuG2UploadTable,
     gpuG2ScalarMulCached,
-} from './gpu-g2.js';
-import { initGpuOnehot, gpuOnehotGatherDirect, gpuOnehotGatherDirectRetainBuffer } from './gpu-onehot.js';
+} from './gpu/g2.js';
+import { initGpuOnehot, gpuOnehotGatherDirect, gpuOnehotGatherDirectRetainBuffer } from './gpu/onehot.js';
 
 // Safari cannot reliably handle 4GB (65536 pages) shared WASM memory due to
 // WebKit's Gigacage security feature. Detect Safari and allocate with backoff.

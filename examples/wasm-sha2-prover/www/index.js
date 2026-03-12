@@ -1,8 +1,8 @@
 const PROGRAMS = ['sha2', 'ecdsa', 'keccak'];
 const PROGRAM_FILES = {
-    sha2:   { prover: 'sha2_prover.bin',   verifier: 'sha2_verifier.bin',   elf: 'sha2.elf'   },
-    ecdsa:  { prover: 'ecdsa_prover.bin',  verifier: 'ecdsa_verifier.bin',  elf: 'ecdsa.elf'  },
-    keccak: { prover: 'keccak_prover.bin', verifier: 'keccak_verifier.bin', elf: 'keccak.elf' },
+    sha2:   { prover: 'data/sha2_prover.bin',   verifier: 'data/sha2_verifier.bin',   elf: 'data/sha2.elf'   },
+    ecdsa:  { prover: 'data/ecdsa_prover.bin',  verifier: 'data/ecdsa_verifier.bin',  elf: 'data/ecdsa.elf'  },
+    keccak: { prover: 'data/keccak_prover.bin', verifier: 'data/keccak_verifier.bin', elf: 'data/keccak.elf' },
 };
 
 const ECDSA_TEST_VECTOR = {
