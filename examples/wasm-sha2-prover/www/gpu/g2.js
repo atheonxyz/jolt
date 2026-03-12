@@ -156,7 +156,7 @@ export function gpuG2UploadTable(tableLimbs) {
     console.log(`[gpu-g2] Table uploaded to GPU (${tableLimbs.byteLength} bytes, persistent)`);
 }
 
-export function gpuG2UploadSrs(affineLimbs) {
+function gpuG2UploadSrs(affineLimbs) {
     if (!_g2Initialized) throw new Error('GPU G2 not initialized');
     if (g2SrsBuffer) {
         g2SrsBuffer.destroy();
@@ -171,7 +171,7 @@ export function gpuG2UploadSrs(affineLimbs) {
     console.log(`[gpu-g2] SRS G2 uploaded in affine (${g2SrsCount} points, ${affineLimbs.byteLength} bytes)`);
 }
 
-export async function gpuG2SrsFold(addendsJacobianLimbs, scalarLimbs, numPoints) {
+async function gpuG2SrsFold(addendsJacobianLimbs, scalarLimbs, numPoints) {
     if (!_g2Initialized) throw new Error('GPU G2 not initialized');
     if (!g2SrsBuffer) throw new Error('No SRS buffer. Call gpuG2UploadSrs() first');
     if (numPoints === 0) return new Uint32Array(0);
@@ -286,7 +286,7 @@ export async function gpuG2ScalarMulCached(scalarLimbs, numScalars) {
     return resultData;
 }
 
-export async function gpuG2VarBaseScalarMul(pointsLimbs, addendsLimbs, scalarLimbs, numPoints) {
+async function gpuG2VarBaseScalarMul(pointsLimbs, addendsLimbs, scalarLimbs, numPoints) {
     if (!_g2Initialized) throw new Error('GPU G2 not initialized. Call initGpuG2() first.');
     if (numPoints === 0) return new Uint32Array(0);
 

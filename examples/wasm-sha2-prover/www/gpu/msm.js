@@ -99,7 +99,6 @@ function glvDecomposeScalars(scalarsFlat, numPoints, scalarBitWidth, batchSize) 
     return { scalars: out, glvBitWidth };
 }
 
-// ── Cost-model window size selection ──────────────────────────────────────────
 function optimalWindowSize(inputSize, scalarBits) {
     if (inputSize > 16_777_216) return 16;
     if (inputSize >= 262_144)  return 15;
@@ -117,7 +116,6 @@ function optimalWindowSize(inputSize, scalarBits) {
 }
 
 let _smvpWgSize = 64;
-// ── Shader loading ───────────────────────────────────────────────────────────
 let _shaderCache = null;
 async function loadShaders() {
     if (_shaderCache) return _shaderCache;
@@ -135,7 +133,6 @@ async function loadShaders() {
     return _shaderCache;
 }
 
-// ── GPU MSM Pipeline ─────────────────────────────────────────────────────────
 let _msmPipeline = null;
 
 async function initMSMPipeline(device) {
@@ -167,7 +164,6 @@ async function initMSMPipeline(device) {
     const glvModule = modules[4].module;
     console.log('[gpu-msm] All MSM shaders compiled successfully');
 
-    // ── CSC Setup bind group layout (decompose, prefix_sum, scatter share one layout)
     const cscBGL = device.createBindGroupLayout({
         entries: [
             { binding: 0, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'read-only-storage' } }, // scalars
@@ -180,7 +176,6 @@ async function initMSMPipeline(device) {
     });
     const cscPipelineLayout = device.createPipelineLayout({ bindGroupLayouts: [cscBGL] });
 
-    // ── SMVP bind group layout
     const smvpBGL = device.createBindGroupLayout({
         entries: [
             { binding: 0, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'read-only-storage' } }, // col_ptr
@@ -191,7 +186,6 @@ async function initMSMPipeline(device) {
         ],
     });
 
-    // ── PBPR bind group layout
     const pbprBGL = device.createBindGroupLayout({
         entries: [
             { binding: 0, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'storage' } },
@@ -200,7 +194,6 @@ async function initMSMPipeline(device) {
         ],
     });
 
-    // ── Horner bind group layout
     const hornerBGL = device.createBindGroupLayout({
         entries: [
             { binding: 0, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'read-only-storage' } },
@@ -218,7 +211,6 @@ async function initMSMPipeline(device) {
         ],
     });
 
-    // ── Create all compute pipelines asynchronously for better init performance
     const smvpPipelineLayout = device.createPipelineLayout({ bindGroupLayouts: [smvpBGL] });
     const hornerPipelineLayout = device.createPipelineLayout({ bindGroupLayouts: [hornerBGL] });
     const pbprPipelineLayout = device.createPipelineLayout({ bindGroupLayouts: [pbprBGL] });
@@ -416,16 +408,6 @@ async function gpuBatchMSMWithGLV(pointsFlat, scalarsFlat, numPoints, scalarBitW
 }
 
 
-// ── Main entry point: batch MSM ──────────────────────────────────────────────
-//
-// pointsFlat: Uint32Array — PT_STRIDE (16) u32s per point (x:8, y:8 in Montgomery form)
-// scalarsFlat: Uint32Array — NUM_LIMBS (8) u32s per scalar (Montgomery form)
-//   Layout: [msm0_scalar0, msm0_scalar1, ..., msm0_scalarN, msm1_scalar0, ...]
-// numPoints: number of points per MSM (all MSMs share same bases)
-// scalarBitWidth: bit width of scalars (e.g., 8 for u8, 256 for Fr)
-// batchSize: number of independent MSMs
-//
-// Returns: Uint32Array — 24 u32s per result (Jacobian x:8, y:8, z:8)
 async function gpuBatchMSM(pointsFlat, scalarsFlat, numPoints, scalarBitWidth, batchSize) {
     const device = _msmPipeline.device;
     const p = _msmPipeline;
@@ -441,7 +423,6 @@ async function gpuBatchMSM(pointsFlat, scalarsFlat, numPoints, scalarBitWidth, b
     const bWgSize = Math.max(Math.min(Math.floor(halfColumns / 128), 64), 32);
     const { bpr1Pipeline, bpr2Pipeline } = await getPBPRPipelines(p, bWgSize);
 
-    // ── Point buffer: cache across calls (same bases reused for all polynomials)
     let pointsBuf;
     if (p._pointsCache && p._pointsCache.numPoints === numPoints && p._pointsCache.byteLength === pointsFlat.byteLength) {
         pointsBuf = p._pointsCache.buf;
@@ -455,9 +436,8 @@ async function gpuBatchMSM(pointsFlat, scalarsFlat, numPoints, scalarBitWidth, b
         p._pointsCache = { buf: pointsBuf, numPoints, byteLength: pointsFlat.byteLength };
     }
 
-    // ── Buffer cache: reuse all intermediate buffers + bind groups when dimensions match
-    // Only scalars change between calls; all buffer sizes depend on (numPoints, batchSize, scalarBitWidth).
-    // Atomic buffers (colPtr, scatterCnt) are cleared via encoder.clearBuffer() each call.
+    // Reuse intermediate buffers + bind groups when dimensions match.
+    // Only scalars change between calls; atomics are cleared via encoder.clearBuffer().
     const cacheKey = `${numPoints}-${batchSize}-${scalarBitWidth}`;
     let c = p._bufferCache;
 
@@ -599,7 +579,6 @@ async function gpuBatchMSM(pointsFlat, scalarsFlat, numPoints, scalarBitWidth, b
 
     const t1 = performance.now();
 
-    // ── Command encoder: clear atomics → CSC → SMVP → PBPR → Horner → readback
     const encoder = device.createCommandEncoder();
 
     // Zero-fill atomic buffers (histogram and scatter counters must start at 0)
@@ -694,10 +673,7 @@ async function gpuBatchMSM(pointsFlat, scalarsFlat, numPoints, scalarBitWidth, b
 
     return resultData; // 24 u32s per MSM result (Jacobian x:8, y:8, z:8)
 }
-// ── Hybrid CPU+GPU batch MSM ─────────────────────────────────────────────
-// Splits batch into GPU and CPU portions, running them in parallel.
-// cpuMsmFn: (pointsFlat, scalarsFlat, numPoints, batchSize) => Uint32Array (Jacobian)
-// gpuFn: the GPU MSM function to use (gpuBatchMSM)
+
 async function gpuBatchMSMHybrid(pointsFlat, scalarsFlat, numPoints, scalarBitWidth, batchSize, cpuMsmFn, gpuFn) {
     if (!cpuMsmFn) {
         // No CPU function available — fall back to pure GPU

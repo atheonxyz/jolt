@@ -10,7 +10,6 @@
 
 use ark_bn254::{Fq, Fq12, Fq2, Fq6, G1Affine, G2Affine};
 use ark_ec::CurveGroup;
-use ark_ff::biginteger::{BigInt, BigInteger};
 use ark_ff::{Field, Zero};
 
 #[cfg(target_arch = "wasm32")]
@@ -22,58 +21,14 @@ use ark_ec::pairing::{MillerLoopOutput, Pairing};
 use super::wrappers::ArkGT;
 use super::wrappers::{ArkG1, ArkG2};
 
-const NUM_LIMBS: usize = 8;
-const LOG_LIMB_SIZE: u32 = 32;
+use super::webgpu_utils::{fq_to_limbs, limbs8_to_fq, FQ_LIMBS};
 #[cfg(target_arch = "wasm32")]
-const FP12_WORDS: usize = 12 * NUM_LIMBS; // 96
+use super::webgpu_utils::fr_to_raw_limbs;
+
 #[cfg(target_arch = "wasm32")]
-const G1_JACOBIAN_WORDS: usize = 24;
-
-fn bigint4_to_limbs(val: &BigInt<4>) -> [u32; NUM_LIMBS] {
-    let mut result = [0u32; NUM_LIMBS];
-    let bytes = val.to_bytes_le();
-    let mut v = 0u64;
-    let mut bits = 0u32;
-    let mut idx = 0;
-    for &byte in bytes.iter() {
-        if idx >= NUM_LIMBS {
-            break;
-        }
-        v |= (byte as u64) << bits;
-        bits += 8;
-        while bits >= LOG_LIMB_SIZE && idx < NUM_LIMBS {
-            result[idx] = v as u32;
-            v >>= LOG_LIMB_SIZE;
-            bits -= LOG_LIMB_SIZE;
-            idx += 1;
-        }
-    }
-    if bits > 0 && idx < NUM_LIMBS {
-        result[idx] = v as u32;
-    }
-    result
-}
-
-fn bigint4_from_limbs(limbs: &[u32]) -> BigInt<4> {
-    let mut result = [0u64; 4];
-    let mut accumulated_bits = 0usize;
-    let mut current_u64 = 0u64;
-    let mut result_idx = 0;
-    for &limb in limbs {
-        current_u64 |= (limb as u64) << accumulated_bits;
-        accumulated_bits += 32;
-        while accumulated_bits >= 64 && result_idx < 4 {
-            result[result_idx] = current_u64;
-            current_u64 = (limb as u64) >> (32 - (accumulated_bits - 64));
-            accumulated_bits -= 64;
-            result_idx += 1;
-        }
-    }
-    if accumulated_bits > 0 && result_idx < 4 {
-        result[result_idx] = current_u64;
-    }
-    BigInt::<4>::new(result)
-}
+const FP12_WORDS: usize = 12 * FQ_LIMBS;
+#[cfg(target_arch = "wasm32")]
+const G1_JACOBIAN_WORDS: usize = 3 * FQ_LIMBS;
 
 fn batch_projective_to_affine_g1(points: &[ArkG1]) -> Vec<G1Affine> {
     let n = points.len();
@@ -129,38 +84,38 @@ fn batch_projective_to_affine_g1(points: &[ArkG1]) -> Vec<G1Affine> {
 
 pub fn serialize_g1_points(points: &[ArkG1]) -> Vec<u32> {
     let affine_points = batch_projective_to_affine_g1(points);
-    let mut out = Vec::with_capacity(points.len() * 2 * NUM_LIMBS);
+    let mut out = Vec::with_capacity(points.len() * 2 * FQ_LIMBS);
     for affine in &affine_points {
-        out.extend_from_slice(&bigint4_to_limbs(&affine.x.0));
-        out.extend_from_slice(&bigint4_to_limbs(&affine.y.0));
+        out.extend_from_slice(&fq_to_limbs(&affine.x));
+        out.extend_from_slice(&fq_to_limbs(&affine.y));
     }
     out
 }
 
 pub fn serialize_g2_points(points: &[ArkG2]) -> Vec<u32> {
-    let mut out = Vec::with_capacity(points.len() * 4 * NUM_LIMBS);
+    let mut out = Vec::with_capacity(points.len() * 4 * FQ_LIMBS);
     for point in points {
         let affine: G2Affine = point.0.into_affine();
-        out.extend_from_slice(&bigint4_to_limbs(&affine.x.c0.0));
-        out.extend_from_slice(&bigint4_to_limbs(&affine.x.c1.0));
-        out.extend_from_slice(&bigint4_to_limbs(&affine.y.c0.0));
-        out.extend_from_slice(&bigint4_to_limbs(&affine.y.c1.0));
+        out.extend_from_slice(&fq_to_limbs(&affine.x.c0));
+        out.extend_from_slice(&fq_to_limbs(&affine.x.c1));
+        out.extend_from_slice(&fq_to_limbs(&affine.y.c0));
+        out.extend_from_slice(&fq_to_limbs(&affine.y.c1));
     }
     out
 }
 
 pub fn deserialize_fq12(words: &[u32]) -> Fq12 {
-    let w: Vec<BigInt<4>> = words.chunks(NUM_LIMBS).map(bigint4_from_limbs).collect();
+    let w: Vec<Fq> = words.chunks(FQ_LIMBS).map(limbs8_to_fq).collect();
     Fq12::new(
         Fq6::new(
-            Fq2::new(Fq::new_unchecked(w[0]), Fq::new_unchecked(w[1])),
-            Fq2::new(Fq::new_unchecked(w[2]), Fq::new_unchecked(w[3])),
-            Fq2::new(Fq::new_unchecked(w[4]), Fq::new_unchecked(w[5])),
+            Fq2::new(w[0], w[1]),
+            Fq2::new(w[2], w[3]),
+            Fq2::new(w[4], w[5]),
         ),
         Fq6::new(
-            Fq2::new(Fq::new_unchecked(w[6]), Fq::new_unchecked(w[7])),
-            Fq2::new(Fq::new_unchecked(w[8]), Fq::new_unchecked(w[9])),
-            Fq2::new(Fq::new_unchecked(w[10]), Fq::new_unchecked(w[11])),
+            Fq2::new(w[6], w[7]),
+            Fq2::new(w[8], w[9]),
+            Fq2::new(w[10], w[11]),
         ),
     )
 }
@@ -229,9 +184,6 @@ pub struct GpuCombineHintsHandle {
 }
 
 #[cfg(target_arch = "wasm32")]
-use super::webgpu_utils::{fq_to_limbs, fr_to_raw_limbs, limbs8_to_fq};
-
-#[cfg(target_arch = "wasm32")]
 pub fn dispatch_gpu_combine_hints(
     hints: &[Vec<ArkG1>],
     coeffs: &[ark_bn254::Fr],
@@ -252,13 +204,13 @@ pub fn dispatch_gpu_combine_hints(
             let x = fq_to_limbs(&p.0.x);
             let y = fq_to_limbs(&p.0.y);
             let z = fq_to_limbs(&p.0.z);
-            points_flat[base..base + NUM_LIMBS].copy_from_slice(&x);
-            points_flat[base + NUM_LIMBS..base + 2 * NUM_LIMBS].copy_from_slice(&y);
-            points_flat[base + 2 * NUM_LIMBS..base + 3 * NUM_LIMBS].copy_from_slice(&z);
+            points_flat[base..base + FQ_LIMBS].copy_from_slice(&x);
+            points_flat[base + FQ_LIMBS..base + 2 * FQ_LIMBS].copy_from_slice(&y);
+            points_flat[base + 2 * FQ_LIMBS..base + 3 * FQ_LIMBS].copy_from_slice(&z);
         }
     }
 
-    let mut scalars_flat = Vec::with_capacity(coeffs.len() * NUM_LIMBS);
+    let mut scalars_flat = Vec::with_capacity(coeffs.len() * FQ_LIMBS);
     for coeff in coeffs {
         scalars_flat.extend_from_slice(&fr_to_raw_limbs(coeff));
     }
@@ -295,9 +247,9 @@ pub async fn resolve_gpu_combine_hints(handle: GpuCombineHintsHandle) -> Vec<Ark
     let mut out = Vec::with_capacity(handle.num_rows);
     for j in 0..handle.num_rows {
         let base = j * G1_JACOBIAN_WORDS;
-        let x = limbs8_to_fq(&result_words[base..base + NUM_LIMBS]);
-        let y = limbs8_to_fq(&result_words[base + NUM_LIMBS..base + 2 * NUM_LIMBS]);
-        let z = limbs8_to_fq(&result_words[base + 2 * NUM_LIMBS..base + 3 * NUM_LIMBS]);
+        let x = limbs8_to_fq(&result_words[base..base + FQ_LIMBS]);
+        let y = limbs8_to_fq(&result_words[base + FQ_LIMBS..base + 2 * FQ_LIMBS]);
+        let z = limbs8_to_fq(&result_words[base + 2 * FQ_LIMBS..base + 3 * FQ_LIMBS]);
         out.push(ArkG1(G1Projective::new_unchecked(x, y, z)));
     }
     out
@@ -382,8 +334,8 @@ pub fn dispatch_gpu_multi_group_pairing(
         .map(|((_, g2), &gc)| serialize_g2_points(&g2[..gc]))
         .collect();
 
-    let mut g1_flat = Vec::with_capacity(total_gpu_pairs * 2 * NUM_LIMBS);
-    let mut g2_flat = Vec::with_capacity(total_gpu_pairs * 4 * NUM_LIMBS);
+    let mut g1_flat = Vec::with_capacity(total_gpu_pairs * 2 * FQ_LIMBS);
+    let mut g2_flat = Vec::with_capacity(total_gpu_pairs * 4 * FQ_LIMBS);
     for g in 0..num_groups {
         g1_flat.extend_from_slice(&per_group_g1[g]);
         g2_flat.extend_from_slice(&per_group_g2[g]);
@@ -515,9 +467,9 @@ pub fn dispatch_gpu_batch_pairing(
         .map(|(group, &gc)| serialize_g1_points(&group[..gc]))
         .collect();
 
-    let mut g1_flat = Vec::with_capacity(total_gpu_pairs * 2 * NUM_LIMBS);
-    let mut g2_flat = Vec::with_capacity(total_gpu_pairs * 4 * NUM_LIMBS);
-    let g2_words_per_point = 4 * NUM_LIMBS;
+    let mut g1_flat = Vec::with_capacity(total_gpu_pairs * 2 * FQ_LIMBS);
+    let mut g2_flat = Vec::with_capacity(total_gpu_pairs * 4 * FQ_LIMBS);
+    let g2_words_per_point = 4 * FQ_LIMBS;
     for (g, &gc) in gpu_counts.iter().enumerate() {
         g1_flat.extend_from_slice(&per_group_g1[g]);
         let g2_words = gc * g2_words_per_point;
@@ -631,7 +583,7 @@ pub fn dispatch_gpu_batch_pairing_from_buffer(
             &g2_owned
         }
     };
-    let g2_words_per_point = 4 * NUM_LIMBS;
+    let g2_words_per_point = 4 * FQ_LIMBS;
     let mut g2_flat = Vec::with_capacity(total_gpu_pairs * g2_words_per_point);
     for &gc in gpu_counts.iter() {
         let g2_words = gc * g2_words_per_point;

@@ -149,7 +149,6 @@ export async function gpuBatchMultiPairing(g1Flat, g2Flat, groupSizes, groupOffs
     millerPass.dispatchWorkgroups(divCeil(totalPairs, MILLER_WORKGROUP_SIZE));
     millerPass.end();
 
-    // --- Pass 3: Tree reduction per group ---
     for (let g = 0; g < groupSizes.length; g++) {
         let count = groupSizes[g];
         const elementOffset = groupOffsets[g];
@@ -176,7 +175,6 @@ export async function gpuBatchMultiPairing(g1Flat, g2Flat, groupSizes, groupOffs
         }
     }
 
-    // --- Readback each group's Fp12 result ---
     const numGroups = groupSizes.length;
     const readbackSize = numGroups * FP12_WORDS * 4;
     const stagingBuffer = device.createBuffer({
