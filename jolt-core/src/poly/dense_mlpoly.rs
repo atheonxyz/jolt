@@ -76,6 +76,13 @@ impl<F: JoltField> DensePolynomial<F> {
     }
 
     pub fn bind_parallel(&mut self, r: F::Challenge, order: BindingOrder) {
+        // For small polynomials, sequential bind avoids rayon scheduling overhead.
+        // The parallel variants use with_min_len(4096) / with_min_len(512*32/NUM_BYTES)
+        // so they never actually split work below these sizes anyway.
+        if self.len <= 8192 {
+            self.bind(r, order);
+            return;
+        }
         match order {
             BindingOrder::LowToHigh => self.bound_poly_var_bot_01_optimized(&r),
             BindingOrder::HighToLow => self.bound_poly_var_top_zero_optimized(&r),

@@ -133,6 +133,30 @@ impl CommittedPolynomial {
         }
     }
 
+    /// Generate the raw i128 scalar witness for dense polynomials (RdInc, RamInc).
+    /// Decouples witness generation from MSM, enabling batched GPU dispatch.
+    pub fn generate_witness_scalars(&self, row_cycles: &[Cycle]) -> Vec<i128> {
+        match self {
+            CommittedPolynomial::RdInc => row_cycles
+                .iter()
+                .map(|cycle| {
+                    let (_, pre_value, post_value) = cycle.rd_write().unwrap_or_default();
+                    post_value as i128 - pre_value as i128
+                })
+                .collect(),
+            CommittedPolynomial::RamInc => row_cycles
+                .iter()
+                .map(|cycle| match cycle.ram_access() {
+                    tracer::instruction::RAMAccess::Write(write) => {
+                        write.post_value as i128 - write.pre_value as i128
+                    }
+                    _ => 0,
+                })
+                .collect(),
+            _ => panic!("generate_witness_scalars only supports dense polynomials (RdInc, RamInc)"),
+        }
+    }
+
     #[tracing::instrument(skip_all, name = "CommittedPolynomial::generate_witness")]
     pub fn generate_witness<F>(
         &self,

@@ -386,6 +386,19 @@ impl<F: JoltField> UniPoly<F> {
     }
 }
 
+impl<F: JoltField> UniPoly<F> {
+    /// Fused multiply-accumulate: `self += rhs * scalar` without allocating an intermediate.
+    #[inline]
+    pub fn mul_add_assign(&mut self, rhs: &Self, scalar: F) {
+        if self.coeffs.len() < rhs.coeffs.len() {
+            self.coeffs.resize(rhs.coeffs.len(), F::zero());
+        }
+        for (lhs, rhs_coeff) in self.coeffs.iter_mut().zip(&rhs.coeffs) {
+            *lhs += *rhs_coeff * scalar;
+        }
+    }
+}
+
 impl<F: JoltField> AddAssign<&Self> for UniPoly<F> {
     fn add_assign(&mut self, rhs: &Self) {
         let ordering = self.coeffs.len().cmp(&rhs.coeffs.len());
