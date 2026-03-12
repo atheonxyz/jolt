@@ -746,31 +746,10 @@ async function gpuBatchMSMHybrid(pointsFlat, scalarsFlat, numPoints, scalarBitWi
     return merged;
 }
 
-// ── Public API ───────────────────────────────────────────────────────────────
 export async function initGPUMSM(device) {
     return initMSMPipeline(device);
 }
 
-export async function executeGPUBatchMSM(pointsFlat, scalarsFlat, numPoints, scalarBitWidth, batchSize) {
-    return gpuBatchMSM(pointsFlat, scalarsFlat, numPoints, scalarBitWidth, batchSize);
-}
-
 export async function executeGPUBatchMSMHybrid(pointsFlat, scalarsFlat, numPoints, scalarBitWidth, batchSize, cpuMsmFn) {
     return gpuBatchMSMHybrid(pointsFlat, scalarsFlat, numPoints, scalarBitWidth, batchSize, cpuMsmFn, gpuBatchMSMWithGLV);
-}
-
-
-// Register on globalThis for wasm-bindgen FFI
-if (typeof globalThis !== 'undefined') {
-    globalThis.__jolt_gpu_msm_init = async (device) => {
-        await initGPUMSM(device);
-    };
-
-    globalThis.__jolt_gpu_batch_msm = async (pointsFlat, scalarsFlat, numPoints, scalarBitWidth, batchSize) => {
-        if (!_msmPipeline) {
-            throw new Error('MSM pipeline not initialized. Call __jolt_gpu_msm_init first.');
-        }
-        return executeGPUBatchMSM(pointsFlat, scalarsFlat, numPoints, scalarBitWidth, batchSize);
-    };
-
 }
