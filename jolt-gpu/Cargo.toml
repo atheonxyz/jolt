@@ -16,7 +16,7 @@ pollster = "0.4"
 bytemuck.workspace = true
 tracing.workspace = true
 thiserror.workspace = true
-ark-bn254.workspace = true
+ark-bn254 = { workspace = true, features = ["curve"] }
 ark-ec.workspace = true
 ark-ff.workspace = true
 ark-std.workspace = true

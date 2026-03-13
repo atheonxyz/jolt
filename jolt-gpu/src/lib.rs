@@ -11,6 +11,12 @@ pub mod shaders;
 pub use backend::{GpuBackend, WgpuBackend};
 pub use context::WgpuContext;
 pub use error::GpuError;
+pub use pairing::{gpu_batch_multi_pairing, hybrid_batch_multi_pairing};
+pub use pipeline::ShaderRegistry;
+pub use serialize::{
+    deserialize_fq12, fq_to_limbs, limbs8_to_fq, serialize_g1_affine, serialize_g2_affine,
+    FP12_WORDS, FQ_LIMBS, G1_WORDS, G2_WORDS,
+};
 
 use std::sync::{Arc, OnceLock};
 
