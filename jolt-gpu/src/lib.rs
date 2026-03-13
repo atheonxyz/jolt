@@ -19,6 +19,8 @@ pub use serialize::{
 };
 
 use ark_bn254::{Fq12, G1Affine, G2Affine};
+
+#[cfg(not(target_arch = "wasm32"))]
 use std::sync::OnceLock;
 
 pub struct GpuPairingEngine {
@@ -27,8 +29,15 @@ pub struct GpuPairingEngine {
 }
 
 impl GpuPairingEngine {
+    #[cfg(not(target_arch = "wasm32"))]
     pub fn new() -> Result<Self, GpuError> {
         let ctx = WgpuContext::new()?;
+        let registry = ShaderRegistry::new(&ctx)?;
+        Ok(Self { ctx, registry })
+    }
+
+    pub async fn new_async() -> Result<Self, GpuError> {
+        let ctx = WgpuContext::new_async().await?;
         let registry = ShaderRegistry::new(&ctx)?;
         Ok(Self { ctx, registry })
     }
@@ -49,8 +58,10 @@ impl GpuPairingEngine {
     }
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 static GPU_ENGINE: OnceLock<Option<GpuPairingEngine>> = OnceLock::new();
 
+#[cfg(not(target_arch = "wasm32"))]
 pub fn get_or_init_engine() -> Option<&'static GpuPairingEngine> {
     GPU_ENGINE
         .get_or_init(|| match GpuPairingEngine::new() {
@@ -66,6 +77,7 @@ pub fn get_or_init_engine() -> Option<&'static GpuPairingEngine> {
         .as_ref()
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 pub fn is_gpu_available() -> bool {
     get_or_init_engine().is_some()
 }

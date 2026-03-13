@@ -92,6 +92,49 @@ pub fn read_buffer_sync(
     data
 }
 
+pub async fn read_buffer_async(
+    device: &wgpu::Device,
+    queue: &wgpu::Queue,
+    buffer: &wgpu::Buffer,
+    size: u64,
+) -> Result<Vec<u8>, crate::error::GpuError> {
+    let staging_buffer = device.create_buffer(&wgpu::BufferDescriptor {
+        label: Some("jolt-gpu-readback-staging-async"),
+        size,
+        usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
+        mapped_at_creation: false,
+    });
+
+    let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+        label: Some("jolt-gpu-readback-encoder-async"),
+    });
+    encoder.copy_buffer_to_buffer(buffer, 0, &staging_buffer, 0, size);
+    queue.submit(Some(encoder.finish()));
+
+    let (tx, rx) = std::sync::mpsc::channel();
+    staging_buffer
+        .slice(..)
+        .map_async(wgpu::MapMode::Read, move |result| {
+            let _ = tx.send(result);
+        });
+
+    device.poll(wgpu::Maintain::Wait);
+
+    match rx.recv() {
+        Ok(Ok(())) => {}
+        Ok(Err(err)) => {
+            return Err(crate::error::GpuError::BufferError(err.to_string()));
+        }
+        Err(err) => {
+            return Err(crate::error::GpuError::BufferError(err.to_string()));
+        }
+    }
+
+    let data = staging_buffer.slice(..).get_mapped_range().to_vec();
+    staging_buffer.unmap();
+    Ok(data)
+}
+
 pub fn write_buffer(queue: &wgpu::Queue, buffer: &wgpu::Buffer, data: &[u8]) {
     queue.write_buffer(buffer, 0, data);
 }

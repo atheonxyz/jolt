@@ -7,10 +7,12 @@ repository = "https://github.com/a16z/jolt"
 license-file = "LICENSE"
 
 [features]
-default = []
+default = ["native"]
+native = ["wgpu/metal", "wgpu/wgc"]
+wasm = ["wgpu/webgpu", "dep:wasm-bindgen-futures"]
 
 [dependencies]
-wgpu = { version = "24", default-features = false, features = ["wgsl", "metal", "wgc"] }
+wgpu = { version = "24", default-features = false, features = ["wgsl"] }
 naga = { version = "24", features = ["wgsl-in"] }
 pollster = "0.4"
 bytemuck.workspace = true
@@ -21,6 +23,7 @@ ark-ec.workspace = true
 ark-ff.workspace = true
 ark-std.workspace = true
 rayon.workspace = true
+wasm-bindgen-futures = { version = "0.4", optional = true }
 
 [dev-dependencies]
 ark-std = { workspace = true, features = ["std"] }

@@ -1,6 +1,6 @@
 use crate::error::GpuError;
 
-#[allow(dead_code)] // fields used incrementally as Wave 2-3 dispatch code lands
+#[allow(dead_code)]
 pub struct WgpuContext {
     pub(crate) device: wgpu::Device,
     pub(crate) queue: wgpu::Queue,
@@ -9,15 +9,19 @@ pub struct WgpuContext {
 }
 
 impl WgpuContext {
+    /// Blocking init for native platforms. Uses pollster to block on the async init.
+    #[cfg(not(target_arch = "wasm32"))]
     pub fn new() -> Result<Self, GpuError> {
         pollster::block_on(Self::init_internal())
     }
 
+    /// Async init for WASM and any context where blocking is undesirable.
+    pub async fn new_async() -> Result<Self, GpuError> {
+        Self::init_internal().await
+    }
+
     async fn init_internal() -> Result<Self, GpuError> {
-        let instance = wgpu::Instance::new(&wgpu::InstanceDescriptor {
-            backends: wgpu::Backends::METAL,
-            ..Default::default()
-        });
+        let instance = wgpu::Instance::new(&wgpu::InstanceDescriptor::default());
 
         let adapter = instance
             .request_adapter(&wgpu::RequestAdapterOptions {

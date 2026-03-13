@@ -3143,6 +3143,7 @@ dependencies = [
  "rayon",
  "thiserror 2.0.18",
  "tracing",
+ "wasm-bindgen-futures",
  "wgpu",
 ]
 
@@ -6662,6 +6663,7 @@ dependencies = [
  "document-features",
  "js-sys",
  "log",
+ "naga",
  "parking_lot",
  "profiling",
  "raw-window-handle",
