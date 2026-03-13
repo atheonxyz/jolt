@@ -371,15 +371,26 @@ impl<F: JoltField, const ORDER: usize> PrefixSuffixDecomposition<F, ORDER> {
     }
 
     pub fn bind(&mut self, r: F::Challenge) {
-        self.P.par_iter().for_each(|p| {
-            if let Some(p) = p {
-                let mut p = p.write().unwrap();
-                p.bind_parallel(r, BindingOrder::HighToLow);
+        let q_len = self.Q.first().map(|q| q.len()).unwrap_or(0);
+        if q_len <= 4096 {
+            // Small polys: avoid rayon overhead from par_iter + RwLock contention
+            for p in self.P.iter().flatten() {
+                p.write().unwrap().bind(r, BindingOrder::HighToLow);
             }
-        });
-        self.Q.par_iter_mut().for_each(|poly| {
-            poly.bind_parallel(r, BindingOrder::HighToLow);
-        });
+            for poly in self.Q.iter_mut() {
+                poly.bind(r, BindingOrder::HighToLow);
+            }
+        } else {
+            self.P.par_iter().for_each(|p| {
+                if let Some(p) = p {
+                    let mut p = p.write().unwrap();
+                    p.bind_parallel(r, BindingOrder::HighToLow);
+                }
+            });
+            self.Q.par_iter_mut().for_each(|poly| {
+                poly.bind_parallel(r, BindingOrder::HighToLow);
+            });
+        }
         self.next_round();
     }
 

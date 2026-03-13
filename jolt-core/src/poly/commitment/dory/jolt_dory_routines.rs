@@ -10,11 +10,18 @@ use rayon::prelude::*;
 /// left[i] = left[i] * scalar + right[i]
 fn fold_field_vectors(left: &mut [ArkFr], right: &[ArkFr], scalar: &ArkFr) {
     assert_eq!(left.len(), right.len(), "Lengths must match");
-    left.par_iter_mut()
-        .zip(right.par_iter())
-        .for_each(|(l, r)| {
+    // Below 4096 elements, rayon scheduling overhead exceeds the parallelism benefit.
+    if left.len() <= 4096 {
+        left.iter_mut().zip(right.iter()).for_each(|(l, r)| {
             *l = *l * *scalar + *r;
         });
+    } else {
+        left.par_iter_mut()
+            .zip(right.par_iter())
+            .for_each(|(l, r)| {
+                *l = *l * *scalar + *r;
+            });
+    }
 }
 
 pub struct JoltG1Routines;
@@ -105,8 +112,11 @@ pub struct JoltG2Routines;
 
 impl DoryRoutines<ArkG2> for JoltG2Routines {
     fn msm(bases: &[ArkG2], scalars: &[ArkFr]) -> ArkG2 {
-        let projective_points: Vec<G2Projective> = bases.iter().map(|w| w.0).collect();
-        let affines = G2Projective::normalize_batch(&projective_points);
+        // SAFETY: ArkG2 has same memory layout as G2Projective
+        let projective_points: &[G2Projective] = unsafe {
+            std::slice::from_raw_parts(bases.as_ptr() as *const G2Projective, bases.len())
+        };
+        let affines = G2Projective::normalize_batch(projective_points);
 
         // SAFETY: ArkFr has same memory layout as Fr
         let raw_scalars: &[Fr] =

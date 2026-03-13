@@ -86,6 +86,8 @@ members = [
     "examples/advice-demo/guest",
     "examples/sig-recovery/host",
     "examples/sig-recovery/guest",
+    "examples/wasm-sha2-prover",
+    "jolt-gpu",
     "zklean-extractor",
     "z3-verifier",
 ]
@@ -227,6 +229,11 @@ syn = { version = "2", features = ["full"] }
 quote = "1.0"
 proc-macro2 = "1.0.79"
 
+# GPU Compute
+wgpu = { version = "28", default-features = false, features = ["wgsl"] }
+naga = { version = "28", features = ["wgsl-in"] }
+pollster = "0.4"
+
 # Platform-specific
 fnv = { version = "1.0.7", default-features = false }
 object = { version = "0.38.1", features = [
@@ -237,6 +244,12 @@ addr2line = "0.26.0"
 getrandom = { version = "0.2.16", default-features = false }
 getrandom_v02 = { version = "0.2.16", package = "getrandom", default-features = false }
 getrandom_v03 = { version = "0.3.3", package = "getrandom", default-features = false }
+wasm-bindgen = "0.2.100"
+wasm-bindgen-futures = "0.4.50"
+wasm-bindgen-rayon = "1.2.1"
+js-sys = "0.3.77"
+web-sys = "0.3.77"
+console_error_panic_hook = "0.1.7"
 
 # Build and Development
 ctor = { version = "0.6" }
@@ -279,5 +292,6 @@ jolt-inlines-keccak256 = { path = "./jolt-inlines/keccak256", default-features =
 jolt-inlines-blake2 = { path = "./jolt-inlines/blake2", default-features = false }
 jolt-inlines-blake3 = { path = "./jolt-inlines/blake3", default-features = false }
 jolt-inlines-bigint = { path = "./jolt-inlines/bigint", default-features = false }
+jolt-gpu = { path = "./jolt-gpu", default-features = false }
 jolt-inlines-secp256k1 = { path = "./jolt-inlines/secp256k1", default-features = false }
 jolt-inlines-grumpkin = { path = "./jolt-inlines/grumpkin", default-features = false }
