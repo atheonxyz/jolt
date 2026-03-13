@@ -86,6 +86,7 @@ members = [
     "examples/advice-demo/guest",
     "examples/sig-recovery/host",
     "examples/sig-recovery/guest",
+    "jolt-gpu",
     "zklean-extractor",
     "z3-verifier",
 ]
@@ -281,3 +282,4 @@ jolt-inlines-blake3 = { path = "./jolt-inlines/blake3", default-features = false
 jolt-inlines-bigint = { path = "./jolt-inlines/bigint", default-features = false }
 jolt-inlines-secp256k1 = { path = "./jolt-inlines/secp256k1", default-features = false }
 jolt-inlines-grumpkin = { path = "./jolt-inlines/grumpkin", default-features = false }
+jolt-gpu = { path = "./jolt-gpu", default-features = false }
