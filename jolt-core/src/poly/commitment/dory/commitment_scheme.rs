@@ -2,7 +2,10 @@
 
 use super::dory_globals::{DoryGlobals, DoryLayout};
 use super::jolt_dory_routines::{JoltG1Routines, JoltG2Routines};
-#[cfg(all(feature = "webgpu-pairing", target_arch = "wasm32"))]
+#[cfg(any(
+    feature = "gpu",
+    all(feature = "webgpu-pairing", target_arch = "wasm32")
+))]
 use super::wrappers::ArkG2;
 use super::wrappers::{
     ark_to_jolt, jolt_to_ark, ArkDoryProof, ArkFr, ArkG1, ArkGT, ArkworksProverSetup,
@@ -19,7 +22,10 @@ use crate::{
     utils::{errors::ProofVerifyError, math::Math, small_scalar::SmallScalar},
 };
 use ark_bn254::{G1Affine, G1Projective};
-#[cfg(all(feature = "webgpu-pairing", target_arch = "wasm32"))]
+#[cfg(any(
+    feature = "gpu",
+    all(feature = "webgpu-pairing", target_arch = "wasm32")
+))]
 use ark_bn254::{G2Affine, G2Projective};
 use ark_ec::CurveGroup;
 use ark_ff::Zero;
@@ -446,6 +452,344 @@ where
             .collect();
         let h1 = C::G1::from(setup.0.h1);
         Some((g1s, h1))
+    }
+}
+
+#[cfg(feature = "gpu")]
+impl DoryCommitmentScheme {
+    pub fn prove_with_native_gpu<ProofTranscript: Transcript>(
+        setup: &ArkworksProverSetup,
+        poly: &MultilinearPolynomial<ark_bn254::Fr>,
+        opening_point: &[ark_bn254::Fr],
+        hint: Option<DoryOpeningProofHint>,
+        transcript: &mut ProofTranscript,
+    ) -> (ArkDoryProof, Option<ark_bn254::Fr>) {
+        use crate::msm::VariableBaseMSM;
+        use dory::primitives::arithmetic::{DoryRoutines, Field as DoryField, Group, PairingCurve};
+        use dory::primitives::transcript::Transcript as DoryTranscript;
+        use dory::{
+            FirstReduceMessage, MultilinearLagrange, ScalarProductMessage, SecondReduceMessage,
+            VMVMessage,
+        };
+
+        #[inline]
+        fn g1_msm_affine(affine_bases: &[G1Affine], scalars: &[ArkFr]) -> ArkG1 {
+            let raw_scalars: &[ark_bn254::Fr] = unsafe {
+                std::slice::from_raw_parts(scalars.as_ptr() as *const ark_bn254::Fr, scalars.len())
+            };
+            let result = <G1Projective as VariableBaseMSM>::msm_field_elements(
+                &affine_bases[..scalars.len()],
+                raw_scalars,
+            )
+            .expect("msm_field_elements should not fail");
+            ArkG1(result)
+        }
+
+        #[inline]
+        fn g2_msm_affine(affine_bases: &[G2Affine], scalars: &[ArkFr]) -> ArkG2 {
+            let raw_scalars: &[ark_bn254::Fr] = unsafe {
+                std::slice::from_raw_parts(scalars.as_ptr() as *const ark_bn254::Fr, scalars.len())
+            };
+            let result = <G2Projective as VariableBaseMSM>::msm_field_elements(
+                &affine_bases[..scalars.len()],
+                raw_scalars,
+            )
+            .expect("msm_field_elements should not fail");
+            ArkG2(result)
+        }
+
+        const GPU_PAIRING_THRESHOLD: usize = 64;
+
+        let _span = trace_span!("DoryCommitmentScheme::prove_with_native_gpu").entered();
+
+        let use_gpu_pairing = jolt_gpu::is_gpu_available();
+
+        let row_commitments = hint.map(|h| h.into_rows()).unwrap_or_else(|| {
+            let (_commitment, row_commitments) = Self::commit(poly, setup);
+            row_commitments.into_rows()
+        });
+
+        let g1_setup_proj: &[G1Projective] = unsafe {
+            std::slice::from_raw_parts(
+                setup.g1_vec.as_ptr() as *const G1Projective,
+                setup.g1_vec.len(),
+            )
+        };
+        let g1_affine_cache = G1Projective::normalize_batch(g1_setup_proj);
+
+        let g2_setup_proj: &[G2Projective] = unsafe {
+            std::slice::from_raw_parts(
+                setup.g2_vec.as_ptr() as *const G2Projective,
+                setup.g2_vec.len(),
+            )
+        };
+        let g2_affine_cache = G2Projective::normalize_batch(g2_setup_proj);
+
+        let num_cols = DoryGlobals::get_num_columns();
+        let num_rows = DoryGlobals::get_max_num_rows();
+        let sigma = num_cols.log_2();
+        let nu = num_rows.log_2();
+
+        let reordered_point = if DoryGlobals::get_layout() == DoryLayout::AddressMajor {
+            let log_T = DoryGlobals::get_T().log_2();
+            let log_K = opening_point.len().saturating_sub(log_T);
+            let (r_address, r_cycle) = opening_point.split_at(log_K);
+            [r_cycle, r_address].concat()
+        } else {
+            opening_point.to_vec()
+        };
+        let ark_point: Vec<ArkFr> = reordered_point.iter().rev().map(jolt_to_ark).collect();
+
+        let (left_vec, right_vec) = poly.compute_evaluation_vectors(&ark_point, nu, sigma);
+        let v_vec = poly.vector_matrix_product(&left_vec, nu, sigma);
+
+        let mut padded_row_commitments = row_commitments.clone();
+        if nu < sigma {
+            padded_row_commitments.resize(1 << sigma, <BN254 as PairingCurve>::G1::identity());
+        }
+
+        let g2_fin = &setup.g2_vec[0];
+
+        let t_vec_v = JoltG1Routines::msm(&padded_row_commitments, &v_vec);
+        let c = BN254::pair(&t_vec_v, g2_fin);
+
+        let d2 = BN254::pair(
+            &g1_msm_affine(&g1_affine_cache[..1 << sigma], &v_vec),
+            g2_fin,
+        );
+
+        let e1 = JoltG1Routines::msm(&row_commitments, &left_vec);
+
+        let vmv_message = VMVMessage { c, d2, e1 };
+
+        let mut dory_transcript = JoltToDoryTranscript::<ProofTranscript>::new(transcript);
+        dory_transcript.append_serde(b"vmv_c", &vmv_message.c);
+        dory_transcript.append_serde(b"vmv_d2", &vmv_message.d2);
+        dory_transcript.append_serde(b"vmv_e1", &vmv_message.e1);
+
+        let mut v1 = padded_row_commitments;
+        let mut v2: Vec<ArkG2> = v_vec
+            .iter()
+            .map(|scalar| ArkG2(g2_fin.0 * scalar.0))
+            .collect();
+        let mut v2_scalars: Option<Vec<ArkFr>> = Some(v_vec);
+        let mut padded_right_vec = right_vec;
+        let mut padded_left_vec = left_vec;
+        if nu < sigma {
+            padded_right_vec.resize(1 << sigma, ArkFr::zero());
+            padded_left_vec.resize(1 << sigma, ArkFr::zero());
+        }
+        let mut s1 = padded_right_vec;
+        let mut s2 = padded_left_vec;
+
+        let num_rounds = nu.max(sigma);
+        let mut first_messages = Vec::with_capacity(num_rounds);
+        let mut second_messages = Vec::with_capacity(num_rounds);
+
+        for round in 0..num_rounds {
+            let n = 1 << (num_rounds - round);
+            let n2 = n / 2;
+
+            let (v1_l, v1_r) = v1.split_at(n2);
+            let (v2_l, v2_r) = v2.split_at(n2);
+            let g1_prime = &setup.g1_vec[..n2];
+            let g2_prime = &setup.g2_vec[..n2];
+
+            let (d1_left, d1_right, d2_left, d2_right, e1_beta, e2_beta);
+
+            if use_gpu_pairing && n2 >= GPU_PAIRING_THRESHOLD && v2_scalars.is_none() {
+                let gpu_results = super::native_gpu_pairing::native_gpu_multi_group_pairing(&[
+                    (v1_l, g2_prime),
+                    (v1_r, g2_prime),
+                    (g1_prime, v2_l),
+                    (g1_prime, v2_r),
+                ]);
+
+                e1_beta = g1_msm_affine(&g1_affine_cache[..n], &s2);
+                e2_beta = g2_msm_affine(&g2_affine_cache[..n], &s1);
+
+                let mut it = gpu_results.into_iter();
+                d1_left = it.next().unwrap();
+                d1_right = it.next().unwrap();
+                d2_left = it.next().unwrap();
+                d2_right = it.next().unwrap();
+            } else if use_gpu_pairing && n2 >= GPU_PAIRING_THRESHOLD {
+                let gpu_results = super::native_gpu_pairing::native_gpu_multi_group_pairing(&[
+                    (v1_l, g2_prime),
+                    (v1_r, g2_prime),
+                ]);
+
+                let scalars = v2_scalars.as_ref().unwrap();
+                let (s_l, s_r) = scalars.split_at(n2);
+                let sum_left = g1_msm_affine(&g1_affine_cache[..n2], s_l);
+                let sum_right = g1_msm_affine(&g1_affine_cache[..n2], s_r);
+                d2_left = BN254::pair(&sum_left, g2_fin);
+                d2_right = BN254::pair(&sum_right, g2_fin);
+                e1_beta = g1_msm_affine(&g1_affine_cache[..n], &s2);
+                e2_beta = g2_msm_affine(&g2_affine_cache[..n], &s1);
+
+                let mut it = gpu_results.into_iter();
+                d1_left = it.next().unwrap();
+                d1_right = it.next().unwrap();
+            } else {
+                if let Some(scalars) = v2_scalars.as_ref() {
+                    let (s_l, s_r) = scalars.split_at(n2);
+                    let sum_left = g1_msm_affine(&g1_affine_cache[..n2], s_l);
+                    let sum_right = g1_msm_affine(&g1_affine_cache[..n2], s_r);
+                    d1_left = BN254::multi_pair_g2_setup(v1_l, g2_prime);
+                    d1_right = BN254::multi_pair_g2_setup(v1_r, g2_prime);
+                    d2_left = BN254::pair(&sum_left, g2_fin);
+                    d2_right = BN254::pair(&sum_right, g2_fin);
+                } else {
+                    d1_left = BN254::multi_pair_g2_setup(v1_l, g2_prime);
+                    d1_right = BN254::multi_pair_g2_setup(v1_r, g2_prime);
+                    d2_left = BN254::multi_pair_g1_setup(g1_prime, v2_l);
+                    d2_right = BN254::multi_pair_g1_setup(g1_prime, v2_r);
+                }
+                e1_beta = g1_msm_affine(&g1_affine_cache[..n], &s2);
+                e2_beta = g2_msm_affine(&g2_affine_cache[..n], &s1);
+            }
+
+            let first_msg = FirstReduceMessage {
+                d1_left,
+                d1_right,
+                d2_left,
+                d2_right,
+                e1_beta,
+                e2_beta,
+            };
+
+            dory_transcript.append_serde(b"d1_left", &first_msg.d1_left);
+            dory_transcript.append_serde(b"d1_right", &first_msg.d1_right);
+            dory_transcript.append_serde(b"d2_left", &first_msg.d2_left);
+            dory_transcript.append_serde(b"d2_right", &first_msg.d2_right);
+            dory_transcript.append_serde(b"e1_beta", &first_msg.e1_beta);
+            dory_transcript.append_serde(b"e2_beta", &first_msg.e2_beta);
+
+            let beta: ArkFr = dory_transcript.challenge_scalar(b"beta");
+
+            let beta_inv = beta.inv().expect("beta must be invertible");
+            JoltG1Routines::fixed_scalar_mul_bases_then_add(&setup.g1_vec[..n], &mut v1, &beta);
+            JoltG2Routines::fixed_scalar_mul_bases_then_add(&setup.g2_vec[..n], &mut v2, &beta_inv);
+            v2_scalars = None;
+
+            first_messages.push(first_msg);
+
+            let (v1_l, v1_r) = v1.split_at(n2);
+            let (v2_l, v2_r) = v2.split_at(n2);
+            let (s1_l, s1_r) = s1.split_at(n2);
+            let (s2_l, s2_r) = s2.split_at(n2);
+
+            let (c_plus, c_minus, e1_plus, e1_minus, e2_plus, e2_minus);
+
+            if use_gpu_pairing && n2 >= GPU_PAIRING_THRESHOLD {
+                let gpu_results = super::native_gpu_pairing::native_gpu_multi_group_pairing(&[
+                    (v1_l, v2_r),
+                    (v1_r, v2_l),
+                ]);
+
+                e1_plus = JoltG1Routines::msm(v1_l, s2_r);
+                e1_minus = JoltG1Routines::msm(v1_r, s2_l);
+                e2_plus = JoltG2Routines::msm(v2_r, s1_l);
+                e2_minus = JoltG2Routines::msm(v2_l, s1_r);
+
+                let mut it = gpu_results.into_iter();
+                c_plus = it.next().unwrap();
+                c_minus = it.next().unwrap();
+            } else {
+                c_plus = BN254::multi_pair(v1_l, v2_r);
+                c_minus = BN254::multi_pair(v1_r, v2_l);
+                e1_plus = JoltG1Routines::msm(v1_l, s2_r);
+                e1_minus = JoltG1Routines::msm(v1_r, s2_l);
+                e2_plus = JoltG2Routines::msm(v2_r, s1_l);
+                e2_minus = JoltG2Routines::msm(v2_l, s1_r);
+            };
+
+            let second_msg = SecondReduceMessage {
+                c_plus,
+                c_minus,
+                e1_plus,
+                e1_minus,
+                e2_plus,
+                e2_minus,
+            };
+
+            dory_transcript.append_serde(b"c_plus", &second_msg.c_plus);
+            dory_transcript.append_serde(b"c_minus", &second_msg.c_minus);
+            dory_transcript.append_serde(b"e1_plus", &second_msg.e1_plus);
+            dory_transcript.append_serde(b"e1_minus", &second_msg.e1_minus);
+            dory_transcript.append_serde(b"e2_plus", &second_msg.e2_plus);
+            dory_transcript.append_serde(b"e2_minus", &second_msg.e2_minus);
+
+            let alpha: ArkFr = dory_transcript.challenge_scalar(b"alpha");
+
+            let alpha_inv = alpha.inv().expect("alpha must be invertible");
+
+            {
+                let (v1_l, v1_r) = v1.split_at_mut(n2);
+                JoltG1Routines::fixed_scalar_mul_vs_then_add(v1_l, v1_r, &alpha);
+            }
+            v1.truncate(n2);
+
+            {
+                let (v2_l, v2_r) = v2.split_at_mut(n2);
+                JoltG2Routines::fixed_scalar_mul_vs_then_add(v2_l, v2_r, &alpha_inv);
+            }
+            v2.truncate(n2);
+
+            {
+                let (s1_l, s1_r) = s1.split_at_mut(n2);
+                JoltG1Routines::fold_field_vectors(s1_l, s1_r, &alpha);
+            }
+            s1.truncate(n2);
+
+            {
+                let (s2_l, s2_r) = s2.split_at_mut(n2);
+                JoltG1Routines::fold_field_vectors(s2_l, s2_r, &alpha_inv);
+            }
+            s2.truncate(n2);
+
+            second_messages.push(second_msg);
+        }
+
+        let gamma: ArkFr = dory_transcript.challenge_scalar(b"gamma");
+        let gamma_inv = gamma.inv().expect("gamma must be invertible");
+
+        let gamma_s1 = gamma * s1[0];
+        let e1_final = v1[0] + gamma_s1 * setup.h1;
+
+        let gamma_inv_s2 = gamma_inv * s2[0];
+        let e2_final = v2[0] + setup.h2.scale(&gamma_inv_s2);
+
+        let final_message = ScalarProductMessage {
+            e1: e1_final,
+            e2: e2_final,
+        };
+
+        dory_transcript.append_serde(b"final_e1", &final_message.e1);
+        dory_transcript.append_serde(b"final_e2", &final_message.e2);
+        let _d = dory_transcript.challenge_scalar(b"d");
+
+        let proof = ArkDoryProof {
+            vmv_message,
+            first_messages,
+            second_messages,
+            final_message,
+            nu,
+            sigma,
+            #[cfg(feature = "zk")]
+            e2: None,
+            #[cfg(feature = "zk")]
+            y_com: None,
+            #[cfg(feature = "zk")]
+            sigma1_proof: None,
+            #[cfg(feature = "zk")]
+            sigma2_proof: None,
+            #[cfg(feature = "zk")]
+            scalar_product_proof: None,
+        };
+
+        (proof, None)
     }
 }
 

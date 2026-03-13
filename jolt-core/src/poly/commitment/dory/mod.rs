@@ -6,6 +6,8 @@
 mod commitment_scheme;
 mod dory_globals;
 mod jolt_dory_routines;
+#[cfg(feature = "gpu")]
+pub mod native_gpu_pairing;
 #[cfg(feature = "webgpu-pairing")]
 pub mod webgpu_g2;
 #[cfg(feature = "webgpu-pairing")]

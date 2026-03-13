@@ -47,6 +47,7 @@ monitor = ["dep:sysinfo"]
 pprof = ["dep:pprof", "dep:prost"]
 test_incremental = []
 challenge-254-bit = []
+gpu = ["prover", "dep:jolt-gpu"]
 wasm-prover = ["prover"]
 webgpu-pairing = [
     "wasm-prover",
@@ -102,6 +103,7 @@ pprof = { version = "0.15", features = [
     "frame-pointer",
 ], optional = true }
 prost = { version = "0.14", optional = true }
+jolt-gpu = { workspace = true, optional = true }
 wasm-bindgen = { workspace = true, optional = true }
 wasm-bindgen-futures = { workspace = true, optional = true }
 js-sys = { workspace = true, optional = true }

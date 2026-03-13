@@ -2819,11 +2819,56 @@ impl<
                 )
             }
         };
-        #[cfg(not(feature = "webgpu-pairing"))]
+        #[cfg(all(feature = "gpu", not(feature = "webgpu-pairing")))]
+        let (proof, _y_blinding) = {
+            use crate::poly::commitment::dory::{
+                ArkworksProverSetup, DoryCommitmentScheme, DoryOpeningProofHint,
+            };
+
+            let _ = poly_ids;
+
+            let dory_hints: Vec<DoryOpeningProofHint> = hints;
+            let ark_coeffs: Vec<ark_bn254::Fr> = coeffs
+                .iter()
+                .map(|c| unsafe { std::mem::transmute_copy::<F, ark_bn254::Fr>(c) })
+                .collect();
+            let hint = DoryCommitmentScheme::combine_hints(dory_hints, &ark_coeffs);
+
+            let opening_point_f: Vec<F> = opening_point.r.iter().map(|c| (*c).into()).collect();
+            let ark_opening_point: &[ark_bn254::Fr] = unsafe {
+                std::slice::from_raw_parts(
+                    opening_point_f.as_ptr() as *const ark_bn254::Fr,
+                    opening_point_f.len(),
+                )
+            };
+            let ark_joint_poly: &MultilinearPolynomial<ark_bn254::Fr> = unsafe {
+                &*(&joint_poly as *const MultilinearPolynomial<F>
+                    as *const MultilinearPolynomial<ark_bn254::Fr>)
+            };
+            let setup: &ArkworksProverSetup = unsafe {
+                &*(&self.preprocessing.generators as *const PCS::ProverSetup
+                    as *const ArkworksProverSetup)
+            };
+
+            let (dory_proof, y_blind) = DoryCommitmentScheme::prove_with_native_gpu(
+                setup,
+                ark_joint_poly,
+                ark_opening_point,
+                Some(hint),
+                &mut self.transcript,
+            );
+
+            let proof = unsafe { std::ptr::read(&dory_proof as *const _ as *const PCS::Proof) };
+            std::mem::forget(dory_proof);
+            let y_blinding =
+                y_blind.map(|b| unsafe { std::mem::transmute_copy::<ark_bn254::Fr, F>(&b) });
+            (proof, y_blinding)
+        };
+        #[cfg(all(not(feature = "webgpu-pairing"), not(feature = "gpu")))]
         let _ = poly_ids;
-        #[cfg(not(feature = "webgpu-pairing"))]
+        #[cfg(all(not(feature = "webgpu-pairing"), not(feature = "gpu")))]
         let hint = PCS::combine_hints(hints, &coeffs);
-        #[cfg(not(feature = "webgpu-pairing"))]
+        #[cfg(all(not(feature = "webgpu-pairing"), not(feature = "gpu")))]
         let (proof, _y_blinding) = PCS::prove(
             &self.preprocessing.generators,
             &joint_poly,
