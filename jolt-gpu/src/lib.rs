@@ -18,27 +18,56 @@ pub use serialize::{
     FP12_WORDS, FQ_LIMBS, G1_WORDS, G2_WORDS,
 };
 
-use std::sync::{Arc, OnceLock};
+use ark_bn254::{Fq12, G1Affine, G2Affine};
+use std::sync::OnceLock;
 
-static GPU_CONTEXT: OnceLock<Option<Arc<WgpuContext>>> = OnceLock::new();
-
-pub fn is_gpu_available() -> bool {
-    get_or_init_context().is_some()
+pub struct GpuPairingEngine {
+    ctx: WgpuContext,
+    registry: ShaderRegistry,
 }
 
-pub fn get_or_init_context() -> Option<Arc<WgpuContext>> {
-    GPU_CONTEXT
-        .get_or_init(|| match WgpuContext::new() {
-            Ok(ctx) => {
-                tracing::info!("GPU available");
-                Some(Arc::new(ctx))
+impl GpuPairingEngine {
+    pub fn new() -> Result<Self, GpuError> {
+        let ctx = WgpuContext::new()?;
+        let registry = ShaderRegistry::new(&ctx)?;
+        Ok(Self { ctx, registry })
+    }
+
+    pub fn batch_multi_pairing(
+        &self,
+        groups: &[(&[G1Affine], &[G2Affine])],
+    ) -> Result<Vec<Fq12>, GpuError> {
+        gpu_batch_multi_pairing(&self.ctx, &self.registry, groups)
+    }
+
+    pub fn hybrid_multi_pairing(
+        &self,
+        groups: &[(&[G1Affine], &[G2Affine])],
+        gpu_ratio: f64,
+    ) -> Result<Vec<Fq12>, GpuError> {
+        hybrid_batch_multi_pairing(&self.ctx, &self.registry, groups, gpu_ratio)
+    }
+}
+
+static GPU_ENGINE: OnceLock<Option<GpuPairingEngine>> = OnceLock::new();
+
+pub fn get_or_init_engine() -> Option<&'static GpuPairingEngine> {
+    GPU_ENGINE
+        .get_or_init(|| match GpuPairingEngine::new() {
+            Ok(engine) => {
+                tracing::info!("GPU pairing engine initialized");
+                Some(engine)
             }
             Err(e) => {
-                tracing::warn!("GPU unavailable: {e}");
+                tracing::warn!("GPU pairing engine unavailable: {e}");
                 None
             }
         })
-        .clone()
+        .as_ref()
+}
+
+pub fn is_gpu_available() -> bool {
+    get_or_init_engine().is_some()
 }
 
 #[cfg(test)]
