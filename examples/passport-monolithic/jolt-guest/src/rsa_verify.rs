@@ -4,17 +4,11 @@
 /// multiplication steps (16 squarings + 1 final multiply). Each step is
 /// offloaded to an advice function that provides (quotient, remainder).
 /// The guest verifies each step in-trace: a*b == q*n + r AND r < n.
-///
-/// This approach is sound because:
-///   - Each modmul step is independently verified via check_advice!
-///   - The chain of 17 verified steps reconstructs the full modexp
-///   - A malicious prover cannot skip or forge any individual step
-
 use crate::bignum;
 
 const SHA256_DIGEST_INFO: [u8; 19] = [
-    0x30, 0x31, 0x30, 0x0d, 0x06, 0x09, 0x60, 0x86, 0x48, 0x01, 0x65, 0x03, 0x04, 0x02, 0x01,
-    0x05, 0x00, 0x04, 0x20,
+    0x30, 0x31, 0x30, 0x0d, 0x06, 0x09, 0x60, 0x86, 0x48, 0x01, 0x65, 0x03, 0x04, 0x02, 0x01, 0x05,
+    0x00, 0x04, 0x20,
 ];
 
 #[jolt::advice]
@@ -45,7 +39,10 @@ pub fn rsa_pkcs1v15_sha256_verify_2048(
     signature: &[u8; 256],
     msg_hash: &[u8; 32],
 ) {
-    assert_eq!(exponent, 65537, "only e=65537 is supported for step-wise RSA");
+    assert_eq!(
+        exponent, 65537,
+        "only e=65537 is supported for step-wise RSA"
+    );
 
     let n_limbs = bignum::be_bytes_to_limbs_2048(modulus);
     let sig_limbs = bignum::be_bytes_to_limbs_2048(signature);
@@ -83,7 +80,10 @@ pub fn rsa_pkcs1v15_sha256_verify_4096(
     signature: &[u8; 512],
     msg_hash: &[u8; 32],
 ) {
-    assert_eq!(exponent, 65537, "only e=65537 is supported for step-wise RSA");
+    assert_eq!(
+        exponent, 65537,
+        "only e=65537 is supported for step-wise RSA"
+    );
 
     let n_limbs = bignum::be_bytes_to_limbs_4096(modulus);
     let sig_limbs = bignum::be_bytes_to_limbs_4096(signature);

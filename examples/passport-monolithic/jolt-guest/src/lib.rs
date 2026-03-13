@@ -30,7 +30,6 @@ fn complete_age_check(inputs: GuestInputs) -> u32 {
 
     // Step 3: DG1 hash integrity
     start_cycle_tracking("dg1_hash");
-    // TODO: we can split arguments further to avoid passing the entire struct
     verify::verify_dg1_hash(
         &inputs.dg1,
         inputs.dg1_padded_length,
@@ -52,11 +51,9 @@ fn complete_age_check(inputs: GuestInputs) -> u32 {
     verify::verify_dsc_pubkey_in_cert(&inputs.passport_validity);
     end_cycle_tracking("dsc_pubkey_in_cert");
 
-    start_cycle_tracking("csc_signature");        
+    start_cycle_tracking("csc_signature");
     verify::verify_csc_signature(&inputs.passport_validity);
     end_cycle_tracking("csc_signature");
-    
-    
 
     1 // success
 }

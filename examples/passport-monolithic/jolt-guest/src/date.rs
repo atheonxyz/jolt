@@ -1,4 +1,3 @@
-/// Minimal no_std date utilities for passport verification.
 /// Mirrors the Noir `date` library's behavior for age/expiry checks.
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -17,8 +16,7 @@ impl SimpleDate {
         let z = days + 719468;
         let era = if z >= 0 { z } else { z - 146096 } / 146097;
         let doe = (z - era * 146097) as u32; // day of era [0, 146096]
-        let yoe =
-            (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365; // year of era [0, 399]
+        let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365; // year of era [0, 399]
         let y = yoe as i64 + era * 400;
         let doy = doe - (365 * yoe + yoe / 4 - yoe / 100); // day of year [0, 365]
         let mp = (5 * doy + 2) / 153; // month index [0, 11]
@@ -86,7 +84,14 @@ mod tests {
     #[test]
     fn test_from_timestamp_epoch() {
         let d = SimpleDate::from_timestamp(0);
-        assert_eq!(d, SimpleDate { year: 1970, month: 1, day: 1 });
+        assert_eq!(
+            d,
+            SimpleDate {
+                year: 1970,
+                month: 1,
+                day: 1
+            }
+        );
     }
 
     #[test]
@@ -104,7 +109,14 @@ mod tests {
         // "070101" = Jan 1, 2007 (with pivot 2025)
         let bytes = [b'0', b'7', b'0', b'1', b'0', b'1'];
         let d = SimpleDate::from_yymmdd_bytes(&bytes, 2025);
-        assert_eq!(d, SimpleDate { year: 2007, month: 1, day: 1 });
+        assert_eq!(
+            d,
+            SimpleDate {
+                year: 2007,
+                month: 1,
+                day: 1
+            }
+        );
     }
 
     #[test]
@@ -112,20 +124,46 @@ mod tests {
         // "950101" = Jan 1, 1995 (with pivot 2025, since 2095 > 2025)
         let bytes = [b'9', b'5', b'0', b'1', b'0', b'1'];
         let d = SimpleDate::from_yymmdd_bytes(&bytes, 2025);
-        assert_eq!(d, SimpleDate { year: 1995, month: 1, day: 1 });
+        assert_eq!(
+            d,
+            SimpleDate {
+                year: 1995,
+                month: 1,
+                day: 1
+            }
+        );
     }
 
     #[test]
     fn test_add_years() {
-        let d = SimpleDate { year: 2000, month: 6, day: 15 };
+        let d = SimpleDate {
+            year: 2000,
+            month: 6,
+            day: 15,
+        };
         let d2 = d.add_years(18);
-        assert_eq!(d2, SimpleDate { year: 2018, month: 6, day: 15 });
+        assert_eq!(
+            d2,
+            SimpleDate {
+                year: 2018,
+                month: 6,
+                day: 15
+            }
+        );
     }
 
     #[test]
     fn test_gte_lt() {
-        let a = SimpleDate { year: 2025, month: 9, day: 19 };
-        let b = SimpleDate { year: 2018, month: 6, day: 15 };
+        let a = SimpleDate {
+            year: 2025,
+            month: 9,
+            day: 19,
+        };
+        let b = SimpleDate {
+            year: 2018,
+            month: 6,
+            day: 15,
+        };
         assert!(a.gte(b));
         assert!(!a.lt(b));
         assert!(b.lt(a));

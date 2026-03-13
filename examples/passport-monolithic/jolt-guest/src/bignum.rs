@@ -76,8 +76,7 @@ fn mul_wide_inner(a: &[u64], b: &[u64], result: &mut [u64]) {
     for i in 0..n {
         let mut carry: u64 = 0;
         for j in 0..n {
-            let prod =
-                (a[i] as u128) * (b[j] as u128) + (result[i + j] as u128) + (carry as u128);
+            let prod = (a[i] as u128) * (b[j] as u128) + (result[i + j] as u128) + (carry as u128);
             result[i + j] = prod as u64;
             carry = (prod >> 64) as u64;
         }
@@ -109,8 +108,7 @@ fn square_wide_inner(a: &[u64], result: &mut [u64]) {
     for i in 0..n {
         let mut carry: u64 = 0;
         for j in (i + 1)..n {
-            let prod =
-                (a[i] as u128) * (a[j] as u128) + (result[i + j] as u128) + (carry as u128);
+            let prod = (a[i] as u128) * (a[j] as u128) + (result[i + j] as u128) + (carry as u128);
             result[i + j] = prod as u64;
             carry = (prod >> 64) as u64;
         }
@@ -164,24 +162,14 @@ pub fn verify_modmul_4096(
 }
 
 /// Verify a^2 == q * n + r for 2048-bit operands using optimized squaring.
-pub fn verify_modsquare_2048(
-    a: &[u64; 32],
-    q: &[u64; 32],
-    n: &[u64; 32],
-    r: &[u64; 32],
-) -> bool {
+pub fn verify_modsquare_2048(a: &[u64; 32], q: &[u64; 32], n: &[u64; 32], r: &[u64; 32]) -> bool {
     let a2 = square_wide_2048(a);
     let qn = mul_wide_2048(q, n);
     verify_sum_eq(&a2, &qn, r)
 }
 
 /// Verify a^2 == q * n + r for 4096-bit operands using optimized squaring.
-pub fn verify_modsquare_4096(
-    a: &[u64; 64],
-    q: &[u64; 64],
-    n: &[u64; 64],
-    r: &[u64; 64],
-) -> bool {
+pub fn verify_modsquare_4096(a: &[u64; 64], q: &[u64; 64], n: &[u64; 64], r: &[u64; 64]) -> bool {
     let a2 = square_wide_4096(a);
     let qn = mul_wide_4096(q, n);
     verify_sum_eq(&a2, &qn, r)
@@ -224,10 +212,7 @@ fn lt_inner(a: &[u64], b: &[u64]) -> bool {
 }
 
 #[cfg(feature = "compute_advice")]
-pub fn div_rem_wide_2048(
-    dividend: &[u64; 64],
-    divisor: &[u64; 32],
-) -> ([u64; 32], [u64; 32]) {
+pub fn div_rem_wide_2048(dividend: &[u64; 64], divisor: &[u64; 32]) -> ([u64; 32], [u64; 32]) {
     let mut rem = [0u64; 33];
     let mut quo = [0u64; 32];
 
@@ -249,10 +234,7 @@ pub fn div_rem_wide_2048(
 }
 
 #[cfg(feature = "compute_advice")]
-pub fn div_rem_wide_4096(
-    dividend: &[u64; 128],
-    divisor: &[u64; 64],
-) -> ([u64; 64], [u64; 64]) {
+pub fn div_rem_wide_4096(dividend: &[u64; 128], divisor: &[u64; 64]) -> ([u64; 64], [u64; 64]) {
     let mut rem = [0u64; 65];
     let mut quo = [0u64; 64];
 

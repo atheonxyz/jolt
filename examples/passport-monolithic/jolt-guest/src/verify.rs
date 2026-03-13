@@ -1,11 +1,3 @@
-/// Passport verification logic — 1:1 port of Noir `complete_age_check` circuit.
-///
-/// Source mapping:
-///   verify_age            ← compare/age/src/lib.nr
-///   verify_expiry         ← data-check/expiry/src/lib.nr
-///   verify_dg1_hash       ← passport_validity_check/src/lib.nr (check_dg1_hash_within_sod)
-///   verify_passport_validity ← passport_validity_check/src/lib.nr (check_passport_validity)
-
 use jolt_inlines_sha2::Sha256;
 
 use crate::date::SimpleDate;
@@ -47,10 +39,7 @@ pub fn verify_age(dg1: &[u8; MAX_DG1_SIZE], min_age: u8, max_age: u8, timestamp:
     if min_age != 0 && max_age == 0 {
         // Only minimum age check
         let min_date = birthdate.add_years(min_age as u32);
-        assert!(
-            current_date.gte(min_date),
-            "age below minimum required age"
-        );
+        assert!(current_date.gte(min_date), "age below minimum required age");
     } else if max_age != 0 && min_age == 0 {
         // Only maximum age check
         let max_date = birthdate.add_years(max_age as u32);
@@ -60,10 +49,7 @@ pub fn verify_age(dg1: &[u8; MAX_DG1_SIZE], min_age: u8, max_age: u8, timestamp:
         assert!(min_age <= max_age, "min_age must be <= max_age");
         let min_date = birthdate.add_years(min_age as u32);
         let max_date = birthdate.add_years(max_age as u32 + 1);
-        assert!(
-            current_date.gte(min_date),
-            "age below minimum required age"
-        );
+        assert!(current_date.gte(min_date), "age below minimum required age");
         assert!(current_date.lt(max_date), "age above maximum allowed age");
     }
 }
@@ -123,7 +109,8 @@ pub fn verify_dg1_hash(
     // Compare with hash in econtent
     for i in 0..32 {
         assert_eq!(
-            dg1_hash[i], pv.econtent[offset + i],
+            dg1_hash[i],
+            pv.econtent[offset + i],
             "DG1 hash mismatch at byte {}",
             i
         );
@@ -164,7 +151,8 @@ pub fn check_sod_integrity(pv: &GuestPassportValidity) {
 
     for i in 0..32 {
         assert_eq!(
-            econtent_hash[i], pv.signed_attributes[offset + i],
+            econtent_hash[i],
+            pv.signed_attributes[offset + i],
             "eContent hash mismatch in signed_attributes at byte {}",
             i
         );
@@ -196,7 +184,8 @@ pub fn verify_dsc_pubkey_in_cert(pv: &GuestPassportValidity) {
 
     for i in 0..DSC_SIG_BYTES {
         assert_eq!(
-            pv.dsc_cert[offset + i], pv.dsc_pubkey[i],
+            pv.dsc_cert[offset + i],
+            pv.dsc_pubkey[i],
             "DSC pubkey mismatch in cert at byte {}",
             i
         );
