@@ -94,9 +94,9 @@ mod tests {
             };
 
             let full_source = if shaders_requiring_common_and_g1_curve.contains(shader_name) {
-                format!("{}\n{}\n{}", COMMON, MSM_G1_CURVE, source)
+                format!("{COMMON}\n{MSM_G1_CURVE}\n{source}")
             } else if shaders_requiring_common.contains(shader_name) {
-                format!("{}\n{}", COMMON, source)
+                format!("{COMMON}\n{source}")
             } else {
                 source.to_string()
             };
@@ -106,21 +106,24 @@ mod tests {
                     passed.push(shader_name.to_string());
                 }
                 Err(e) => {
-                    failed.push((shader_name.to_string(), format!("{:?}", e)));
+                    failed.push((shader_name.to_string(), format!("{e:?}")));
                 }
             }
         }
 
+        let total = ALL_SHADER_NAMES.len();
+        let pass_count = passed.len();
         println!("\n=== Shader Parse Results ===");
-        println!("Passed: {}/{}", passed.len(), ALL_SHADER_NAMES.len());
+        println!("Passed: {pass_count}/{total}");
         for name in &passed {
-            println!("  ✓ {}", name);
+            println!("  ✓ {name}");
         }
 
         if !failed.is_empty() {
-            println!("\nFailed: {}", failed.len());
+            let fail_count = failed.len();
+            println!("\nFailed: {fail_count}");
             for (name, err) in &failed {
-                println!("  ✗ {}: {}", name, err);
+                println!("  ✗ {name}: {err}");
             }
         }
 
