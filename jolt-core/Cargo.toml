@@ -47,6 +47,7 @@ monitor = ["dep:sysinfo"]
 pprof = ["dep:pprof", "dep:prost"]
 test_incremental = []
 challenge-254-bit = []
+gpu = ["dep:jolt-gpu"]
 
 [dependencies]
 ark-bn254.workspace = true
@@ -95,6 +96,7 @@ pprof = { version = "0.15", features = [
     "frame-pointer",
 ], optional = true }
 prost = { version = "0.14", optional = true }
+jolt-gpu = { workspace = true, optional = true }
 
 [package.metadata.cargo-machete]
 ignored = ["prost"]

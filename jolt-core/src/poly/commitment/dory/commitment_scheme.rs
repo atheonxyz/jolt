@@ -3,7 +3,7 @@
 use super::dory_globals::{DoryGlobals, DoryLayout};
 use super::jolt_dory_routines::{JoltG1Routines, JoltG2Routines};
 use super::wrappers::{
-    ark_to_jolt, jolt_to_ark, ArkDoryProof, ArkFr, ArkG1, ArkGT, ArkworksProverSetup,
+    ark_to_jolt, jolt_to_ark, ArkDoryProof, ArkFr, ArkG1, ArkG2, ArkGT, ArkworksProverSetup,
     ArkworksVerifierSetup, JoltToDoryTranscript, BN254,
 };
 use crate::{
@@ -400,7 +400,7 @@ impl StreamingCommitmentScheme for DoryCommitmentScheme {
             }
 
             let g2_bases = &setup.g2_vec[..num_rows];
-            let tier_2 = <BN254 as PairingCurve>::multi_pair_g2_setup(&row_commitments, g2_bases);
+            let tier_2 = multi_pair_g2_setup_maybe_gpu(&row_commitments, g2_bases);
 
             (tier_2, DoryOpeningProofHint::new(row_commitments))
         } else {
@@ -408,7 +408,7 @@ impl StreamingCommitmentScheme for DoryCommitmentScheme {
                 chunks.iter().flat_map(|chunk| chunk.clone()).collect();
 
             let g2_bases = &setup.g2_vec[..row_commitments.len()];
-            let tier_2 = <BN254 as PairingCurve>::multi_pair_g2_setup(&row_commitments, g2_bases);
+            let tier_2 = multi_pair_g2_setup_maybe_gpu(&row_commitments, g2_bases);
 
             (tier_2, DoryOpeningProofHint::new(row_commitments))
         }
@@ -442,6 +442,32 @@ where
         let h1 = C::G1::from(setup.0.h1);
         Some((g1_0, h1))
     }
+}
+
+#[cfg(feature = "gpu")]
+fn gpu_multi_pair_g2_setup(g1s: &[ArkG1], g2s: &[ArkG2]) -> Option<ArkGT> {
+    use ark_bn254::Bn254;
+    use ark_ec::pairing::{MillerLoopOutput, Pairing};
+
+    let engine = jolt_gpu::get_or_init_engine()?;
+
+    let g1_affines: Vec<G1Affine> = g1s.iter().map(|p| p.0.into_affine()).collect();
+    let g2_affines: Vec<ark_bn254::G2Affine> = g2s.iter().map(|p| p.0.into_affine()).collect();
+
+    let fq12s = engine
+        .hybrid_multi_pairing(&[(&g1_affines, &g2_affines)], 0.95)
+        .ok()?;
+
+    let pairing_output = Bn254::final_exponentiation(MillerLoopOutput(fq12s[0]))?;
+    Some(ArkGT(pairing_output.0))
+}
+
+fn multi_pair_g2_setup_maybe_gpu(g1s: &[ArkG1], g2s: &[ArkG2]) -> ArkGT {
+    #[cfg(feature = "gpu")]
+    if let Some(result) = gpu_multi_pair_g2_setup(g1s, g2s) {
+        return result;
+    }
+    <BN254 as PairingCurve>::multi_pair_g2_setup(g1s, g2s)
 }
 
 /// Reorders opening_point for AddressMajor layout.
