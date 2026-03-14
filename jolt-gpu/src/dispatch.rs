@@ -1,6 +1,6 @@
-#![allow(dead_code)]
-
 use std::sync::mpsc;
+
+use crate::error::GpuError;
 
 pub fn create_bind_group(
     device: &wgpu::Device,
@@ -14,48 +14,13 @@ pub fn create_bind_group(
     })
 }
 
-pub fn dispatch_compute(
-    device: &wgpu::Device,
-    queue: &wgpu::Queue,
-    pipeline: &wgpu::ComputePipeline,
-    bind_groups: &[&wgpu::BindGroup],
-    workgroup_counts: (u32, u32, u32),
-) {
-    let span = tracing::debug_span!(
-        "dispatch_compute",
-        x = workgroup_counts.0,
-        y = workgroup_counts.1,
-        z = workgroup_counts.2,
-        bind_group_count = bind_groups.len()
-    );
-    let _guard = span.enter();
-
-    let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
-        label: Some("jolt-gpu-compute-encoder"),
-    });
-
-    {
-        let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
-            label: Some("jolt-gpu-compute-pass"),
-            timestamp_writes: None,
-        });
-        pass.set_pipeline(pipeline);
-        for (index, bind_group) in bind_groups.iter().enumerate() {
-            pass.set_bind_group(index as u32, *bind_group, &[]);
-        }
-        pass.dispatch_workgroups(workgroup_counts.0, workgroup_counts.1, workgroup_counts.2);
-    }
-
-    tracing::debug!("submitting compute dispatch");
-    queue.submit(Some(encoder.finish()));
-}
-
+#[allow(dead_code)]
 pub fn read_buffer_sync(
     device: &wgpu::Device,
     queue: &wgpu::Queue,
     buffer: &wgpu::Buffer,
     size: u64,
-) -> Vec<u8> {
+) -> Result<Vec<u8>, GpuError> {
     let _span = tracing::debug_span!("read_buffer_sync", size).entered();
 
     let staging_buffer = device.create_buffer(&wgpu::BufferDescriptor {
@@ -82,22 +47,23 @@ pub fn read_buffer_sync(
 
     match rx.recv() {
         Ok(Ok(())) => {}
-        Ok(Err(err)) => panic!("{}", crate::error::GpuError::BufferError(err.to_string())),
-        Err(err) => panic!("{}", crate::error::GpuError::BufferError(err.to_string())),
+        Ok(Err(err)) => return Err(GpuError::BufferError(err.to_string())),
+        Err(err) => return Err(GpuError::BufferError(err.to_string())),
     }
 
     let data = staging_buffer.slice(..).get_mapped_range().to_vec();
     staging_buffer.unmap();
     tracing::debug!(bytes = data.len(), "finished synchronous GPU readback");
-    data
+    Ok(data)
 }
 
+#[allow(dead_code)]
 pub async fn read_buffer_async(
     device: &wgpu::Device,
     queue: &wgpu::Queue,
     buffer: &wgpu::Buffer,
     size: u64,
-) -> Result<Vec<u8>, crate::error::GpuError> {
+) -> Result<Vec<u8>, GpuError> {
     let staging_buffer = device.create_buffer(&wgpu::BufferDescriptor {
         label: Some("jolt-gpu-readback-staging-async"),
         size,
@@ -111,7 +77,7 @@ pub async fn read_buffer_async(
     encoder.copy_buffer_to_buffer(buffer, 0, &staging_buffer, 0, size);
     queue.submit(Some(encoder.finish()));
 
-    let (tx, rx) = std::sync::mpsc::channel();
+    let (tx, rx) = mpsc::channel();
     staging_buffer
         .slice(..)
         .map_async(wgpu::MapMode::Read, move |result| {
@@ -123,10 +89,10 @@ pub async fn read_buffer_async(
     match rx.recv() {
         Ok(Ok(())) => {}
         Ok(Err(err)) => {
-            return Err(crate::error::GpuError::BufferError(err.to_string()));
+            return Err(GpuError::BufferError(err.to_string()));
         }
         Err(err) => {
-            return Err(crate::error::GpuError::BufferError(err.to_string()));
+            return Err(GpuError::BufferError(err.to_string()));
         }
     }
 
@@ -166,7 +132,8 @@ mod tests {
 
         dispatch::write_buffer(&ctx.queue, &buffer, &expected);
         let actual =
-            dispatch::read_buffer_sync(&ctx.device, &ctx.queue, &buffer, expected.len() as u64);
+            dispatch::read_buffer_sync(&ctx.device, &ctx.queue, &buffer, expected.len() as u64)
+                .expect("readback should succeed");
         assert_eq!(actual, expected);
     }
 }

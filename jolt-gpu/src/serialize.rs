@@ -1,5 +1,3 @@
-#![allow(dead_code)]
-
 use ark_bn254::{Fq, Fq12, Fq2, Fq6, G1Affine, G2Affine};
 use ark_ff::BigInt;
 

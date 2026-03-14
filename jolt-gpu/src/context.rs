@@ -1,10 +1,11 @@
 use crate::error::GpuError;
 
-#[allow(dead_code)]
 pub struct WgpuContext {
     pub(crate) device: wgpu::Device,
     pub(crate) queue: wgpu::Queue,
+    #[allow(dead_code)]
     pub(crate) adapter_info: wgpu::AdapterInfo,
+    #[allow(dead_code)]
     pub(crate) limits: wgpu::Limits,
 }
 

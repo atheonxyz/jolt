@@ -1,10 +1,9 @@
-#![allow(dead_code)]
-
 use std::sync::mpsc;
 
 use ark_bn254::{Bn254, Fq12, G1Affine, G2Affine};
 use ark_ec::pairing::Pairing;
 use ark_std::One;
+use rayon::prelude::*;
 
 use crate::{
     context::WgpuContext,
@@ -17,15 +16,24 @@ use crate::{
 const MILLER_WORKGROUP_SIZE: u32 = 64;
 const REDUCE_WORKGROUP_SIZE: u32 = 256;
 
-pub fn gpu_batch_multi_pairing(
+/// In-flight GPU readback handle. The staging buffer has been mapped async
+/// but `device.poll` has not yet been called — GPU work is still running.
+struct GpuPairingReadback {
+    staging_buffer: wgpu::Buffer,
+    rx: mpsc::Receiver<Result<(), wgpu::BufferAsyncError>>,
+}
+
+struct GpuPairingDispatch {
+    group_sizes: Vec<u32>,
+    /// Present only when there are non-empty groups with actual GPU work.
+    readback: Option<GpuPairingReadback>,
+}
+
+fn gpu_dispatch_pairing(
     ctx: &WgpuContext,
     registry: &ShaderRegistry,
     groups: &[(&[G1Affine], &[G2Affine])],
-) -> Result<Vec<Fq12>, GpuError> {
-    if groups.is_empty() {
-        return Ok(Vec::new());
-    }
-
+) -> Result<GpuPairingDispatch, GpuError> {
     let mut group_sizes = Vec::with_capacity(groups.len());
     let mut group_offsets = Vec::with_capacity(groups.len());
     let mut total_pairs = 0_u32;
@@ -42,16 +50,18 @@ pub fn gpu_batch_multi_pairing(
         total_pairs = total_pairs.saturating_add(size);
     }
 
+    if total_pairs == 0 {
+        return Ok(GpuPairingDispatch {
+            group_sizes,
+            readback: None,
+        });
+    }
+
     let mut g1_flat = Vec::with_capacity(total_pairs as usize);
     let mut g2_flat = Vec::with_capacity(total_pairs as usize);
     for &(g1s, g2s) in groups {
         g1_flat.extend_from_slice(&serialize_g1_affine(g1s));
         g2_flat.extend_from_slice(&serialize_g2_affine(g2s));
-    }
-
-    let mut out = vec![Fq12::one(); groups.len()];
-    if total_pairs == 0 {
-        return Ok(out);
     }
 
     let g1_buffer = ctx.device.create_buffer(&wgpu::BufferDescriptor {
@@ -213,41 +223,70 @@ pub fn gpu_batch_multi_pairing(
         copy_slot += 1;
     }
 
+    // Submit — non-blocking. GPU starts executing immediately.
     ctx.queue.submit(Some(encoder.finish()));
 
-    if non_empty_count > 0 {
-        let (tx, rx) = mpsc::channel();
-        staging_buffer
-            .slice(..)
-            .map_async(wgpu::MapMode::Read, move |result| {
-                let _ = tx.send(result);
-            });
-        let _ = ctx.device.poll(wgpu::Maintain::Wait);
-        match rx.recv() {
-            Ok(Ok(())) => {}
-            Ok(Err(err)) => return Err(GpuError::BufferError(err.to_string())),
-            Err(err) => return Err(GpuError::BufferError(err.to_string())),
-        }
+    // Register map callback. Fires only during device.poll().
+    let (tx, rx) = mpsc::channel();
+    staging_buffer
+        .slice(..)
+        .map_async(wgpu::MapMode::Read, move |result| {
+            let _ = tx.send(result);
+        });
 
-        let bytes = staging_buffer.slice(..).get_mapped_range();
-        let words: &[u32] = bytemuck::cast_slice(&bytes);
+    Ok(GpuPairingDispatch {
+        group_sizes,
+        readback: Some(GpuPairingReadback { staging_buffer, rx }),
+    })
+}
 
-        let mut read_idx = 0_usize;
-        for (idx, &group_size) in group_sizes.iter().enumerate() {
-            if group_size == 0 {
-                out[idx] = Fq12::one();
-                continue;
-            }
-            let start = read_idx * FP12_WORDS;
-            out[idx] = deserialize_fq12(&words[start..start + FP12_WORDS]);
-            read_idx += 1;
-        }
+fn gpu_collect_pairing(
+    ctx: &WgpuContext,
+    dispatch: GpuPairingDispatch,
+) -> Result<Vec<Fq12>, GpuError> {
+    let num_groups = dispatch.group_sizes.len();
+    let mut out = vec![Fq12::one(); num_groups];
 
-        drop(bytes);
-        staging_buffer.unmap();
+    let Some(readback) = dispatch.readback else {
+        return Ok(out);
+    };
+
+    let _ = ctx.device.poll(wgpu::Maintain::Wait);
+    match readback.rx.recv() {
+        Ok(Ok(())) => {}
+        Ok(Err(err)) => return Err(GpuError::BufferError(err.to_string())),
+        Err(err) => return Err(GpuError::BufferError(err.to_string())),
     }
 
+    let bytes = readback.staging_buffer.slice(..).get_mapped_range();
+    let words: &[u32] = bytemuck::cast_slice(&bytes);
+
+    let mut read_idx = 0_usize;
+    for (idx, &group_size) in dispatch.group_sizes.iter().enumerate() {
+        if group_size == 0 {
+            continue;
+        }
+        let start = read_idx * FP12_WORDS;
+        out[idx] = deserialize_fq12(&words[start..start + FP12_WORDS]);
+        read_idx += 1;
+    }
+
+    drop(bytes);
+    readback.staging_buffer.unmap();
+
     Ok(out)
+}
+
+pub fn gpu_batch_multi_pairing(
+    ctx: &WgpuContext,
+    registry: &ShaderRegistry,
+    groups: &[(&[G1Affine], &[G2Affine])],
+) -> Result<Vec<Fq12>, GpuError> {
+    if groups.is_empty() {
+        return Ok(Vec::new());
+    }
+    let dispatch = gpu_dispatch_pairing(ctx, registry, groups)?;
+    gpu_collect_pairing(ctx, dispatch)
 }
 
 pub fn hybrid_batch_multi_pairing(
@@ -281,19 +320,26 @@ pub fn hybrid_batch_multi_pairing(
         cpu_groups.push((&g1s[gpu_count..], &g2s[gpu_count..]));
     }
 
-    let gpu_results = gpu_batch_multi_pairing(ctx, registry, &gpu_groups)?;
-    let mut combined = Vec::with_capacity(groups.len());
+    let dispatch = gpu_dispatch_pairing(ctx, registry, &gpu_groups)?;
 
-    for (idx, &(cpu_g1s, cpu_g2s)) in cpu_groups.iter().enumerate() {
-        if cpu_g1s.is_empty() {
-            combined.push(gpu_results[idx]);
-            continue;
-        }
+    let cpu_results: Vec<Fq12> = cpu_groups
+        .par_iter()
+        .map(|&(cpu_g1s, cpu_g2s)| {
+            if cpu_g1s.is_empty() {
+                Fq12::one()
+            } else {
+                Bn254::multi_miller_loop(cpu_g1s.iter().copied(), cpu_g2s.iter().copied()).0
+            }
+        })
+        .collect();
 
-        let cpu_result =
-            Bn254::multi_miller_loop(cpu_g1s.iter().copied(), cpu_g2s.iter().copied()).0;
-        combined.push(gpu_results[idx] * cpu_result);
-    }
+    let gpu_results = gpu_collect_pairing(ctx, dispatch)?;
+
+    let combined = gpu_results
+        .iter()
+        .zip(cpu_results.iter())
+        .map(|(&gpu, &cpu)| gpu * cpu)
+        .collect();
 
     Ok(combined)
 }

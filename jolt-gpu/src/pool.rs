@@ -6,10 +6,8 @@ use std::sync::{
 
 use crate::WgpuContext;
 
-#[allow(dead_code)]
 type PoolKey = (u64, wgpu::BufferUsages);
 
-#[allow(dead_code)]
 pub(crate) fn size_class(size: u64) -> u64 {
     match size {
         0 => 1,
@@ -17,7 +15,6 @@ pub(crate) fn size_class(size: u64) -> u64 {
     }
 }
 
-#[allow(dead_code)]
 pub(crate) struct GpuBuffer {
     pub(crate) buffer: wgpu::Buffer,
     pub(crate) actual_size: u64,
@@ -25,14 +22,12 @@ pub(crate) struct GpuBuffer {
     usage: wgpu::BufferUsages,
 }
 
-#[allow(dead_code)]
 pub(crate) struct BufferPool {
     buffers: Mutex<HashMap<PoolKey, Vec<wgpu::Buffer>>>,
     hits: AtomicU64,
     misses: AtomicU64,
 }
 
-#[allow(dead_code)]
 impl BufferPool {
     pub(crate) fn new() -> Self {
         Self {
@@ -97,14 +92,12 @@ impl BufferPool {
     }
 }
 
-#[allow(dead_code)]
 impl Default for BufferPool {
     fn default() -> Self {
         Self::new()
     }
 }
 
-#[allow(dead_code)]
 impl WgpuContext {
     pub(crate) fn create_buffer_pool(&self) -> BufferPool {
         BufferPool::new()

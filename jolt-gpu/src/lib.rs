@@ -1,14 +1,13 @@
-mod backend;
 mod context;
 mod dispatch;
 mod error;
 mod pairing;
 mod pipeline;
+#[allow(dead_code)]
 mod pool;
 mod serialize;
 pub mod shaders;
 
-pub use backend::{GpuBackend, WgpuBackend};
 pub use context::WgpuContext;
 pub use error::GpuError;
 pub use pairing::{gpu_batch_multi_pairing, hybrid_batch_multi_pairing};
