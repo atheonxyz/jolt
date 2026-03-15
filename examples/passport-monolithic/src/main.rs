@@ -51,10 +51,12 @@ pub fn main() {
     let shared_preprocessing = guest::preprocess_shared_complete_age_check(&mut program);
     let prover_preprocessing =
         guest::preprocess_prover_complete_age_check(shared_preprocessing.clone());
+    let verifier_setup = prover_preprocessing.generators.to_verifier_setup();
+    let blindfold_setup = prover_preprocessing.blindfold_setup();
     let verifier_preprocessing = guest::preprocess_verifier_complete_age_check(
         shared_preprocessing,
-        prover_preprocessing.generators.to_verifier_setup(),
-        None,
+        verifier_setup,
+        Some(blindfold_setup),
     );
 
     let prove = guest::build_prover_complete_age_check(program, prover_preprocessing);
