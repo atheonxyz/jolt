@@ -1,16 +1,10 @@
-//! Bignum arithmetic for RSA modular multiplication verification,
-//! accelerated with bigint256_mul inline + 1-level Karatsuba.
+//! Bignum arithmetic for RSA modular multiplication verification.
 //!
-//! 4096-bit: 1-level Karatsuba (64→2×32, schoolbook base case)
-//! 2048-bit: 1-level Karatsuba (32→2×16, schoolbook base case)
-//! Base case: chunk-level schoolbook with bigint256_mul inline (1 virtual
-//! instruction per 256×256→512-bit partial product).
-
-use jolt_inlines_bigint::bigint256_mul;
-
-const CHUNK: usize = 4;
-
-// ── Byte ↔ limb conversion ──────────────────────────────────────────────────
+//! Uses little-endian u64 limb representation. Only the operations needed
+//! for step-wise RSA modexp verification are implemented.
+//!
+//! Guest verification functions (always compiled): mul_wide, verify_modmul, lt
+//! Advice-only functions (compute_advice only): div_rem_wide (Knuth's Algorithm D)
 
 pub fn be_bytes_to_limbs_2048(bytes: &[u8; 256]) -> [u64; 32] {
     let mut limbs = [0u64; 32];
@@ -41,8 +35,14 @@ fn be_bytes_to_limbs_inner(bytes: &[u8], limbs: &mut [u64]) {
     for i in 0..limbs.len() {
         let off = n_bytes - (i + 1) * 8;
         limbs[i] = u64::from_be_bytes([
-            bytes[off], bytes[off + 1], bytes[off + 2], bytes[off + 3],
-            bytes[off + 4], bytes[off + 5], bytes[off + 6], bytes[off + 7],
+            bytes[off],
+            bytes[off + 1],
+            bytes[off + 2],
+            bytes[off + 3],
+            bytes[off + 4],
+            bytes[off + 5],
+            bytes[off + 6],
+            bytes[off + 7],
         ]);
     }
 }
@@ -56,216 +56,119 @@ fn limbs_to_be_bytes_inner(limbs: &[u64], bytes: &mut [u8]) {
     }
 }
 
-// ── Helpers ─────────────────────────────────────────────────────────────────
-
-#[inline(always)]
-fn chunk4(limbs: &[u64], i: usize) -> [u64; 4] {
-    let off = i * CHUNK;
-    [limbs[off], limbs[off + 1], limbs[off + 2], limbs[off + 3]]
-}
-
-#[inline(always)]
-fn accumulate_prod(result: &mut [u64], prod: [u64; 8], offset: usize) {
-    let mut carry: u64 = 0;
-    for k in 0..8 {
-        let pos = offset + k;
-        let (s1, c1) = result[pos].overflowing_add(prod[k]);
-        let (s2, c2) = s1.overflowing_add(carry);
-        result[pos] = s2;
-        carry = c1 as u64 + c2 as u64;
-    }
-    let mut pos = offset + 8;
-    while carry != 0 && pos < result.len() {
-        let (s, c) = result[pos].overflowing_add(carry);
-        result[pos] = s;
-        carry = c as u64;
-        pos += 1;
-    }
-}
-
-fn add_limbs_at(dst: &mut [u64], src: &[u64], offset: usize) {
-    let mut carry: u64 = 0;
-    for k in 0..src.len() {
-        let pos = offset + k;
-        if pos >= dst.len() { break; }
-        let (s1, c1) = dst[pos].overflowing_add(src[k]);
-        let (s2, c2) = s1.overflowing_add(carry);
-        dst[pos] = s2;
-        carry = c1 as u64 + c2 as u64;
-    }
-    let mut pos = offset + src.len();
-    while carry != 0 && pos < dst.len() {
-        let (s, c) = dst[pos].overflowing_add(carry);
-        dst[pos] = s;
-        carry = c as u64;
-        pos += 1;
-    }
-}
-
-fn add_limbs(dst: &mut [u64], a: &[u64], b: &[u64]) -> u64 {
-    let mut carry: u64 = 0;
-    for i in 0..a.len() {
-        let (s1, c1) = a[i].overflowing_add(b[i]);
-        let (s2, c2) = s1.overflowing_add(carry);
-        dst[i] = s2;
-        carry = c1 as u64 + c2 as u64;
-    }
-    carry
-}
-
-fn sub_wide(dst: &mut [u64], a: &[u64], b: &[u64]) {
-    let mut borrow: u64 = 0;
-    for i in 0..a.len() {
-        let b_val = if i < b.len() { b[i] } else { 0 };
-        let (d1, br1) = a[i].overflowing_sub(b_val);
-        let (d2, br2) = d1.overflowing_sub(borrow);
-        dst[i] = d2;
-        borrow = br1 as u64 + br2 as u64;
-    }
-}
-
-// ── Schoolbook base case ────────────────────────────────────────────────────
-
-fn schoolbook_mul(a: &[u64], b: &[u64], result: &mut [u64]) {
-    let a_chunks = a.len() / CHUNK;
-    let b_chunks = b.len() / CHUNK;
-    for r in result.iter_mut() { *r = 0; }
-    for i in 0..a_chunks {
-        let ac = chunk4(a, i);
-        for j in 0..b_chunks {
-            accumulate_prod(result, bigint256_mul(ac, chunk4(b, j)), (i + j) * CHUNK);
-        }
-    }
-}
-
-fn schoolbook_square(a: &[u64], result: &mut [u64]) {
-    let n_chunks = a.len() / CHUNK;
-    for r in result.iter_mut() { *r = 0; }
-    for i in 0..n_chunks {
-        let ac = chunk4(a, i);
-        for j in (i + 1)..n_chunks {
-            accumulate_prod(result, bigint256_mul(ac, chunk4(a, j)), (i + j) * CHUNK);
-        }
-    }
-    let mut carry: u64 = 0;
-    for i in 0..result.len() {
-        let (d, c) = result[i].overflowing_add(result[i]);
-        let (d2, c2) = d.overflowing_add(carry);
-        result[i] = d2;
-        carry = c as u64 + c2 as u64;
-    }
-    for i in 0..n_chunks {
-        let ac = chunk4(a, i);
-        accumulate_prod(result, bigint256_mul(ac, ac), i * 2 * CHUNK);
-    }
-}
-
-// ── 1-level Karatsuba ───────────────────────────────────────────────────────
-
-macro_rules! impl_karatsuba_mul {
-    ($name:ident, $n:expr, $half:expr, $wide:expr, $sub_mul:ident) => {
-        fn $name(a: &[u64], b: &[u64], result: &mut [u64]) {
-            let mut z0 = [0u64; $wide];
-            $sub_mul(&a[..$half], &b[..$half], &mut z0[..$n]);
-
-            let mut z2 = [0u64; $wide];
-            $sub_mul(&a[$half..], &b[$half..], &mut z2[..$n]);
-
-            let mut sa = [0u64; $half];
-            let ca = add_limbs(&mut sa, &a[..$half], &a[$half..]);
-            let mut sb = [0u64; $half];
-            let cb = add_limbs(&mut sb, &b[..$half], &b[$half..]);
-
-            let mut zm = [0u64; $wide];
-            $sub_mul(&sa, &sb, &mut zm[..$n]);
-            if ca != 0 { add_limbs_at(&mut zm, &sb, $half); }
-            if cb != 0 { add_limbs_at(&mut zm, &sa, $half); }
-            if ca != 0 && cb != 0 {
-                let mut p = $n; let mut c = 1u64;
-                while c != 0 && p < $wide { let (s, o) = zm[p].overflowing_add(c); zm[p] = s; c = o as u64; p += 1; }
-            }
-
-            let mut z1 = [0u64; $wide];
-            sub_wide(&mut z1, &zm, &z0);
-            let t: [u64; $wide] = z1;
-            sub_wide(&mut z1, &t, &z2);
-
-            result[..$wide].copy_from_slice(&z0[..$wide]);
-            add_limbs_at(&mut result[..$wide], &z1[..$wide - $half], $half);
-            add_limbs_at(&mut result[..$wide], &z2[..$n], $n);
-        }
-    };
-}
-
-macro_rules! impl_karatsuba_square {
-    ($name:ident, $n:expr, $half:expr, $wide:expr, $sub_sq:ident) => {
-        fn $name(a: &[u64], result: &mut [u64]) {
-            let mut z0 = [0u64; $wide];
-            $sub_sq(&a[..$half], &mut z0[..$n]);
-
-            let mut z2 = [0u64; $wide];
-            $sub_sq(&a[$half..], &mut z2[..$n]);
-
-            let mut sa = [0u64; $half];
-            let ca = add_limbs(&mut sa, &a[..$half], &a[$half..]);
-
-            let mut zm = [0u64; $wide];
-            $sub_sq(&sa, &mut zm[..$n]);
-            if ca != 0 {
-                add_limbs_at(&mut zm, &sa, $half);
-                add_limbs_at(&mut zm, &sa, $half);
-                let mut p = $n; let mut c = 1u64;
-                while c != 0 && p < $wide { let (s, o) = zm[p].overflowing_add(c); zm[p] = s; c = o as u64; p += 1; }
-            }
-
-            let mut z1 = [0u64; $wide];
-            sub_wide(&mut z1, &zm, &z0);
-            let t: [u64; $wide] = z1;
-            sub_wide(&mut z1, &t, &z2);
-
-            result[..$wide].copy_from_slice(&z0[..$wide]);
-            add_limbs_at(&mut result[..$wide], &z1[..$wide - $half], $half);
-            add_limbs_at(&mut result[..$wide], &z2[..$n], $n);
-        }
-    };
-}
-
-// 2048-bit: 32→2×16 schoolbook
-impl_karatsuba_mul!(kara_mul_32, 32, 16, 64, schoolbook_mul);
-impl_karatsuba_square!(kara_sq_32, 32, 16, 64, schoolbook_square);
-
-// 4096-bit: 64→2×32 schoolbook
-impl_karatsuba_mul!(kara_mul_64, 64, 32, 128, schoolbook_mul);
-impl_karatsuba_square!(kara_sq_64, 64, 32, 128, schoolbook_square);
-
-// ── Public API ──────────────────────────────────────────────────────────────
-
 pub fn mul_wide_2048(a: &[u64; 32], b: &[u64; 32]) -> [u64; 64] {
-    let mut r = [0u64; 64]; kara_mul_32(a, b, &mut r); r
+    let mut result = [0u64; 64];
+    mul_wide_inner(a, b, &mut result);
+    result
 }
+
 pub fn mul_wide_4096(a: &[u64; 64], b: &[u64; 64]) -> [u64; 128] {
-    let mut r = [0u64; 128]; kara_mul_64(a, b, &mut r); r
+    let mut result = [0u64; 128];
+    mul_wide_inner(a, b, &mut result);
+    result
 }
+
+fn mul_wide_inner(a: &[u64], b: &[u64], result: &mut [u64]) {
+    let n = a.len();
+    for i in 0..result.len() {
+        result[i] = 0;
+    }
+    for i in 0..n {
+        let mut carry: u64 = 0;
+        for j in 0..n {
+            let prod = (a[i] as u128) * (b[j] as u128) + (result[i + j] as u128) + (carry as u128);
+            result[i + j] = prod as u64;
+            carry = (prod >> 64) as u64;
+        }
+        result[i + n] = carry;
+    }
+}
+
 pub fn square_wide_2048(a: &[u64; 32]) -> [u64; 64] {
-    let mut r = [0u64; 64]; kara_sq_32(a, &mut r); r
+    let mut result = [0u64; 64];
+    square_wide_inner(a, &mut result);
+    result
 }
+
 pub fn square_wide_4096(a: &[u64; 64]) -> [u64; 128] {
-    let mut r = [0u64; 128]; kara_sq_64(a, &mut r); r
+    let mut result = [0u64; 128];
+    square_wide_inner(a, &mut result);
+    result
 }
 
-// ── Verification ────────────────────────────────────────────────────────────
+/// Squaring exploits symmetry: a[i]*a[j] == a[j]*a[i] for i != j,
+/// halving the number of multiplications (528 vs 1024 for 32 limbs).
+fn square_wide_inner(a: &[u64], result: &mut [u64]) {
+    let n = a.len();
+    for i in 0..result.len() {
+        result[i] = 0;
+    }
 
-pub fn verify_modmul_2048(a: &[u64; 32], b: &[u64; 32], q: &[u64; 32], n: &[u64; 32], r: &[u64; 32]) -> bool {
-    verify_sum_eq(&mul_wide_2048(a, b), &mul_wide_2048(q, n), r)
+    // Off-diagonal products: accumulate a[i]*a[j] for i < j
+    for i in 0..n {
+        let mut carry: u64 = 0;
+        for j in (i + 1)..n {
+            let prod = (a[i] as u128) * (a[j] as u128) + (result[i + j] as u128) + (carry as u128);
+            result[i + j] = prod as u64;
+            carry = (prod >> 64) as u64;
+        }
+        result[i + n] = carry;
+    }
+
+    // Double the off-diagonal sum (each cross-term appears twice)
+    let mut carry: u64 = 0;
+    for i in 0..2 * n {
+        let doubled = (result[i] as u128) * 2 + (carry as u128);
+        result[i] = doubled as u64;
+        carry = (doubled >> 64) as u64;
+    }
+
+    // Add diagonal products: a[i]*a[i] at positions result[2*i]
+    let mut carry: u64 = 0;
+    for i in 0..n {
+        let prod = (a[i] as u128) * (a[i] as u128) + (result[2 * i] as u128) + (carry as u128);
+        result[2 * i] = prod as u64;
+        carry = (prod >> 64) as u64;
+        let sum = (result[2 * i + 1] as u128) + (carry as u128);
+        result[2 * i + 1] = sum as u64;
+        carry = (sum >> 64) as u64;
+    }
 }
-pub fn verify_modmul_4096(a: &[u64; 64], b: &[u64; 64], q: &[u64; 64], n: &[u64; 64], r: &[u64; 64]) -> bool {
-    verify_sum_eq(&mul_wide_4096(a, b), &mul_wide_4096(q, n), r)
+
+pub fn verify_modmul_2048(
+    a: &[u64; 32],
+    b: &[u64; 32],
+    q: &[u64; 32],
+    n: &[u64; 32],
+    r: &[u64; 32],
+) -> bool {
+    let ab = mul_wide_2048(a, b);
+    let qn = mul_wide_2048(q, n);
+    verify_sum_eq(&ab, &qn, r)
 }
+
+pub fn verify_modmul_4096(
+    a: &[u64; 64],
+    b: &[u64; 64],
+    q: &[u64; 64],
+    n: &[u64; 64],
+    r: &[u64; 64],
+) -> bool {
+    let ab = mul_wide_4096(a, b);
+    let qn = mul_wide_4096(q, n);
+    verify_sum_eq(&ab, &qn, r)
+}
+
 pub fn verify_modsquare_2048(a: &[u64; 32], q: &[u64; 32], n: &[u64; 32], r: &[u64; 32]) -> bool {
-    verify_sum_eq(&square_wide_2048(a), &mul_wide_2048(q, n), r)
+    let a2 = square_wide_2048(a);
+    let qn = mul_wide_2048(q, n);
+    verify_sum_eq(&a2, &qn, r)
 }
+
 pub fn verify_modsquare_4096(a: &[u64; 64], q: &[u64; 64], n: &[u64; 64], r: &[u64; 64]) -> bool {
-    verify_sum_eq(&square_wide_4096(a), &mul_wide_4096(q, n), r)
+    let a2 = square_wide_4096(a);
+    let qn = mul_wide_4096(q, n);
+    verify_sum_eq(&a2, &qn, r)
 }
 
 fn verify_sum_eq(wide: &[u64], base: &[u64], ext: &[u64]) -> bool {
@@ -282,15 +185,22 @@ fn verify_sum_eq(wide: &[u64], base: &[u64], ext: &[u64]) -> bool {
     carry == 0
 }
 
-// ── Comparison ──────────────────────────────────────────────────────────────
+pub fn lt_2048(a: &[u64; 32], b: &[u64; 32]) -> bool {
+    lt_inner(a, b)
+}
 
-pub fn lt_2048(a: &[u64; 32], b: &[u64; 32]) -> bool { lt_inner(a, b) }
-pub fn lt_4096(a: &[u64; 64], b: &[u64; 64]) -> bool { lt_inner(a, b) }
+pub fn lt_4096(a: &[u64; 64], b: &[u64; 64]) -> bool {
+    lt_inner(a, b)
+}
 
 fn lt_inner(a: &[u64], b: &[u64]) -> bool {
     for i in (0..a.len()).rev() {
-        if a[i] < b[i] { return true; }
-        if a[i] > b[i] { return false; }
+        if a[i] < b[i] {
+            return true;
+        }
+        if a[i] > b[i] {
+            return false;
+        }
     }
     false
 }
@@ -370,6 +280,7 @@ fn knuth_div(dividend: &[u64], divisor: &[u64], quo: &mut [u64], rem: &mut [u64]
     } else {
         for i in 0..m_plus_n { u[i] = dividend[i]; }
     }
+    let _ = ulen;
 
     for i in 0..quo.len() { quo[i] = 0; }
 
