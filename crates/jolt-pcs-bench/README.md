@@ -1,17 +1,34 @@
-# jolt-pcs-bench — WHIR vs Dory PCS commitment benchmark on the ECDSA workload
+# jolt-pcs-bench — WHIR-ZK + GKR vs Dory PCS comparison on the ECDSA workload
 
 A feasibility benchmark that answers a single question:
 
-> For the actual polynomial commitment workload of a Jolt ECDSA proof at 2^19 cycles,
-> how does WHIR (in zero-knowledge mode) with the LogUp\* trick compare to Jolt's
-> Dory in wall-clock time and committed data volume?
+> For the actual polynomial commitment workload of a Jolt ECDSA proof at 2^19
+> cycles, how does WHIR-ZK plus the LogUp\* trick (commit + GKR pushforward
+> proving) compare to Jolt's Dory commit in wall-clock time and committed
+> data volume?
 
-This benchmark only times the **commit** step. No opening proofs, no verification,
-no integration with the prover pipeline. The output is wall-clock numbers and
-field-element counts so you can decide whether the LogUp\* + WHIR direction is
-worth pursuing for Jolt.
+What's measured (three timing phases plus the Dory baseline):
 
-**Field menu** (`whir-pcs-bench --field …`):
+1. **Dory commit** of Jolt's current one-hot polynomial set (32 + 4 + 4 = 40
+   sparse one-hot chunks + 2 dense `RdInc`/`RamInc`).
+2. **WHIR-ZK commit** of the LogUp\* §4.1-batched set: 40 `ra_dense ∈ F^T`
+   + **3 eq-weighted pushforwards** `P^F ∈ F^{2^15}` (one per Jolt family —
+   InstructionRa, BytecodeRa, RamRa — per LogUp\* §4.1) + the same 2 dense
+   oracles. Reported as `commit_ms`.
+3. **`claim_eval_ms`**: per-family `d` MLE evaluations
+   `M̃^(i)(r_row, r_col)` — the inputs to PAZK §4.5.2's claim reduction.
+   In a real protocol these come from upstream sumcheck binding; the bench
+   reports them separately so reviewers can decide how to attribute them.
+4. **`gkr_ms`** — LogUp\* §4 / Figure-1 prover per family: §4.5.2 claim
+   reduction + eq-weighted `P^F` materialization + fan-in-2 fractional GKR
+   sumcheck proving the well-formedness identity
+   `Σ_j eq(bits(j), r_M_row)/(α − M^(*)[j]) == Σ_k P^F[k]/(α − k)`.
+
+What's **not** measured: opening proofs; sumcheck/Spartan/BlindFold; anything
+inside the prover crate. The bench is read-only with respect to
+`crates/jolt-prover`.
+
+**Field menu** (WHIR-side, see `whir-pcs-bench --field …`):
 
 - `bn254` (default) — `Identity<Field256>`, apples-to-apples with Dory.
 - `goldilocks-fp3` — `Identity<Field64_3>`, cubic extension of Goldilocks
@@ -20,13 +37,32 @@ worth pursuing for Jolt.
 The Jolt side / Dory always uses BN254 Fr (that's what Jolt's prover actually
 runs). Only the WHIR side is field-agnostic.
 
-The remaining out-of-scope milestone:
-
-- Add the GKR pushforward proving overhead (the *commitment* of `P[k]` is timed
-  here; *proving P came from ra_dense* is not).
-
 BabyBear / Mersenne31 / KoalaBear are deferred follow-ups (would require adding
 a new `MontConfig` plus an extension field).
+
+## Design docs
+
+Both papers are at the workspace root:
+
+- [`twist_shout.pdf`](../../TwistShout.pdf) — original Twist/Shout protocol.
+- [`twist_shout_logup_star.pdf`](../../twist_shout_logup_star.pdf) — LogUp\*
+  reformulation. Key sections referenced by the bench: §4.1 (batching),
+  §5.1 (Shout), §5.2 (Twist), Figure 1 (GKR pushforward), eq. 6
+  (Inc-evaluation, out of scope for the bench).
+
+Two design docs map the bench code to the paper sections and to the Jolt
+codebase:
+
+- [DESIGN_DORY.md](DESIGN_DORY.md) — the Dory side: which polynomials Jolt
+  commits (Shout: `InstructionRa`, `BytecodeRa`; Twist: `RamRa`,
+  `RamInc`; plus `RdInc`), how the bench builds them, the Dory API path,
+  and divergences from jolt-core's production prover.
+- [DESIGN_WHIR.md](DESIGN_WHIR.md) — the WHIR + LogUp\* side: the
+  argmax transformation (§5.1 / §5.2), the field-agnostic dump format,
+  the size-class commit with 3 per-family eq-weighted pushforwards
+  (§4.1), PAZK §4.5.2 claim reduction (specialized to shared
+  `(r_row, r_col)`), and the Figure-1 eq-weighted fan-in-2 fractional
+  GKR pushforward prover.
 
 ---
 
@@ -42,18 +78,34 @@ a new `MontConfig` plus an extension field).
    - `RamRa` (4 chunks)
    - `RdInc`, `RamInc` (dense T-vectors)
 3. Times Dory's `commit` on every one of those (40 sparse one-hot + 2 dense calls).
-4. Applies the LogUp\* transformation per `twist_shout_logup_star.pdf` §5.1 / §5.2:
-   each one-hot chunk becomes a dense `ra_dense ∈ F^T` (the argmax index per cycle,
-   already stored that way in Jolt) plus a pushforward `P ∈ F^K`.
-5. Asserts 5 transformation invariants (`verify.rs`).
-6. Serializes the LogUp\*-transformed polynomials to disk as **raw integers**
-   (u8 ra_dense, u32 pushforward, i128 RdInc/RamInc). The dump is
-   field-agnostic — no BN254 Fr ever appears in the file. ~41 MB total.
-7. A sibling binary `whir-pcs-bench` (separate workspace, see below) reads the
-   dump, encodes each integer into the chosen WHIR target field (`bn254` or
-   `goldilocks-fp3`) at load time, and times WHIR-ZK's `commit`.
-8. The orchestrator script combines both JSON reports into a side-by-side table
-   showing Dory vs each WHIR field choice.
+4. Applies the §5.1 / §5.2 dense-encoding step: each one-hot chunk becomes
+   a dense `ra_dense ∈ F^T` (the argmax index per cycle — Jolt already
+   stores it that way as `Vec<Option<u8>>`). No pushforward is produced
+   here — the eq-weighted pushforward depends on Fiat-Shamir randomness
+   that lives in the WHIR-side transcript, so it's built at runtime later.
+5. Asserts argmax / size invariants (`verify.rs`). The dump still emits a
+   legacy per-chunk u32 histogram for backward compatibility, but the
+   WHIR side discards it on load.
+6. Serializes ra_dense (u8) + the legacy histograms (u32) + dense
+   (`RdInc`, `RamInc` as i128) to disk as raw integers — field-agnostic,
+   ~41 MB total.
+7. A sibling binary `whir-pcs-bench` (separate workspace, see below) reads
+   the dump, encodes each integer into the chosen WHIR target field
+   (`bn254` or `goldilocks-fp3`).
+8. **Per family** (3 families: InstructionRa with d=32, BytecodeRa d=4,
+   RamRa d=4) the sibling binary builds one eq-weighted pushforward
+   `P^F = M^(*)_dense_∗ eq_{r_M_row}` (per LogUp\* §4 eq. 4) and commits
+   it via WHIR — so the WHIR commit phase sees 40 `ra_dense` + 2 dense +
+   **3** eq-weighted `P^F`.
+9. The sibling binary then runs the **Figure-1 LogUp\* prover** per
+   family: PAZK §4.5.2 claim reduction (specialized: free in our case),
+   the eq-weighted P^F materialization, and a fan-in-2 fractional-add
+   GKR proving `Σ_j eq(bits(j), r_M_row) / (α − M^(*)[j]) == Σ_k P^F[k] /
+   (α − k)`. Time reported across `claim_eval_ms` (d MLE evals per
+   family) and `gkr_ms` (everything else).
+10. The orchestrator script combines all JSON reports into a side-by-side
+   table showing Dory commit vs each WHIR field choice's commit /
+   claim_eval / gkr / combined cost.
 
 ---
 
@@ -90,7 +142,11 @@ Both binaries exchange polynomials via a tiny binary file format (`dump.rs` /
 crates/jolt-pcs-bench/
 ├── Cargo.toml
 ├── README.md                ← this file
+├── DESIGN_DORY.md           ← Dory bench ↔ Twist/Shout paper ↔ Jolt codebase
+├── DESIGN_WHIR.md           ← WHIR + LogUp* + GKR bench ↔ paper ↔ Jolt codebase
+├── PROFILING.md             ← per-config wall-clock + dhat breakdown
 ├── run-bench.sh             ← orchestrator: builds both, runs both, combines JSON
+├── profile.sh               ← captures samply + chrome + dhat traces
 └── src/
     ├── main.rs              ← CLI, JSON output, glue
     ├── workload.rs          ← ECDSA guest compile → trace → CommitmentTraceSources
@@ -98,37 +154,36 @@ crates/jolt-pcs-bench/
     │                          copy of `AddressMajorOneHotPolynomial` (mirrors
     │                          `crates/jolt-prover/src/stages/commitment.rs`)
     ├── logup_star.rs        ← §5.1 / §5.2 LogUp* transformation
-    ├── verify.rs            ← 5 invariants on the transformation
+    ├── verify.rs            ← argmax / size invariants on ra_dense. (The
+    │                           legacy per-chunk histogram invariant is now
+    │                           moot — the WHIR side rebuilds P^F at runtime.)
     ├── dory_bench.rs        ← DoryScheme::commit timing
     └── dump.rs              ← Polynomial dump format consumed by whir-pcs-bench
 
 ../../../whir-pcs-bench/      ← sibling crate, separate workspace
 ├── Cargo.toml               ← pins blake3 = "=1.8.3" to keep digest 0.10
+├── README.md                ← WHIR-side overview + how to run
 └── src/
-    └── main.rs              ← whir_zk::Config::commit timing
+    ├── main.rs              ← read dump, encode to F, commit + GKR timing
+    └── gkr.rs               ← fan-in-2 fractional GKR pushforward prover
 ```
 
 ---
 
-## The LogUp* transformation (what's actually swapped)
+## The LogUp\* protocol (one-paragraph summary)
 
-The paper is at `jolt/twist_shout_logup_star.pdf`. Concretely, this bench
-implements §5.1 (Shout) and §5.2 (Twist) commitment transformations:
-
-| Family                             | Dory layout                  | WHIR (LogUp\*) layout               |
-| ---------------------------------- | ---------------------------- | ----------------------------------- |
-| `InstructionRa(i)`, i=0..32        | sparse one-hot `K_chunk × T` | `ra_dense ∈ F^T` + `P ∈ F^K_chunk`  |
-| `BytecodeRa(i)`, i=0..4            | sparse one-hot `K_chunk × T` | `ra_dense ∈ F^T` + `P ∈ F^K_chunk`  |
-| `RamRa(i)`, i=0..4                 | sparse one-hot `K_chunk × T` | `ra_dense ∈ F^T` + `P ∈ F^K_chunk`  |
-| `RdInc`, `RamInc`                  | dense `F^T`                  | dense `F^T` (unchanged)             |
-| `TrustedAdvice`, `UntrustedAdvice` | dense `F^T`                  | dense `F^T` (unchanged; not in ECDSA workload) |
-
-**Argmax extraction is trivial here** because Jolt already stores the one-hot
-polynomial as a `Vec<Option<u8>>` of indices (the §5.1 dense form). The
-"transformation" is just casting indices to `Fr` and computing the histogram.
-
-**Pushforward `P[k]`** is `count(j : ra_dense[j] == k)`. For Jolt's setting,
-`K_chunk = 16` (since `log_k_chunk = 4`).
+Each one-hot chunk `ra(k, j) ∈ {0,1}^{K_chunk × T}` becomes a dense
+`ra_dense ∈ F^T` (the argmax index per cycle — Jolt already stores this).
+The d chunks per family are row-concatenated into `M^(*) ∈ F^{T·d}`
+(§4.1). Per family, the prover commits **one** eq-weighted pushforward
+`P^F[k] = Σ_{j : M^(*)[j] = k} eq(bits(j), r_M_row)` (LogUp\* §4 eq. 4) —
+not a histogram. After the upstream sumcheck provides d input claims
+`M̃^(i)(r_row, r_col)`, PAZK §4.5.2 reduces them to one combined claim,
+and Figure 1's eq-weighted fan-in-2 fractional GKR proves well-formedness
+of P^F. Dense oracles `RdInc`/`RamInc` are unchanged. Pushforwards are
+padded to 2^15 zeros (whir_zk blinding minimum). Across the 3 Jolt
+families, **3 pushforwards are committed total** (not 40). See
+[DESIGN_WHIR.md](DESIGN_WHIR.md) for the full mapping to the paper.
 
 ---
 
@@ -144,9 +199,6 @@ declared in the guest at [examples/p256-ecdsa-verify/guest/src/lib.rs:5](../../e
 The actual ECDSA trace is shorter; the rest is NoOp padding. Both the actual
 cycle count and the padded trace length are reported to stdout on every run.
 
-(Earlier iterations of this bench used `secp256k1-ecdsa-verify` at 2^18; we
-switched to P-256 because its `max_trace_length` matches the 2^19 target from
-the original GOAL.md and exercises Jolt at one cycle-doubling further.)
 
 ### 2. Test vectors
 
@@ -212,18 +264,26 @@ comment at `logup_star.rs:18-26`.
 `whir_zk::Config::commit` requires uniform-size vectors. We bucket polynomials
 into two size classes:
 
-- `num_vars = 15` (2^15 = 32768): all 40 pushforward vectors
-- `num_vars = 19` (2^19 = 524288): all 40 `ra_dense` + `RdInc` + `RamInc`
+- `num_vars = 15` (2^15 = 32768): **3** eq-weighted pushforward vectors
+  (one per family — InstructionRa, BytecodeRa, RamRa — per LogUp\* §4.1).
+- `num_vars = 19` (2^19 = 524288): all 40 `ra_dense` + `RdInc` + `RamInc`.
 
 Each class is committed in one batched `commit` call. The reported WHIR
-wall-clock is the sum of both calls.
+wall-clock is the sum of both calls. The drop from 40 to 3 pushforwards
+in the small class accounts for most of the `commit_ms` reduction vs the
+prior milestone.
 
 ### 9. Field-agnostic dump format (integer-form, version 2)
 
 The dump stores **raw integer values** rather than pre-encoded Fr field elements:
 
 - `ra_dense` chunks: `Vec<u8>` (1 byte per cycle) — argmax index ∈ [0, 16).
-- `pushforward` vectors: `Vec<u32>` (4 bytes per bucket) — histogram count.
+- `pushforward::<family>_<chunk>` vectors: `Vec<u32>` (4 bytes per bucket).
+  **Legacy field**: these are the unweighted per-chunk histograms from the
+  pre-§4.1 design. The WHIR side ignores them on load and rebuilds the
+  per-family eq-weighted `P^F` at runtime. Kept in the dump format
+  (version 2) to avoid touching the Jolt-side dump writer for a research
+  bench.
 - `RdInc`, `RamInc`: `Vec<i128>` (16 bytes per cycle) — signed RAM/register increments.
 
 Each WHIR target field independently encodes these integers at load time via
@@ -303,7 +363,36 @@ Other useful flags:
 - `--verify-only` (jolt-pcs-bench): runs only the transformation invariants, no timing.
 - `--no-dory`: skip the Dory bench (e.g. to re-dump without re-running Dory).
 - `--no-dump`: skip writing the polynomial dump file.
-- `--field {bn254|goldilocks-fp3}` (whir-pcs-bench): pick the scalar field.
+- `--no-gkr` (whir-pcs-bench): skip the LogUp\* GKR phase entirely. With
+  this flag the per-family eq-weighted pushforwards are NOT built and
+  NOT committed, so `commit_ms` only covers `ra_dense` + 2 dense
+  oracles — useful for isolating the pure commit-phase cost.
+- `--field {bn254 | goldilocks-fp3}` (whir-pcs-bench): pick the scalar field.
+
+## Profiling
+
+Both binaries support three profile types:
+
+- **`--trace-chrome <path>`** — writes a tracing-chrome span tree (view at
+  https://ui.perfetto.dev/). Captures bench-side spans + all WHIR internal
+  `#[instrument]` spans (irs_commit, sumcheck, matrix_commit, etc.).
+- **`--profile-alloc --dhat-output <path>`** — captures a dhat heap profile
+  (view at https://nnethercote.github.io/dh_view/dh_view.html). Requires
+  `cargo build --features profile-alloc`.
+- **samply** — CPU sampling profile (run `samply record -- target/samply/<bin> [args]`).
+  Both crates have a `[profile.samply]` block: `cargo build --profile samply`.
+
+One-shot orchestrator captures all three for all three configs:
+
+```bash
+crates/jolt-pcs-bench/profile.sh all --all
+# Artifacts under /tmp/jolt-pcs-bench/traces/{dory,whir-bn254,whir-fp3}/
+```
+
+See [PROFILING.md](PROFILING.md) for the per-config wall-clock and allocation
+breakdown tables, the validated bench-side wins, the GKR per-layer
+breakdown, and the documented WHIR-internal hot paths (out-of-scope for the
+bench-side work but prioritized for any future upstream work).
 
 ---
 
@@ -320,59 +409,133 @@ d-factors:    instruction_d=32, bytecode_d=4, ram_d=4
 
 Polynomial inventory:
   Dory  (one-hot, BN254):            336.6M field elements (32 B/elem)
-  WHIR  (LogUp*+dense, BN254):       23.3M field elements (32 B/elem)
-  WHIR  (LogUp*+dense, Fp3-Gold):    23.3M field elements (24 B/elem)
+  WHIR  (LogUp*+dense, BN254):       22.1M field elements (32 B/elem)
+  WHIR  (LogUp*+dense, Fp3-Gold):    22.1M field elements (24 B/elem)
 
-  Ratio Dory/WHIR (by element):     14.43x  (WHIR is 6.9% of Dory)
+  Ratio Dory/WHIR (by element):     15.22x  (WHIR is 6.6% of Dory)
 
 Timing:
-  Dory       (BN254)     min= 5278.1ms  median= 5299.7ms  max= 5476.4ms  (336.6M elems)
-  WHIR-ZK BN254          min= 5505.0ms  median= 5635.0ms  max= 6688.0ms  (23.3M elems  32B/elem)  encode=0.37s
-  WHIR-ZK Goldilocks Fp3 min= 4522.1ms  median= 4785.4ms  max= 4984.5ms  (23.3M elems  24B/elem)  encode=0.06s
+  Dory       (BN254)     min= 5259.3ms  median= 5287.1ms  max= 5470.7ms  (336.6M elems)
+  WHIR-ZK BN254 commit   min= 5281.8ms  median= 5296.6ms  max= 5370.4ms  (22.1M elems  32B/elem)  encode=0.42s
+    ├─ claim_eval         min=   88.7ms  median=   90.4ms  max=   92.6ms  (d MLE evals per family)
+    ├─ gkr (eq-weighted)  min= 4353.4ms  median= 4478.0ms  max= 4651.8ms  (3 families, max A-depth=24)
+    └─ commit + LogUp*   min= 9723.9ms  median= 9864.1ms  max=10113.2ms
+  WHIR-ZK Goldilocks Fp3 commit min= 3201.4ms  median= 3201.7ms  max= 3249.4ms  (22.1M elems  24B/elem)  encode=0.09s
+    ├─ claim_eval         min=   72.5ms  median=   73.4ms  max=   74.9ms  (d MLE evals per family)
+    ├─ gkr (eq-weighted)  min= 2813.4ms  median= 2817.1ms  max= 2874.6ms  (3 families, max A-depth=24)
+    └─ commit + LogUp*   min= 6088.2ms  median= 6092.3ms  max= 6198.1ms
 
 Wall-clock ratios (WHIR / Dory):
-  WHIR-ZK BN254          1.06x
-  WHIR-ZK Goldilocks Fp3 0.90x
+  WHIR-ZK BN254          commit-only:     1.00x
+  WHIR-ZK BN254          commit + LogUp*: 1.87x
+  WHIR-ZK Goldilocks Fp3 commit-only:     0.61x
+  WHIR-ZK Goldilocks Fp3 commit + LogUp*: 1.15x
 ```
 
 Both binaries emit JSON reports (`dory.json`, `whir-bn254.json`,
 `whir-goldilocks.json`); the orchestrator merges them into `combined.json`.
+The WHIR-side report includes a `gkr` block with `min_ms`, `median_ms`,
+`max_ms`, plus nested `claim_eval_ms` and `gkr_only_ms` sub-blocks, plus
+`per_family_ms` (3 entries: per-family A-side+B-side GKR cost) and
+`per_layer_ms` (max-A-depth entries, default 24: per-layer sumcheck cost
+summed across the 3 families that reach each layer).
 
 ---
 
 ## What the numbers mean
 
-Reference measurements from this machine (Apple M-series; 1 warmup, 5 runs;
-`p256-ecdsa-verify` workload at T = 2^19 cycles):
+Reference measurements from this machine (Apple M-series; 1 warmup × 5
+runs; `p256-ecdsa-verify` at T = 2^19; `run-bench.sh --field both`). The
+bench reports three timing phases plus the combined total.
 
-| Scheme                         | Median wall-clock | Field elements | Bytes / elem | vs Dory       |
-| ------------------------------ | ----------------: | -------------: | -----------: | ------------- |
-| **Dory (BN254)**               |          5300 ms  |        336.6 M |        32 B  | baseline      |
-| **WHIR-ZK BN254**              |          5635 ms  |         23.3 M |        32 B  | 1.06x slower  |
-| **WHIR-ZK Goldilocks Fp3**     |          4785 ms  |         23.3 M |        24 B  | **0.90x — 10% faster** |
+### Per-phase wall-clock (medians over 5 measured runs)
 
-Three observations:
+| Scheme                       | commit ms | claim_eval ms | gkr ms | total LogUp\* ms | commit + LogUp\* |
+| ---------------------------- | --------: | ------------: | -----: | ---------------: | ---------------: |
+| **Dory (BN254)** — baseline  | 5287.1    | —             | —      | —                | 5287.1           |
+| **WHIR-ZK BN254**            | 5296.6    | 90.4          | 4478.0 | 4568.4           | 9864.1           |
+| **WHIR-ZK Goldilocks Fp3**   | 3201.7    | 73.4          | 2817.1 | 2890.5           | 6092.3           |
 
-1. **Field-element reduction**: WHIR commits 14.43x fewer field elements than
-   Dory (6.9% of Dory's count). This matches the paper's ~6.5% prediction; the
-   small overshoot is the pushforward padding to 2^15 (~25% of WHIR's budget),
-   unavoidable for ZK at 128-bit security.
+### Min / median / max across 5 runs
 
-2. **BN254 wall-clock**: WHIR-ZK on BN254 is ~6% *slower* than Dory wall-clock
-   despite committing 14x fewer elements. WHIR-ZK's per-element cost on BN254
-   is ~15x Dory's per-element cost, which roughly cancels the data-volume win.
+| Scheme                       | min ms | median ms | max ms |
+| ---------------------------- | -----: | --------: | -----: |
+| **Dory (BN254)**             | 5259.3 | 5287.1    | 5470.7 |
+| WHIR-ZK BN254 — commit only  | 5281.8 | 5296.6    | 5370.4 |
+| WHIR-ZK BN254 — claim_eval   |   88.7 |   90.4    |   92.6 |
+| WHIR-ZK BN254 — gkr          | 4353.4 | 4478.0    | 4651.8 |
+| WHIR-ZK BN254 — commit + LogUp\* | 9723.9 | 9864.1 | 10113.2 |
+| WHIR-ZK Fp3 — commit only    | 3201.4 | 3201.7    | 3249.4 |
+| WHIR-ZK Fp3 — claim_eval     |   72.5 |   73.4    |   74.9 |
+| WHIR-ZK Fp3 — gkr            | 2813.4 | 2817.1    | 2874.6 |
+| WHIR-ZK Fp3 — commit + LogUp\* | 6088.2 | 6092.3 | 6198.1 |
 
-3. **Goldilocks Fp3 wall-clock**: switching the WHIR field to the 192-bit cubic
-   extension of Goldilocks finally tips the comparison: WHIR-ZK becomes 10%
-   faster than Dory on the same workload, with the same 14.43x reduction in
-   element count and a 25% smaller per-element footprint (24 B vs 32 B). The
-   reduction in arithmetic cost per element (Fp3 multiplications dominate
-   ~3 × 64-bit instead of one 254-bit) is what does it.
+### Four scenarios vs Dory baseline (wall-clock ratio)
 
-In short: **on BN254 alone, LogUp\* + WHIR-ZK does not buy you wall-clock; on
-Goldilocks Fp3 it does, by ~10%, plus the smaller commitment / proof footprint
-that comes with a smaller field.** The next milestone is whether the GKR
-pushforward proving overhead (currently out of scope) preserves this win.
+| Scenario | median ms | vs Dory (5287 ms) |
+| --- | --: | --: |
+| WHIR-ZK BN254, commit only | 5296.6 | **1.00x** (parity) |
+| WHIR-ZK BN254, commit + LogUp\* | 9864.1 | **1.87x slower** |
+| WHIR-ZK Goldilocks Fp3, commit only | 3201.7 | **0.61x** (≈ 40 % faster) |
+| WHIR-ZK Goldilocks Fp3, commit + LogUp\* | 6092.3 | **1.15x slower** |
+
+Numbers above are paper-faithful: §4.1 batching (3 family-level
+eq-weighted pushforwards, not 40 per-chunk unweighted histograms),
+PAZK §4.5.2 claim reduction, and Figure-1 eq-weighted fan-in-2
+fractional GKR. The prior milestone's wrong-shape unweighted-histogram
+implementation has been retired. See [DESIGN_WHIR.md](DESIGN_WHIR.md)
+for the full mapping to the paper.
+
+### Polynomial inventory at this workload
+
+| Side | What's committed | Total field elements |
+|---|---|---:|
+| Dory | 40 sparse one-hot chunks + 2 dense (RdInc, RamInc) | 336.6 M |
+| WHIR (both fields) | 40 ra_dense + **3 eq-weighted P^F** + 2 dense | **22.1 M** |
+
+Dory/WHIR element ratio: **15.22x** (WHIR commits 6.6 % of Dory's element count).
+
+### Six observations
+
+1. **Field-element reduction**: WHIR's small size class is **3 P^F**
+   (one per family — InstructionRa, BytecodeRa, RamRa) instead of 40
+   per-chunk. Total committed-element count goes from 23.3 M (pre-§4.1
+   milestone) to 22.1 M (~5 % reduction); `commit_ms` benefits more
+   than the element count alone suggests because fewer per-class
+   commit calls reduces WHIR-side `Config` setup overhead.
+
+2. **`claim_eval_ms` is in the noise** (~70–95 ms). These are the d MLE
+   evaluations `M̃^(i)(r_row, r_col)` per family — §4.5.2's inputs. In a
+   real protocol they come from upstream sumcheck binding, but the bench
+   reports them separately so reviewers can attribute as they see fit.
+   Even if you count them in full, they shift the ratios by ≤ 1.5 %.
+
+3. **`gkr_ms` dominates the LogUp\* overhead** at both fields (~98 % of
+   `total LogUp*`). InstructionRa's batched A-circuit (depth 24, 32
+   chunks concatenated) accounts for ~78 % of `gkr_ms`; the deepest
+   sumcheck round (layer 23) is ~32 % of `gkr_ms` on its own.
+
+4. **§4.5.2 prover cost is essentially free** in our setting. The PAZK
+   canonical-curve construction for d generic points would cost O(d ·
+   log W · 2^{log W}) ≈ 12 G field ops for InstructionRa — but in Jolt the
+   d input points share `(r_row, r_col)` and §4.5.2 collapses to a single
+   eq-weighted linear combination over the chunk dimension. Documented in
+   [DESIGN_WHIR.md §2.1](DESIGN_WHIR.md#21-§452-collapsed-to-a-linear-combination).
+
+5. **Commit-only vs Dory**: WHIR-BN254 commit is at **parity** with
+   Dory (1.00x). WHIR-Fp3 commit is **~40 % faster** than Dory commit
+   (0.61x), thanks to the 24 B/elem footprint vs Dory's 32 B/elem and
+   the 15.22x element-count reduction together overcoming WHIR's higher
+   per-element cost.
+
+6. **Combined commit + LogUp\* vs Dory**: BN254 lands at **1.87x slower**;
+   **Fp3 at 1.15x slower** — much closer than the previous (incorrect,
+   unweighted-histogram) milestone suggested. The interesting future
+   question is whether the leaf-claim PCS openings (out of scope for
+   this bench) can be done with a single batched WHIR opening at
+   `log_t + log_d` variables,
+   at which point WHIR's smaller commitment footprint may outweigh the
+   GKR overhead.
 
 ---
 
@@ -383,116 +546,10 @@ The bench mirrors the **Bolt-codegen commit path** in
 prover in `jolt-core/src/zkvm/prover.rs`. Both crates commit the same logical
 polynomials and produce the same final commitments, but they differ in
 *how* the commit is performed. The bench reports the Bolt path's wall-clock,
-which is the slower of the two equivalent paths. The differences are:
+which is the slower of the two equivalent paths.
 
-### Divergence 1: Dory layout (CycleMajor streaming vs AddressMajor non-streaming)
-
-**jolt-core** ([prover.rs:719](../../jolt-core/src/zkvm/prover.rs#L719)): branches
-on `DoryGlobals::get_layout()`. Default is `DoryLayout::CycleMajor`
-([dory_globals.rs:53](../../jolt-core/src/poly/commitment/dory/dory_globals.rs#L53)),
-which takes the streaming path: cycles are pulled in row-band chunks via
-`lazy_trace.iter_chunks(row_len)`, each band's witness is generated and
-committed via `StreamingCommitmentScheme::process_chunk*` /
-`aggregate_chunks`. The full trace and full witness are never materialized
-simultaneously.
-
-**Bolt** ([commitment.rs:543](commitment.rs#L543)): uses `DoryLayout::AddressMajor`
-implicitly via the duplicated `AddressMajorOneHotPolynomial`. The
-non-streaming branch in jolt-core's `else if AddressMajor` runs
-([prover.rs:725-744](../../jolt-core/src/zkvm/prover.rs#L725-L744)):
-`lazy_trace.collect::<Vec<Cycle>>()` materializes the full trace, then per
-polynomial `generate_witness(...)` materializes the full
-`MultilinearPolynomial<F>`, then `CommitmentScheme::commit` does a one-shot
-commit. Same final commitment, different cache/memory profile.
-
-**Impact on bench numbers**: the bench measures the Bolt AddressMajor path.
-jolt-core's CycleMajor streaming path is typically ~15-25% faster on the
-same workload at T = 2^19 due to better cache locality, no full-witness
-materialization, and a CycleMajor-specific fast path in
-`OneHotPolynomial::commit_rows`
-([one_hot_polynomial.rs:137-171](../../jolt-core/src/poly/one_hot_polynomial.rs#L137-L171)).
-
-### Divergence 2: Dense-poly Fr materialization (lazy `CompactPolynomial<i128>` vs eager `Vec<Fr>`)
-
-**jolt-core** ([witness.rs:184, 199](../../jolt-core/src/zkvm/witness.rs#L184)):
-`RdInc`/`RamInc` produce a `Vec<i128>` then `coeffs.into()` wraps it as
-`MultilinearPolynomial::I128Scalars(CompactPolynomial<i128, F>)`. The Dory
-commit converts `i128 → Fr` lazily inside `for_each_row` / `for_each_nonzero`
-and can skip zero-valued cycles entirely.
-
-**Bolt** ([commitment.rs:511-518](commitment.rs#L511-L518)): eagerly calls
-`dense_i128_column_to_field(sources.rd_inc, target_len)` to materialize the
-full `Vec<Fr>` up front, then `DoryScheme::commit_evaluations_with_row_len`.
-The bench mirrors this exactly (`jolt_polys::build_polynomial_set` calls
-`dense_i128_column_to_field`).
-
-**Impact on bench numbers**: at ECDSA roughly half of `RdInc/RamInc` cycles
-have `inc = 0` (NoOp cycles, or cycles without register/RAM writes). jolt-core
-skips those in the MSM entirely; the bench does T Montgomery encodings up
-front and pays Pedersen-MSM cost on all T elements. Small absolute impact
-(only 2 dense polys vs 40 one-hot chunks), but real.
-
-### Divergence 3: Sparse one-hot wrapper (`OneHotPolynomial` vs `AddressMajorOneHotPolynomial`)
-
-Both go through `DoryScheme::commit`'s sparse path and ultimately call the
-same batched-G1-addition kernel
-(`jolt_crypto::ec::bn254::batch_addition::batch_g1_additions_multi_affine` —
-see [scheme.rs:478-484](../jolt-dory/src/scheme.rs#L478-L484) for the Bolt
-side and [one_hot_polynomial.rs:148-149, 195](../../jolt-core/src/poly/one_hot_polynomial.rs#L148)
-for the jolt-core side).
-
-However, jolt-core's `OneHotPolynomial::commit_rows` has a
-**CycleMajor-specific fast path** for the common case `t / row_len >=
-num_threads` ([one_hot_polynomial.rs:137-171](../../jolt-core/src/poly/one_hot_polynomial.rs#L137-L171))
-that pre-groups column indices by address per chunk, reducing scatter cost.
-The bench's `AddressMajorOneHotPolynomial::for_each_nonzero` takes the
-generic path. This is a consequence of Divergence 1 and not a separate
-divergence — but worth knowing about if you profile.
-
-### Divergence 4: Commit-plan construction (Bolt static vs jolt-core dynamic)
-
-**jolt-core**: zero static plan. At runtime, [prover.rs:715](../../jolt-core/src/zkvm/prover.rs#L715)
-calls `all_committed_polynomials(&one_hot_params)` ([witness.rs:47](../../jolt-core/src/zkvm/witness.rs#L47))
-which returns a `Vec<CommittedPolynomial>` whose length and chunk indices
-adapt to whatever `instruction_d`, `bytecode_d`, `ram_d` come from the
-runtime workload. Each enum variant carries its own dispatch info; the
-prover's commit loop is a single `polys.par_iter().map(|poly_id| ...)`.
-
-**Bolt**: the `COMMITMENT_PROGRAM` constant at
-[commitment.rs:1318-1424](commitment.rs#L1318-L1424) is a `&'static` array of
-literal oracle name strings (`"InstructionRa_0", "InstructionRa_1", …`) with
-hardcoded `num_vars`. The current in-tree values are sized for **muldiv at
-T = 2^16, bytecode_k = 2^12** (`num_vars: 16` dense, `num_vars: 20` one-hot,
-`BytecodeRa_0..2` = bytecode_d = 3). For ECDSA at T = 2^19, the right values
-are `num_vars: 19` dense, `num_vars: 23` one-hot, `BytecodeRa_0..3` =
-bytecode_d = 4. Running `prove_commitment_phase()` for ECDSA against the
-in-tree static plan would hit `PlanCountMismatch` or `OracleTooLarge` errors.
-
-Bolt's MLIR codegen pipeline regenerates `commitment.rs` per
-`(guest, max_trace_length)` pair; the file you see in tree is just whichever
-plan was last regenerated. **The bench bypasses Bolt's static plan entirely**
-and reconstructs the polynomial list from `OneHotParams::new(log_T,
-bytecode_k, ram_k)` at runtime — the same dynamic-plan approach jolt-core
-uses. This is necessary: no ECDSA codegen for the static plan exists in tree.
-
-### Divergence 5: `ram_K` bytecode-end clamp (previously missing, now fixed)
-
-**jolt-core** ([prover.rs:414-433](../../jolt-core/src/zkvm/prover.rs#L414-L433))
-computes `ram_K` as `max(largest_runtime_ram_address, bytecode_end + 1)`
-then `.next_power_of_two()`. The bytecode-end term ensures `ram_K` is large
-enough to index the static bytecode image even for workloads that barely
-touch RAM at runtime.
-
-**The bench** originally only took the runtime maximum, skipping the
-bytecode-end clamp. For ECDSA the heap reach (~2^14 = 16384) already
-dominated `bytecode_end + 1` so the two formulas coincided. For a workload
-that barely touches RAM, the bench would have computed a *smaller* `ram_K`
-than jolt-core, leading to a smaller `ram_d` and a different `RamRa`
-decomposition. **Fixed** in `workload.rs` by importing
-`jolt_core::zkvm::ram::RAMPreprocessing::preprocess(memory_init)` and
-clamping with the same formula. ECDSA numbers are unchanged (`ram_k=16384`).
-
-### Summary
+The five divergences (each spelled out with line refs in
+[DESIGN_DORY.md §6](DESIGN_DORY.md#6-divergences-from-jolt-cores-production-prover)):
 
 | # | Divergence              | jolt-core | Bolt / bench | Affects ECDSA numbers? |
 | - | ----------------------- | --------- | ------------ | ---------------------- |
@@ -502,13 +559,15 @@ clamping with the same formula. ECDSA numbers are unchanged (`ram_k=16384`).
 | 4 | Commit-plan construction | Dynamic (runtime) | Static (codegen per workload) | No — bench bypasses Bolt's static plan |
 | 5 | `ram_K` bytecode clamp  | Clamped | **Now clamped (was missing)** | No for ECDSA; previously yes for sparse-RAM workloads |
 
-The bench's published `Dory ~5300 ms` measures the Bolt AddressMajor +
+Bottom line: the bench's Dory wall-clock measures the Bolt AddressMajor +
 non-streaming + eager-Fr path. Against jolt-core's production CycleMajor +
 streaming + lazy-i128 path, expect ~15-30% headroom in Dory's favor. The
-"WHIR-Fp3 is 10% faster than Dory" claim is therefore *true vs the Bolt
-path the bench measures, possibly false vs jolt-core's optimized path*.
-Adding a `--prover-path {bolt, jolt-core}` flag is a ~2-3 hour follow-up if
-you want production-vs-WHIR numbers.
+"WHIR-Fp3 commit is ~15% faster than Dory" claim is therefore *true vs the
+Bolt path the bench measures, possibly false vs jolt-core's optimized
+path*. Adding a `--prover-path {bolt, jolt-core}` flag is a ~2-3 hour
+follow-up if you want production-vs-WHIR numbers. The GKR-vs-Dory
+combined ratio (~1.32x for Fp3) shifts further in Dory's favor under that
+adjustment.
 
 ---
 
@@ -516,27 +575,47 @@ you want production-vs-WHIR numbers.
 
 (Explicit so the scope of the conclusion above is unambiguous.)
 
-- Opening proofs (just the commit step).
-- The GKR pushforward proving overhead. The pushforward vectors P[k] are
-  committed via WHIR (matching what a real LogUp\* prover would do), but the
-  cost of *proving* P was derived correctly from ra_dense is not measured.
-- Sumcheck / Spartan / BlindFold prover overhead.
-- Anything that touches the Jolt prover crate. This bench is read-only with
+- **PCS opening proofs.** The bench stops once the WHIR commit returns
+  and the GKR leaf-claim transmissions are sent. A real LogUp\* prover
+  would continue with batched PCS openings on `ra_dense` and `P` at the
+  GKR's final randomness; that cost is not measured.
+- **Sumcheck / Spartan / BlindFold prover overhead.** This bench is
+  about the polynomial-commitment phase, not the rest of the Jolt
+  proving pipeline.
+- **Anything that touches the Jolt prover crate.** Read-only with
   respect to `crates/jolt-prover`.
-- Dory on a non-BN254 field. The Dory side is the comparison baseline; it must
-  match the field Jolt's prover actually uses.
-- BabyBear / KoalaBear / Mersenne31. Adding any of these requires a new
-  `MontConfig` plus an extension field (Fp4 or Fp5) for 128-bit soundness, plus
-  reduction handling for the i128 `RdInc/RamInc` values which don't fit in
-  a 31-bit prime. Deferred to a follow-up milestone if Goldilocks Fp3 motivates
-  pushing further toward small fields.
+- **Dory on a non-BN254 field.** Dory is the baseline; it must match the
+  field Jolt's prover actually uses.
+- **Verifier work.** The bench measures the prover only. Internal
+  soundness is enforced via the GKR root cross-multiplication assert
+  (`N_A·D_B == N_B·D_A` per pair).
+- **BabyBear / KoalaBear / Mersenne31.** Adding any of these requires a
+  new `MontConfig` plus an extension field (Fp4 or Fp5) for 128-bit
+  soundness, plus reduction handling for the `i128` `RdInc`/`RamInc`
+  values which don't fit in a 31-bit prime. Deferred follow-up.
 
 ---
 
 ## Critical files referenced
 
-- The paper: [twist_shout_logup_star.pdf](../../twist_shout_logup_star.pdf)
-  (§5.1 Shout, §5.2 Twist, eq.6 Inc-evaluation)
+Papers (workspace root):
+
+- [twist_shout.pdf](../../TwistShout.pdf) — original Twist/Shout (Shout: §5.1,
+  Twist: §5.2 of the LogUp\* paper's numbering; the original paper uses
+  different section numbers).
+- [twist_shout_logup_star.pdf](../../twist_shout_logup_star.pdf) — LogUp\*
+  reformulation. Sections used by the bench: §4.1 (batching across pairs),
+  §5.1 (Shout via ra_dense), §5.2 (Twist via wa_dense + virtual wv/Val),
+  Figure 1 (GKR pushforward circuit), eq. 6 (Inc-evaluation, out of scope).
+
+Bench design docs:
+
+- [DESIGN_DORY.md](DESIGN_DORY.md) — Dory bench ↔ Twist/Shout ↔ Jolt code.
+- [DESIGN_WHIR.md](DESIGN_WHIR.md) — WHIR + LogUp\* + GKR bench ↔ paper ↔ Jolt code.
+- [PROFILING.md](PROFILING.md) — span tree breakdown, dhat allocation, GKR per-layer table.
+
+Jolt internals (referenced by both DESIGN docs):
+
 - ECDSA guest: [examples/p256-ecdsa-verify/guest/src/lib.rs](../../examples/p256-ecdsa-verify/guest/src/lib.rs)
 - Trace extraction: [crates/jolt-trace/src/extract.rs](../jolt-trace/src/extract.rs)
 - Witness builders: [crates/jolt-witness/src/lib.rs](../jolt-witness/src/lib.rs)
@@ -545,3 +624,4 @@ you want production-vs-WHIR numbers.
   [crates/jolt-prover/src/stages/commitment.rs](../jolt-prover/src/stages/commitment.rs)
 - Dory commit: [crates/jolt-dory/src/scheme.rs](../jolt-dory/src/scheme.rs)
 - WHIR-ZK commit: `../../../whir/src/protocols/whir_zk/`
+- GKR prover (bench-local): `../../../whir-pcs-bench/src/gkr.rs`

@@ -52,6 +52,17 @@ rayon = { workspace = true }
 serde = { workspace = true, features = ["derive"] }
 serde_json = "1"
 tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+tracing-chrome = { workspace = true }
+# Allocation profiling — opt-in via `--features profile-alloc` so dhat's
+# global allocator hook doesn't impact normal release runs.
+dhat = { version = "0.3", optional = true }
+
+[features]
+default = []
+# Enables dhat heap profiling. Bench binary installs a global allocator
+# wrapper that records every allocation; use only when running `--profile-alloc`.
+profile-alloc = ["dep:dhat"]
 
 [package.metadata.cargo-machete]
 ignored = ["jolt-inlines-p256", "ark-bn254"]

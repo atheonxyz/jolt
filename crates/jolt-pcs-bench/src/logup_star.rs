@@ -51,6 +51,7 @@ pub struct LogUpStarSet {
 }
 
 impl LogUpStarSet {
+    #[allow(dead_code)] // historical metric — legacy dump shape
     pub fn total_field_elements(&self) -> usize {
         let dense: usize = self.ra_dense.iter().map(|d| d.values.len()).sum();
         let push: usize = self.pushforwards.iter().map(|p| p.values.len()).sum();
@@ -90,6 +91,7 @@ fn transform_chunk(chunk: &OneHotChunk) -> (DenseRa, Pushforward) {
     )
 }
 
+#[tracing::instrument(skip_all, name = "bench.logup_star.transform")]
 pub fn transform(set: &JoltPolynomialSet) -> LogUpStarSet {
     let mut ra_dense = Vec::new();
     let mut pushforwards = Vec::new();

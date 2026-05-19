@@ -2,6 +2,13 @@
 // registrations are visible to the tracer at runtime.
 use jolt_inlines_p256 as _;
 
+// Allocation profiling: install dhat's global allocator wrapper when the
+// `profile-alloc` feature is on. Recording is gated on the `--profile-alloc`
+// CLI flag inside `main`; without it the wrapper exists but doesn't record.
+#[cfg(feature = "profile-alloc")]
+#[global_allocator]
+static ALLOC: dhat::Alloc = dhat::Alloc;
+
 mod dory_bench;
 mod dump;
 mod jolt_polys;
@@ -13,6 +20,9 @@ use std::path::PathBuf;
 use std::time::Instant;
 
 use clap::Parser;
+use tracing_chrome::ChromeLayerBuilder;
+use tracing_subscriber::layer::SubscriberExt;
+use tracing_subscriber::util::SubscriberInitExt;
 
 use dory_bench::{bench_dory, DoryBenchSummary};
 use dump::dump_for_whir;
@@ -51,10 +61,80 @@ struct Args {
     /// Optional JSON output path.
     #[arg(long)]
     json: Option<PathBuf>,
+
+    /// Write a Chrome / Perfetto trace of all tracing spans to this path.
+    /// View at https://ui.perfetto.dev/ . Requires the WHIR `tracing` feature
+    /// (already enabled) and adds bench-side spans for `build_polynomial_set`,
+    /// `transform`, `verify_transformation`, `dump_for_whir`, `bench_dory`.
+    #[arg(long)]
+    trace_chrome: Option<PathBuf>,
+
+    /// Capture a dhat heap-allocation profile. Writes the JSON to the path
+    /// given by `--dhat-output` (default: `./dhat-heap.json`), viewable at
+    /// https://nnethercote.github.io/dh_view/dh_view.html . Requires building
+    /// with `--features profile-alloc`; otherwise a no-op (warning printed).
+    #[arg(long)]
+    profile_alloc: bool,
+
+    /// Output path for the dhat profile (only meaningful with --profile-alloc).
+    #[arg(long, default_value = "dhat-heap.json")]
+    dhat_output: PathBuf,
+}
+
+/// Install a tracing subscriber. Returns the chrome flush guard (must be held
+/// until program exit). Returns `None` if `--trace-chrome` wasn't given —
+/// the global subscriber is still installed so spans are inert no-ops.
+fn install_tracing(trace_chrome: Option<&PathBuf>) -> Option<tracing_chrome::FlushGuard> {
+    if let Some(path) = trace_chrome {
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent).ok();
+        }
+        let (chrome_layer, guard) = ChromeLayerBuilder::new()
+            .include_args(true)
+            .file(path)
+            .build();
+        tracing_subscriber::registry().with(chrome_layer).init();
+        println!(
+            "[trace] writing Chrome/Perfetto trace to {} (open at https://ui.perfetto.dev/)",
+            path.display()
+        );
+        Some(guard)
+    } else {
+        None
+    }
+}
+
+#[cfg(feature = "profile-alloc")]
+fn install_dhat(enabled: bool, output: &std::path::Path) -> Option<dhat::Profiler> {
+    enabled.then(|| {
+        if let Some(parent) = output.parent() {
+            if !parent.as_os_str().is_empty() {
+                std::fs::create_dir_all(parent).ok();
+            }
+        }
+        println!(
+            "[dhat] heap profiling enabled — `{}` will be written at exit",
+            output.display()
+        );
+        dhat::Profiler::builder().file_name(output).build()
+    })
+}
+
+#[cfg(not(feature = "profile-alloc"))]
+fn install_dhat(enabled: bool, _output: &std::path::Path) -> Option<()> {
+    if enabled {
+        eprintln!(
+            "[dhat] WARNING: --profile-alloc given but binary was built without \
+             `--features profile-alloc`. No allocation profile will be captured."
+        );
+    }
+    None
 }
 
 fn main() {
     let args = Args::parse();
+    let _chrome_guard = install_tracing(args.trace_chrome.as_ref());
+    let _dhat_guard = install_dhat(args.profile_alloc, &args.dhat_output);
     let start = Instant::now();
 
     let workload = build_ecdsa_workload();
@@ -87,26 +167,46 @@ fn main() {
     );
 
     let logup = transform(&polys);
-    let logup_total = logup.total_field_elements();
+    let ra_dense_total: usize = logup.ra_dense.iter().map(|r| r.values.len()).sum();
+    let legacy_pf_total: usize = logup.pushforwards.iter().map(|p| p.values.len()).sum();
     let dense_field: usize = polys.dense.iter().map(|d| d.values.len()).sum();
-    let whir_total = logup_total + dense_field;
+
+    // The WHIR side discards the per-chunk u32 pushforwards in the dump and
+    // commits ONE eq-weighted P^F ∈ F^{2^WHIR_MIN_NUM_VARS} per family
+    // (LogUp* §4.1). Report the actual committed shape, not the dump shape.
+    let n_families = polys.one_hot_families.len();
+    let pf_per_family_len = 1usize << logup_star::WHIR_MIN_NUM_VARS;
+    let actual_pf_total = n_families * pf_per_family_len;
+    let whir_committed_total = ra_dense_total + actual_pf_total + dense_field;
+
     println!(
-        "[main] LogUp* set: {} ra_dense + {} pushforward, total {} field elements ({:.1}M)",
+        "[main] LogUp* set (dump shape, contains legacy per-chunk histograms): \
+         {} ra_dense + {} legacy pushforward = {} elements ({:.1}M)",
         logup.ra_dense.len(),
         logup.pushforwards.len(),
-        logup_total,
-        (logup_total as f64) / 1.0e6,
+        ra_dense_total + legacy_pf_total,
+        ((ra_dense_total + legacy_pf_total) as f64) / 1.0e6,
     );
     println!(
-        "[main] WHIR total (ra_dense + pushforward + RdInc + RamInc): {} field elements ({:.1}M)",
-        whir_total,
-        (whir_total as f64) / 1.0e6,
+        "[main] WHIR-side committed set (after §4.1 family aggregation): \
+         {} ra_dense (each 2^{}) + {} eq-weighted P^F (each 2^{}) + {} dense (each 2^{}) \
+         = {} elements ({:.1}M)",
+        logup.ra_dense.len(),
+        workload.log_t,
+        n_families,
+        logup_star::WHIR_MIN_NUM_VARS,
+        polys.dense.len(),
+        workload.log_t,
+        whir_committed_total,
+        (whir_committed_total as f64) / 1.0e6,
     );
     println!(
         "[main] Dory/WHIR field-element ratio: {:.2}x (WHIR is {:.1}% of Dory)",
-        (total as f64) / (whir_total as f64),
-        100.0 * (whir_total as f64) / (total as f64),
+        (total as f64) / (whir_committed_total as f64),
+        100.0 * (whir_committed_total as f64) / (total as f64),
     );
+    // Retain the legacy-shape total for backward-compatible JSON output.
+    let whir_total = whir_committed_total;
 
     verify_transformation(&workload, &polys, &logup);
 

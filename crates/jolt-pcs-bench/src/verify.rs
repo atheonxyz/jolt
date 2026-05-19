@@ -11,6 +11,7 @@ use crate::jolt_polys::{JoltPolynomialSet, OneHotSource};
 use crate::logup_star::{LogUpStarSet, WHIR_MIN_NUM_VARS};
 use crate::workload::EcdsaWorkload;
 
+#[tracing::instrument(skip_all, name = "bench.verify_transformation")]
 pub fn verify_transformation(
     workload: &EcdsaWorkload,
     polys: &JoltPolynomialSet,
