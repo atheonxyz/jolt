@@ -112,6 +112,22 @@ print(f"d-factors:    instruction_d={workload['instruction_d']}, "
       f"bytecode_d={workload['bytecode_d']}, ram_d={workload['ram_d']}")
 print()
 
+def median(xs):
+    s = sorted(xs)
+    return s[len(s)//2] if s else 0.0
+
+def commit_only_stats(w):
+    """Compute commit-only timing from per_class_ms (top-level totals
+    include claim_eval + gkr too)."""
+    per_class = w.get('per_class_ms', {})
+    if not per_class:
+        return (0.0, 0.0, 0.0)
+    # per_class is {num_vars_str: [per-run ms]}. Sum across classes per run.
+    runs = list(per_class.values())
+    n_runs = len(runs[0]) if runs else 0
+    per_run = [sum(r[i] for r in runs) for i in range(n_runs)]
+    return (min(per_run), median(per_run), max(per_run))
+
 def stats_line(label, s, elements, bytes_per=None):
     extra = f"  encode={s.get('encode_seconds', 0):.2f}s" if 'encode_seconds' in s else ""
     bpe = f"  {bytes_per}B/elem" if bytes_per else ""
@@ -143,13 +159,42 @@ if whir_payloads:
 print("Timing:")
 print(stats_line("Dory       (BN254)", dory_t, dory_elements))
 for label, w in whir_payloads:
-    print(stats_line(label, w, w['total_field_elements'], w['field_bytes_per_elem']))
+    # commit-only stats (claim_eval + gkr are reported separately).
+    cmin, cmed, cmax = commit_only_stats(w)
+    commit_synth = {"min_ms": cmin, "median_ms": cmed, "max_ms": cmax,
+                    "encode_seconds": w.get("encode_seconds", 0)}
+    print(stats_line(f"{label} commit", commit_synth, w['total_field_elements'],
+                     w['field_bytes_per_elem']))
+    if 'gkr' in w:
+        g = w['gkr']
+        ce = g.get('claim_eval_ms', {})
+        gk = g.get('gkr_only_ms', {})
+        ce_label = "  ├─ claim_eval        "
+        gk_label = "  ├─ gkr (eq-weighted) "
+        sum_label = "  └─ commit + LogUp*  "
+        if ce:
+            print(f"  {ce_label[:24]} min={ce['min_ms']:7.1f}ms  median={ce['median_ms']:7.1f}ms  "
+                  f"max={ce['max_ms']:7.1f}ms  (d MLE evals per family)")
+        if gk:
+            print(f"  {gk_label[:24]} min={gk['min_ms']:7.1f}ms  median={gk['median_ms']:7.1f}ms  "
+                  f"max={gk['max_ms']:7.1f}ms  (3 families, max A-depth=24)")
+        # combined = commit + (claim_eval + gkr_only) = commit + gkr.runs_ms.
+        combined_min = cmin + g['min_ms']
+        combined_med = cmed + g['median_ms']
+        combined_max = cmax + g['max_ms']
+        print(f"  {sum_label[:24]} min={combined_min:7.1f}ms  median={combined_med:7.1f}ms  "
+              f"max={combined_max:7.1f}ms")
 print()
 
 print("Wall-clock ratios (WHIR / Dory):")
 for label, w in whir_payloads:
-    r = w["median_ms"] / dory_t["median_ms"]
-    print(f"  {label:<22} {r:.2f}x")
+    _, cmed, _ = commit_only_stats(w)
+    r = cmed / dory_t["median_ms"]
+    print(f"  {label:<22} commit-only:    {r:.2f}x")
+    if 'gkr' in w:
+        combined_med = cmed + w['gkr']['median_ms']
+        r2 = combined_med / dory_t["median_ms"]
+        print(f"  {label:<22} commit + LogUp*: {r2:.2f}x")
 
 combined = {
     "workload": workload,

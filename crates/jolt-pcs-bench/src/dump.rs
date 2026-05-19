@@ -21,11 +21,18 @@
 //!                   kind=I128 → 16 * values_len bytes (LE)
 //! ```
 //!
-//! The integer→field conversion (and its losslessness) is justified in
-//! [`/Users/utsavsharma/.claude/plans/whir-vs-dory-parallel-moth.md`].
-//! For this milestone (BN254 Fr and Goldilocks Fp3), all conversions are
-//! lossless because every committed value's |v| is far below the smaller
-//! field's modulus.
+//! ## Pushforward field is legacy after the §4.1 rewrite
+//!
+//! The `pushforward::<family>_<chunk>` u32 entries in this dump are the
+//! **unweighted per-chunk histograms** `P[k] = #{j : ra_dense[j] = k}` from
+//! the original (incorrect) implementation. The paper-faithful design
+//! requires the *eq-weighted* per-family pushforward
+//! `P^F[k] = Σ_{j : M^(*)[j] = k} ẽq(bits(j), r_M_row)`, where `r_M_row`
+//! is Fiat-Shamir-squeezed inside the WHIR transcript. That cannot be
+//! pre-computed at dump time, so the WHIR side rebuilds it at runtime
+//! (`whir-pcs-bench/src/gkr.rs::prepare_pushforwards`) and discards
+//! these u32 entries on load. The Jolt side still emits them for backward
+//! compatibility with any tooling that reads version-2 dumps.
 
 use std::fs::File;
 use std::io::{BufWriter, Write};
@@ -48,6 +55,7 @@ enum Kind {
 
 /// Field elements (logical count, not bytes) written to the dump.
 /// This is the metric reported as "WHIR total field elements".
+#[tracing::instrument(skip_all, name = "bench.dump_for_whir")]
 pub fn dump_for_whir(
     polys: &JoltPolynomialSet,
     logup: &LogUpStarSet,

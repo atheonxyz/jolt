@@ -73,6 +73,7 @@ impl JoltPolynomialSet {
     }
 }
 
+#[tracing::instrument(skip_all, name = "bench.build_polynomial_set")]
 pub fn build_polynomial_set(
     sources: &CommitmentTraceSources,
     params: &OneHotParams,

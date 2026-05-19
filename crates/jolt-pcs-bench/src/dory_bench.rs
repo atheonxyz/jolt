@@ -59,6 +59,7 @@ fn max_num_vars(polys: &JoltPolynomialSet) -> usize {
     one_hot_max.max(dense_max)
 }
 
+#[tracing::instrument(skip_all, name = "bench.dory_bench.run_once")]
 fn run_once(polys: &JoltPolynomialSet, setup: &DoryProverSetup) -> DoryRunResult {
     let total_start = Instant::now();
     let mut per_oracle = Vec::new();
