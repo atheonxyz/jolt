@@ -31,18 +31,15 @@ jolt-poly = { workspace = true }
 jolt-trace = { workspace = true }
 jolt-witness = { workspace = true }
 jolt-openings = { path = "../jolt-openings" }
-jolt-transcript = { workspace = true }
 
 # Guest pipeline
-jolt-sdk = { workspace = true, features = ["host"] }
 jolt-inlines-p256 = { workspace = true, features = ["host"] }
 common = { workspace = true, features = ["std"] }
-tracer = { workspace = true }
 
-# Arkworks
+# Arkworks — `ark-bn254` is unused at the source level but kept in the
+# dependency graph (see `cargo-machete.ignored` below) so the `curve` feature
+# stays activated through the workspace patch graph.
 ark-bn254 = { workspace = true, features = ["curve"] }
-ark-ff = { workspace = true }
-ark-serialize = { workspace = true }
 
 # Utilities
 clap = { workspace = true }

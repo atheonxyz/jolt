@@ -168,25 +168,14 @@ fn main() {
 
     let logup = transform(&polys);
     let ra_dense_total: usize = logup.ra_dense.iter().map(|r| r.values.len()).sum();
-    let legacy_pf_total: usize = logup.pushforwards.iter().map(|p| p.values.len()).sum();
     let dense_field: usize = polys.dense.iter().map(|d| d.values.len()).sum();
 
-    // The WHIR side discards the per-chunk u32 pushforwards in the dump and
-    // commits ONE eq-weighted P^F ∈ F^{2^WHIR_MIN_NUM_VARS} per family
-    // (LogUp* §4.1). Report the actual committed shape, not the dump shape.
+    // The WHIR side commits one eq-weighted P^F ∈ F^{2^WHIR_MIN_NUM_VARS}
+    // per family (LogUp* §4.1).
     let n_families = polys.one_hot_families.len();
-    let pf_per_family_len = 1usize << logup_star::WHIR_MIN_NUM_VARS;
-    let actual_pf_total = n_families * pf_per_family_len;
-    let whir_committed_total = ra_dense_total + actual_pf_total + dense_field;
+    let eq_weighted_pf_len = 1usize << logup_star::WHIR_MIN_NUM_VARS;
+    let whir_total = ra_dense_total + n_families * eq_weighted_pf_len + dense_field;
 
-    println!(
-        "[main] LogUp* set (dump shape, contains legacy per-chunk histograms): \
-         {} ra_dense + {} legacy pushforward = {} elements ({:.1}M)",
-        logup.ra_dense.len(),
-        logup.pushforwards.len(),
-        ra_dense_total + legacy_pf_total,
-        ((ra_dense_total + legacy_pf_total) as f64) / 1.0e6,
-    );
     println!(
         "[main] WHIR-side committed set (after §4.1 family aggregation): \
          {} ra_dense (each 2^{}) + {} eq-weighted P^F (each 2^{}) + {} dense (each 2^{}) \
@@ -197,16 +186,14 @@ fn main() {
         logup_star::WHIR_MIN_NUM_VARS,
         polys.dense.len(),
         workload.log_t,
-        whir_committed_total,
-        (whir_committed_total as f64) / 1.0e6,
+        whir_total,
+        (whir_total as f64) / 1.0e6,
     );
     println!(
         "[main] Dory/WHIR field-element ratio: {:.2}x (WHIR is {:.1}% of Dory)",
-        (total as f64) / (whir_committed_total as f64),
-        100.0 * (whir_committed_total as f64) / (total as f64),
+        (total as f64) / (whir_total as f64),
+        100.0 * (whir_total as f64) / (total as f64),
     );
-    // Retain the legacy-shape total for backward-compatible JSON output.
-    let whir_total = whir_committed_total;
 
     verify_transformation(&workload, &polys, &logup);
 
@@ -220,14 +207,8 @@ fn main() {
 
     if !args.no_dump {
         let dump_start = Instant::now();
-        let n = dump_for_whir(
-            &polys,
-            &logup,
-            &workload.sources,
-            workload.trace_len,
-            &args.dump,
-        )
-        .expect("dump polys");
+        let n = dump_for_whir(&polys, &workload.sources, workload.trace_len, &args.dump)
+            .expect("dump polys");
         println!(
             "[dump] wrote {n} field elements to {} in {:.1}s",
             args.dump.display(),
@@ -260,7 +241,7 @@ fn main() {
 
 fn min_median_max(times: &[f64]) -> (f64, f64, f64) {
     let mut sorted = times.to_vec();
-    sorted.sort_by(|a, b| a.partial_cmp(b).unwrap());
+    sorted.sort_by(|a, b| a.total_cmp(b));
     let min = sorted[0];
     let median = sorted[sorted.len() / 2];
     let max = sorted[sorted.len() - 1];
@@ -284,8 +265,12 @@ fn write_json_report(
                 run.per_oracle
                     .iter()
                     .map(|t| {
+                        let name = match t.chunk_idx {
+                            Some(idx) => format!("{}_{idx}", t.family_name),
+                            None => t.family_name.to_string(),
+                        };
                         serde_json::json!({
-                            "name": t.name,
+                            "name": name,
                             "num_vars": t.num_vars,
                             "elapsed_ms": t.elapsed_ms,
                         })
@@ -323,6 +308,5 @@ fn write_json_report(
         "ratio_dory_over_whir": (dory_total_elements as f64) / (whir_total_elements as f64),
         "dory": dory_json,
     });
-    std::fs::write(path, serde_json::to_string_pretty(&report).unwrap())
-        .expect("write json");
+    std::fs::write(path, serde_json::to_string_pretty(&report).unwrap()).expect("write json");
 }

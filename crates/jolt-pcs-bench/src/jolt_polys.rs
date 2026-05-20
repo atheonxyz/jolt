@@ -9,29 +9,33 @@
 use jolt_core::zkvm::config::OneHotParams;
 use jolt_field::{Field, Fr};
 use jolt_poly::{EqPolynomial, MultilinearPoly};
-use jolt_witness::{
-    dense_i128_column_to_field, one_hot_chunk_indices, CommitmentTraceSources,
-};
+use jolt_witness::{dense_i128_column_to_field, one_hot_chunk_indices, CommitmentTraceSources};
 use rayon::prelude::*;
 
 /// One source family ("instruction", "bytecode", "ram") of one-hot indices,
 /// chunked across `d` factors.
 #[derive(Clone, Debug)]
-pub struct OneHotFamily {
+pub(crate) struct OneHotFamily {
     pub name: &'static str,
+    /// Consumed only by `verify_transformation` (debug-only); kept on the
+    /// struct so debug builds can dispatch over the source variants.
+    #[cfg_attr(
+        not(debug_assertions),
+        expect(dead_code, reason = "verify is debug-only")
+    )]
     pub source: OneHotSource,
     pub chunks: Vec<OneHotChunk>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum OneHotSource {
+pub(crate) enum OneHotSource {
     InstructionKeys,
     RamAddresses,
     BytecodeIndices,
 }
 
 #[derive(Clone, Debug)]
-pub struct OneHotChunk {
+pub(crate) struct OneHotChunk {
     /// Per-cycle index into [0, k_chunk). `None` means no entry that cycle.
     pub indices: Vec<Option<u8>>,
     /// Position within the d-decomposition (0 == most-significant chunk).
@@ -48,20 +52,20 @@ pub struct OneHotChunk {
 /// 1D dense polynomial of length T. Either a signed-i128 transition
 /// (Rd/RamInc, materialized into Fr) or already-Fr advice oracle.
 #[derive(Clone, Debug)]
-pub struct DensePoly {
+pub(crate) struct DensePoly {
     pub name: &'static str,
     pub num_vars: usize,
     pub values: Vec<Fr>,
 }
 
 /// The complete polynomial set Jolt's prover commits to for one ECDSA proof.
-pub struct JoltPolynomialSet {
+pub(crate) struct JoltPolynomialSet {
     pub one_hot_families: Vec<OneHotFamily>,
     pub dense: Vec<DensePoly>,
 }
 
 impl JoltPolynomialSet {
-    pub fn total_field_elements(&self) -> usize {
+    pub(crate) fn total_field_elements(&self) -> usize {
         let one_hot: usize = self
             .one_hot_families
             .iter()
@@ -74,7 +78,7 @@ impl JoltPolynomialSet {
 }
 
 #[tracing::instrument(skip_all, name = "bench.build_polynomial_set")]
-pub fn build_polynomial_set(
+pub(crate) fn build_polynomial_set(
     sources: &CommitmentTraceSources,
     params: &OneHotParams,
     trace_len: usize,
@@ -163,7 +167,7 @@ pub fn build_polynomial_set(
 
 /// Sparse one-hot polynomial in the address-major flat layout that Dory
 /// commits to (mirrors `crates/jolt-prover/src/stages/commitment.rs:214-318`).
-pub struct AddressMajorOneHotPolynomial<'a> {
+pub(crate) struct AddressMajorOneHotPolynomial<'a> {
     trace_len: usize,
     chunk_domain: usize,
     indices: &'a [Option<u8>],
@@ -171,7 +175,7 @@ pub struct AddressMajorOneHotPolynomial<'a> {
 }
 
 impl<'a> AddressMajorOneHotPolynomial<'a> {
-    pub fn from_chunk(chunk: &'a OneHotChunk) -> Self {
+    pub(crate) fn from_chunk(chunk: &'a OneHotChunk) -> Self {
         let active_len = chunk.trace_len * chunk.chunk_domain;
         let target_len = 1usize << chunk.layout_num_vars;
         assert!(
