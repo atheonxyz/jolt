@@ -15,28 +15,31 @@ use jolt_openings::CommitmentScheme;
 
 use crate::jolt_polys::{AddressMajorOneHotPolynomial, JoltPolynomialSet};
 
+// I.6: PerOracleTiming uses static name + optional chunk index instead of
+// allocating a `String` per chunk per run.
 #[derive(Clone, Debug)]
-pub struct PerOracleTiming {
-    pub name: String,
+pub(crate) struct PerOracleTiming {
+    pub family_name: &'static str,
+    pub chunk_idx: Option<usize>,
     pub num_vars: usize,
     pub elapsed_ms: f64,
 }
 
 #[derive(Clone, Debug)]
-pub struct DoryRunResult {
+pub(crate) struct DoryRunResult {
     pub total_ms: f64,
     pub per_oracle: Vec<PerOracleTiming>,
 }
 
 #[derive(Clone, Debug)]
-pub struct DoryBenchSummary {
+pub(crate) struct DoryBenchSummary {
     pub setup_ms: f64,
     pub setup_num_vars: usize,
     pub runs: Vec<DoryRunResult>,
 }
 
 impl DoryBenchSummary {
-    pub fn total_times_ms(&self) -> Vec<f64> {
+    pub(crate) fn total_times_ms(&self) -> Vec<f64> {
         self.runs.iter().map(|r| r.total_ms).collect()
     }
 }
@@ -50,12 +53,7 @@ fn max_num_vars(polys: &JoltPolynomialSet) -> usize {
         .map(|c| c.layout_num_vars)
         .max()
         .unwrap_or(0);
-    let dense_max = polys
-        .dense
-        .iter()
-        .map(|d| d.num_vars)
-        .max()
-        .unwrap_or(0);
+    let dense_max = polys.dense.iter().map(|d| d.num_vars).max().unwrap_or(0);
     one_hot_max.max(dense_max)
 }
 
@@ -71,7 +69,8 @@ fn run_once(polys: &JoltPolynomialSet, setup: &DoryProverSetup) -> DoryRunResult
             let (_commit, _hint) = DoryScheme::commit(&poly, setup);
             let elapsed = t0.elapsed();
             per_oracle.push(PerOracleTiming {
-                name: format!("{}_{}", family.name, chunk.chunk),
+                family_name: family.name,
+                chunk_idx: Some(chunk.chunk),
                 num_vars: chunk.layout_num_vars,
                 elapsed_ms: dur_ms(elapsed),
             });
@@ -85,7 +84,8 @@ fn run_once(polys: &JoltPolynomialSet, setup: &DoryProverSetup) -> DoryRunResult
             DoryScheme::commit_evaluations_with_row_len(&dense.values, row_len, setup);
         let elapsed = t0.elapsed();
         per_oracle.push(PerOracleTiming {
-            name: dense.name.to_string(),
+            family_name: dense.name,
+            chunk_idx: None,
             num_vars: dense.num_vars,
             elapsed_ms: dur_ms(elapsed),
         });
@@ -97,7 +97,11 @@ fn run_once(polys: &JoltPolynomialSet, setup: &DoryProverSetup) -> DoryRunResult
     }
 }
 
-pub fn bench_dory(polys: &JoltPolynomialSet, warmup: usize, runs: usize) -> DoryBenchSummary {
+pub(crate) fn bench_dory(
+    polys: &JoltPolynomialSet,
+    warmup: usize,
+    runs: usize,
+) -> DoryBenchSummary {
     let setup_num_vars = max_num_vars(polys);
     let setup_start = Instant::now();
     println!("[dory] setup_prover(num_vars={setup_num_vars}) — generating SRS...");

@@ -83,12 +83,10 @@ codebase:
    stores it that way as `Vec<Option<u8>>`). No pushforward is produced
    here — the eq-weighted pushforward depends on Fiat-Shamir randomness
    that lives in the WHIR-side transcript, so it's built at runtime later.
-5. Asserts argmax / size invariants (`verify.rs`). The dump still emits a
-   legacy per-chunk u32 histogram for backward compatibility, but the
-   WHIR side discards it on load.
-6. Serializes ra_dense (u8) + the legacy histograms (u32) + dense
-   (`RdInc`, `RamInc` as i128) to disk as raw integers — field-agnostic,
-   ~41 MB total.
+5. Asserts argmax / size invariants in debug builds (`verify.rs`, gated
+   behind `cfg(debug_assertions)` — release runs skip them).
+6. Serializes ra_dense (u8) + dense (`RdInc`, `RamInc` as i128) to disk
+   as raw integers — field-agnostic, dump format v3.
 7. A sibling binary `whir-pcs-bench` (separate workspace, see below) reads
    the dump, encodes each integer into the chosen WHIR target field
    (`bn254` or `goldilocks-fp3`).
@@ -154,9 +152,8 @@ crates/jolt-pcs-bench/
     │                          copy of `AddressMajorOneHotPolynomial` (mirrors
     │                          `crates/jolt-prover/src/stages/commitment.rs`)
     ├── logup_star.rs        ← §5.1 / §5.2 LogUp* transformation
-    ├── verify.rs            ← argmax / size invariants on ra_dense. (The
-    │                           legacy per-chunk histogram invariant is now
-    │                           moot — the WHIR side rebuilds P^F at runtime.)
+    ├── verify.rs            ← argmax / size / chunk-decompose invariants
+    │                           on ra_dense (cfg(debug_assertions) only).
     ├── dory_bench.rs        ← DoryScheme::commit timing
     └── dump.rs              ← Polynomial dump format consumed by whir-pcs-bench
 
@@ -247,17 +244,18 @@ ZK is via `whir::protocols::whir_zk::Config<Field256>` (NOT default plain WHIR �
 the WHIR repo's default is non-ZK). The `rs_in_order` feature is required for
 `whir_zk` and is enabled in `Cargo.toml`.
 
-### 7. `WHIR_MIN_NUM_VARS = 15` for pushforward padding
+### 7. `WHIR_MIN_NUM_VARS = 15` floor
 
 `whir_zk::Config::new` asserts `num_blinding_variables < num_witness_variables`.
 At 128-bit security with rate 1/2 and folding_factor=4, the blinding-variable
 upper bound works out to ~14, so any vector with fewer than 15 variables fails
-the assertion. Pushforward vectors are length `K_chunk = 16` (4 variables),
-which fails — we pad each up to 2^15 zeros to satisfy the inequality.
+the assertion. The eq-weighted per-family pushforward `P^F` is sized to
+`2^15 = 32768` entries by construction (`log_m = WHIR_MIN_NUM_VARS`), which
+clears the threshold; `ra_dense` and dense polys are size `2^19` and clear it
+trivially.
 
-This is the unavoidable cost of ZK at 128-bit security. The plan's risks
-section flagged this; the empirical minimum (`14` fails, `15` passes) is in a
-comment at `logup_star.rs:18-26`.
+The empirical minimum (`14` fails, `15` passes) is documented in
+`logup_star.rs`.
 
 ### 8. WHIR vector groups (size classes)
 
@@ -273,32 +271,29 @@ wall-clock is the sum of both calls. The drop from 40 to 3 pushforwards
 in the small class accounts for most of the `commit_ms` reduction vs the
 prior milestone.
 
-### 9. Field-agnostic dump format (integer-form, version 2)
+### 9. Field-agnostic dump format (integer-form, version 3)
 
 The dump stores **raw integer values** rather than pre-encoded Fr field elements:
 
 - `ra_dense` chunks: `Vec<u8>` (1 byte per cycle) — argmax index ∈ [0, 16).
-- `pushforward::<family>_<chunk>` vectors: `Vec<u32>` (4 bytes per bucket).
-  **Legacy field**: these are the unweighted per-chunk histograms from the
-  pre-§4.1 design. The WHIR side ignores them on load and rebuilds the
-  per-family eq-weighted `P^F` at runtime. Kept in the dump format
-  (version 2) to avoid touching the Jolt-side dump writer for a research
-  bench.
 - `RdInc`, `RamInc`: `Vec<i128>` (16 bytes per cycle) — signed RAM/register increments.
 
 Each WHIR target field independently encodes these integers at load time via
-`F::from_u64` and a signed-`Neg` helper for `i128`. Total dump size shrinks from
-~750 MB (Fr-encoded) to ~41 MB (integer-encoded) — useful for keeping dumps in
-`/tmp` between bench iterations.
+`F::from_u64` and a signed-`Neg` helper for `i128`. Total dump size is ~41 MB —
+useful for keeping dumps in `/tmp` between bench iterations.
+
+Format v3 dropped the per-chunk u32 unweighted pushforward histograms that
+the pre-§4.1 design emitted: the WHIR side never consumed them (it rebuilds
+the eq-weighted per-family P^F at runtime from raw u8 indices + Fiat-Shamir
+randomness).
 
 **Why this is lossless for both target fields.** The dump never contains a
-254-bit field element; only `u8` / `u32` / `i128` integers whose maximum
-magnitudes are far below either target field's modulus:
+254-bit field element; only `u8` / `i128` integers whose maximum magnitudes
+are far below either target field's modulus:
 
 | Polynomial    | Stored as | Max \|v\|        | Fits BN254 Fr (~2^254)? | Fits Goldilocks Fp3 (~2^192)? |
 | ------------- | --------- | ---------------- | ----------------------- | ----------------------------- |
 | `ra_dense`    | `u8`      | < 16             | ✓                       | ✓                             |
-| `pushforward` | `u32`     | < T = 2^19       | ✓                       | ✓                             |
 | `RdInc/RamInc`| `i128`    | < 2·2^64 ≈ 2^65  | ✓ (188 bits of headroom)| ✓ (126 bits of headroom)      |
 
 The integer→Fr conversion produces **bit-identical Fr elements** to the older
@@ -415,21 +410,21 @@ Polynomial inventory:
   Ratio Dory/WHIR (by element):     15.22x  (WHIR is 6.6% of Dory)
 
 Timing:
-  Dory       (BN254)     min= 5259.3ms  median= 5287.1ms  max= 5470.7ms  (336.6M elems)
-  WHIR-ZK BN254 commit   min= 5281.8ms  median= 5296.6ms  max= 5370.4ms  (22.1M elems  32B/elem)  encode=0.42s
-    ├─ claim_eval         min=   88.7ms  median=   90.4ms  max=   92.6ms  (d MLE evals per family)
-    ├─ gkr (eq-weighted)  min= 4353.4ms  median= 4478.0ms  max= 4651.8ms  (3 families, max A-depth=24)
-    └─ commit + LogUp*   min= 9723.9ms  median= 9864.1ms  max=10113.2ms
-  WHIR-ZK Goldilocks Fp3 commit min= 3201.4ms  median= 3201.7ms  max= 3249.4ms  (22.1M elems  24B/elem)  encode=0.09s
-    ├─ claim_eval         min=   72.5ms  median=   73.4ms  max=   74.9ms  (d MLE evals per family)
-    ├─ gkr (eq-weighted)  min= 2813.4ms  median= 2817.1ms  max= 2874.6ms  (3 families, max A-depth=24)
-    └─ commit + LogUp*   min= 6088.2ms  median= 6092.3ms  max= 6198.1ms
+  Dory       (BN254)     min= 5248.9ms  median= 5293.7ms  max= 5385.1ms  (336.6M elems)
+  WHIR-ZK BN254 commit   min= 5078.3ms  median= 5347.7ms  max= 6014.9ms  (22.1M elems  32B/elem)  encode=0.08s
+    ├─ claim_eval         min=   85.1ms  median=   86.5ms  max=   89.6ms  (d MLE evals per family)
+    ├─ gkr (eq-weighted)  min= 2289.8ms  median= 2405.8ms  max= 2851.8ms  (3 families, max A-depth=24)
+    └─ commit + LogUp*   min= 7453.2ms  median= 7842.1ms  max= 8953.2ms
+  WHIR-ZK Goldilocks Fp3 commit min= 3101.4ms  median= 3144.5ms  max= 4149.5ms  (22.1M elems  24B/elem)  encode=0.02s
+    ├─ claim_eval         min=   74.4ms  median=   74.9ms  max=   93.1ms  (d MLE evals per family)
+    ├─ gkr (eq-weighted)  min= 1926.4ms  median= 1963.1ms  max= 2198.8ms  (3 families, max A-depth=24)
+    └─ commit + LogUp*   min= 5102.1ms  median= 5185.2ms  max= 6441.5ms
 
 Wall-clock ratios (WHIR / Dory):
-  WHIR-ZK BN254          commit-only:     1.00x
-  WHIR-ZK BN254          commit + LogUp*: 1.87x
-  WHIR-ZK Goldilocks Fp3 commit-only:     0.61x
-  WHIR-ZK Goldilocks Fp3 commit + LogUp*: 1.15x
+  WHIR-ZK BN254          commit-only:     1.01x
+  WHIR-ZK BN254          commit + LogUp*: 1.48x
+  WHIR-ZK Goldilocks Fp3 commit-only:     0.59x
+  WHIR-ZK Goldilocks Fp3 commit + LogUp*: 0.98x
 ```
 
 Both binaries emit JSON reports (`dory.json`, `whir-bn254.json`,
@@ -452,32 +447,32 @@ bench reports three timing phases plus the combined total.
 
 | Scheme                       | commit ms | claim_eval ms | gkr ms | total LogUp\* ms | commit + LogUp\* |
 | ---------------------------- | --------: | ------------: | -----: | ---------------: | ---------------: |
-| **Dory (BN254)** — baseline  | 5287.1    | —             | —      | —                | 5287.1           |
-| **WHIR-ZK BN254**            | 5296.6    | 90.4          | 4478.0 | 4568.4           | 9864.1           |
-| **WHIR-ZK Goldilocks Fp3**   | 3201.7    | 73.4          | 2817.1 | 2890.5           | 6092.3           |
+| **Dory (BN254)** — baseline  | 5293.7    | —             | —      | —                | 5293.7           |
+| **WHIR-ZK BN254**            | 5347.7    | 86.5          | 2405.8 | 2494.3           | 7842.1           |
+| **WHIR-ZK Goldilocks Fp3**   | 3144.5    | 74.9          | 1963.1 | 2040.8           | 5185.2           |
 
 ### Min / median / max across 5 runs
 
 | Scheme                       | min ms | median ms | max ms |
 | ---------------------------- | -----: | --------: | -----: |
-| **Dory (BN254)**             | 5259.3 | 5287.1    | 5470.7 |
-| WHIR-ZK BN254 — commit only  | 5281.8 | 5296.6    | 5370.4 |
-| WHIR-ZK BN254 — claim_eval   |   88.7 |   90.4    |   92.6 |
-| WHIR-ZK BN254 — gkr          | 4353.4 | 4478.0    | 4651.8 |
-| WHIR-ZK BN254 — commit + LogUp\* | 9723.9 | 9864.1 | 10113.2 |
-| WHIR-ZK Fp3 — commit only    | 3201.4 | 3201.7    | 3249.4 |
-| WHIR-ZK Fp3 — claim_eval     |   72.5 |   73.4    |   74.9 |
-| WHIR-ZK Fp3 — gkr            | 2813.4 | 2817.1    | 2874.6 |
-| WHIR-ZK Fp3 — commit + LogUp\* | 6088.2 | 6092.3 | 6198.1 |
+| **Dory (BN254)**             | 5248.9 | 5293.7    | 5385.1 |
+| WHIR-ZK BN254 — commit only  | 5078.3 | 5347.7    | 6014.9 |
+| WHIR-ZK BN254 — claim_eval   |   85.1 |   86.5    |   89.6 |
+| WHIR-ZK BN254 — gkr          | 2289.8 | 2405.8    | 2851.8 |
+| WHIR-ZK BN254 — commit + LogUp\* | 7453.2 | 7842.1 | 8953.2 |
+| WHIR-ZK Fp3 — commit only    | 3101.4 | 3144.5    | 4149.5 |
+| WHIR-ZK Fp3 — claim_eval     |   74.4 |   74.9    |   93.1 |
+| WHIR-ZK Fp3 — gkr            | 1926.4 | 1963.1    | 2198.8 |
+| WHIR-ZK Fp3 — commit + LogUp\* | 5102.1 | 5185.2 | 6441.5 |
 
 ### Four scenarios vs Dory baseline (wall-clock ratio)
 
-| Scenario | median ms | vs Dory (5287 ms) |
+| Scenario | median ms | vs Dory (5294 ms) |
 | --- | --: | --: |
-| WHIR-ZK BN254, commit only | 5296.6 | **1.00x** (parity) |
-| WHIR-ZK BN254, commit + LogUp\* | 9864.1 | **1.87x slower** |
-| WHIR-ZK Goldilocks Fp3, commit only | 3201.7 | **0.61x** (≈ 40 % faster) |
-| WHIR-ZK Goldilocks Fp3, commit + LogUp\* | 6092.3 | **1.15x slower** |
+| WHIR-ZK BN254, commit only | 5347.7 | **1.01x** (parity) |
+| WHIR-ZK BN254, commit + LogUp\* | 7842.1 | **1.48x slower** |
+| WHIR-ZK Goldilocks Fp3, commit only | 3144.5 | **0.59x** (≈ 41 % faster) |
+| WHIR-ZK Goldilocks Fp3, commit + LogUp\* | 5185.2 | **0.98x** (parity, slight WHIR win) |
 
 Numbers above are paper-faithful: §4.1 batching (3 family-level
 eq-weighted pushforwards, not 40 per-chunk unweighted histograms),
@@ -523,19 +518,17 @@ Dory/WHIR element ratio: **15.22x** (WHIR commits 6.6 % of Dory's element count)
    [DESIGN_WHIR.md §2.1](DESIGN_WHIR.md#21-§452-collapsed-to-a-linear-combination).
 
 5. **Commit-only vs Dory**: WHIR-BN254 commit is at **parity** with
-   Dory (1.00x). WHIR-Fp3 commit is **~40 % faster** than Dory commit
-   (0.61x), thanks to the 24 B/elem footprint vs Dory's 32 B/elem and
+   Dory (1.01x). WHIR-Fp3 commit is **~41 % faster** than Dory commit
+   (0.59x), thanks to the 24 B/elem footprint vs Dory's 32 B/elem and
    the 15.22x element-count reduction together overcoming WHIR's higher
    per-element cost.
 
-6. **Combined commit + LogUp\* vs Dory**: BN254 lands at **1.87x slower**;
-   **Fp3 at 1.15x slower** — much closer than the previous (incorrect,
-   unweighted-histogram) milestone suggested. The interesting future
+6. **Combined commit + LogUp\* vs Dory**: BN254 lands at **1.48x slower**;
+   **Fp3 reaches parity (0.98x — slight WHIR win)**. The interesting future
    question is whether the leaf-claim PCS openings (out of scope for
    this bench) can be done with a single batched WHIR opening at
-   `log_t + log_d` variables,
-   at which point WHIR's smaller commitment footprint may outweigh the
-   GKR overhead.
+   `log_t + log_d` variables, at which point WHIR's smaller commitment
+   footprint may outweigh any remaining BN254 GKR overhead.
 
 ---
 
@@ -562,12 +555,11 @@ The five divergences (each spelled out with line refs in
 Bottom line: the bench's Dory wall-clock measures the Bolt AddressMajor +
 non-streaming + eager-Fr path. Against jolt-core's production CycleMajor +
 streaming + lazy-i128 path, expect ~15-30% headroom in Dory's favor. The
-"WHIR-Fp3 commit is ~15% faster than Dory" claim is therefore *true vs the
+"WHIR-Fp3 commit + LogUp* matches Dory" claim is therefore *true vs the
 Bolt path the bench measures, possibly false vs jolt-core's optimized
 path*. Adding a `--prover-path {bolt, jolt-core}` flag is a ~2-3 hour
-follow-up if you want production-vs-WHIR numbers. The GKR-vs-Dory
-combined ratio (~1.32x for Fp3) shifts further in Dory's favor under that
-adjustment.
+follow-up if you want production-vs-WHIR numbers. Under that adjustment
+the combined Fp3 ratio likely lands around ~1.15-1.25x in Dory's favor.
 
 ---
 

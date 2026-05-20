@@ -6,12 +6,11 @@
 
 use std::time::Instant;
 
-use common::jolt_device::MemoryLayout;
 use jolt_core::zkvm::config::OneHotParams;
 use jolt_field::Fr;
 use jolt_trace::bytecode::BytecodePreprocessing;
-use jolt_trace::{extract_trace, CycleRow, Program};
-use jolt_witness::{commitment_trace_sources, CommitmentTraceSources, CycleInput};
+use jolt_trace::{extract_trace, Program};
+use jolt_witness::{commitment_trace_sources, CommitmentTraceSources};
 
 const GUEST_PACKAGE: &str = "p256-ecdsa-verify-guest";
 const FUNC_NAME: &str = "p256_ecdsa_verify";
@@ -61,21 +60,15 @@ fn ecdsa_test_input() -> Vec<u8> {
     input_bytes
 }
 
-pub struct EcdsaWorkload {
+pub(crate) struct EcdsaWorkload {
     pub log_t: usize,
     pub trace_len: usize,
     pub bytecode_k: usize,
     pub ram_k: usize,
     pub one_hot_params: OneHotParams,
     /// Built via the canonical `extract_trace` + `commitment_trace_sources`
-    /// path. This is what downstream phases (Dory commit, dump, etc.) consume.
+    /// path — the same one Jolt's prover uses.
     pub sources: CommitmentTraceSources,
-    /// Same five columns, built by walking `Vec<Cycle>` once via `CycleRow`
-    /// accessors. Skips `extract_trace`'s R1CS witness vector
-    /// (`trace_len * NUM_VARS_PADDED` field zeros) and `InstructionFlagData`
-    /// construction. Asserted equal to `sources` at build time.
-    #[expect(dead_code, reason = "captured for inspection; bench consumes `sources`")]
-    pub direct_sources: CommitmentTraceSources,
 }
 
 /// Drives the ECDSA guest pipeline end-to-end and returns the dense indices
@@ -84,7 +77,7 @@ pub struct EcdsaWorkload {
 /// The returned `sources` and `one_hot_params` exactly mirror what
 /// `jolt-prover`'s `SparseCommitmentInputs` uses internally.
 #[tracing::instrument(skip_all, name = "bench.build_ecdsa_workload")]
-pub fn build_ecdsa_workload() -> EcdsaWorkload {
+pub(crate) fn build_ecdsa_workload() -> EcdsaWorkload {
     let t_start = Instant::now();
     let mut program = Program::new(GUEST_PACKAGE);
     let _ = program.set_func(FUNC_NAME).set_heap_size(HEAP_SIZE);
@@ -122,20 +115,15 @@ pub fn build_ecdsa_workload() -> EcdsaWorkload {
     // For ECDSA both terms produce a value < 2^14, so the result coincides regardless of
     // which term wins — but the clamp matters for sparse-RAM workloads where execution
     // never reaches the bytecode end.
-    let bytecode_end = jolt_core::zkvm::ram::remap_address(
-        ram_preprocessing.min_bytecode_address,
-        &memory_layout,
-    )
-    .unwrap_or(0)
-        + ram_preprocessing.bytecode_words.len() as u64
-        + 1;
+    let bytecode_end =
+        jolt_core::zkvm::ram::remap_address(ram_preprocessing.min_bytecode_address, &memory_layout)
+            .unwrap_or(0)
+            + ram_preprocessing.bytecode_words.len() as u64
+            + 1;
     let ram_k = trace
         .iter()
         .filter_map(|cycle| {
-            jolt_core::zkvm::ram::remap_address(
-                cycle.ram_access().address() as u64,
-                &memory_layout,
-            )
+            jolt_core::zkvm::ram::remap_address(cycle.ram_access().address() as u64, &memory_layout)
         })
         .max()
         .unwrap_or(0)
@@ -151,32 +139,17 @@ pub fn build_ecdsa_workload() -> EcdsaWorkload {
     // Canonical path: extract_trace returns (cycle_inputs, r1cs_witness,
     // instruction_flags) padded to `trace_len`. The bench discards _r1cs / _flags.
     let extract_start = Instant::now();
-    let (cycle_inputs, _r1cs, _flags) =
-        extract_trace::<_, Fr>(&trace, trace_len, &bytecode, &memory_layout, NUM_VARS_PADDED);
-    let sources = commitment_trace_sources(&cycle_inputs);
-    let extract_elapsed = extract_start.elapsed();
-
-    // Direct path: mirrors `extract_trace` but produces only the commitment
-    // inputs — skips the `trace_len * NUM_VARS_PADDED` Fr-zero r1cs allocation
-    // and `InstructionFlagData` construction. Per-cycle conversion duplicates
-    // the private `jolt_trace::extract::cycle_input`; `assert_eq!` below
-    // guarantees the two paths stay byte-identical.
-    let direct_start = Instant::now();
-    let direct_inputs =
-        extract_commitment_inputs(&trace, trace_len, &bytecode, &memory_layout);
-    let direct_sources = commitment_trace_sources(&direct_inputs);
-    let direct_elapsed = direct_start.elapsed();
-
-    assert_eq!(
-        sources, direct_sources,
-        "direct trace walk diverges from extract_trace + commitment_trace_sources"
+    let (cycle_inputs, _r1cs, _flags) = extract_trace::<_, Fr>(
+        &trace,
+        trace_len,
+        &bytecode,
+        &memory_layout,
+        NUM_VARS_PADDED,
     );
-
-    let extract_ms = extract_elapsed.as_secs_f64() * 1e3;
-    let direct_ms = direct_elapsed.as_secs_f64() * 1e3;
+    let sources = commitment_trace_sources(&cycle_inputs);
     println!(
-        "[workload] commitment-source extraction: extract_trace+commitment_trace_sources={extract_ms:.2}ms, direct-from-Cycle={direct_ms:.2}ms, speedup={:.2}x",
-        extract_ms / direct_ms.max(f64::MIN_POSITIVE),
+        "[workload] commitment-source extraction: {:.2}ms",
+        extract_start.elapsed().as_secs_f64() * 1e3,
     );
 
     let one_hot_params = OneHotParams::new(log_t, bytecode_k, ram_k);
@@ -195,7 +168,6 @@ pub fn build_ecdsa_workload() -> EcdsaWorkload {
         t_start.elapsed().as_secs_f64()
     );
 
-    let _ = cycle_inputs; // consumed via `sources`; kept here just to anchor extract_trace ordering
     EcdsaWorkload {
         log_t,
         trace_len,
@@ -203,70 +175,5 @@ pub fn build_ecdsa_workload() -> EcdsaWorkload {
         ram_k,
         one_hot_params,
         sources,
-        direct_sources,
     }
-}
-
-/// Duplicate of the private `jolt_trace::extract::cycle_input`
-/// ([extract.rs:68-98](../../../crates/jolt-trace/src/extract.rs#L68-L98)).
-///
-/// Kept in lockstep with upstream via the `assert_eq!` in
-/// `build_ecdsa_workload` — if upstream's per-cycle derivation grows a new
-/// term, the assertion fires and we update this body.
-fn cycle_input(
-    cycle: &impl CycleRow,
-    bytecode: &BytecodePreprocessing,
-    memory_layout: &MemoryLayout,
-) -> CycleInput {
-    let rd_inc = match cycle.rd_write() {
-        Some((_, pre, post)) => post as i128 - pre as i128,
-        None => 0,
-    };
-    let ram_inc = match (cycle.ram_read_value(), cycle.ram_write_value()) {
-        (Some(pre), Some(post)) => post as i128 - pre as i128,
-        _ => 0,
-    };
-    let lowest = memory_layout.get_lowest_address();
-    let ram_address = cycle.ram_access_address().map(|addr| {
-        debug_assert!(
-            addr >= lowest,
-            "RAM address {addr:#x} below lowest {lowest:#x}"
-        );
-        ((addr - lowest) / 8) as u128
-    });
-
-    CycleInput {
-        dense: [rd_inc, ram_inc],
-        one_hot: [
-            Some(cycle.lookup_index()),
-            Some(bytecode.get_cycle_pc(cycle) as u128),
-            ram_address,
-        ],
-    }
-}
-
-/// Bench-side counterpart to [`extract_trace`](jolt_trace::extract_trace) that
-/// produces *only* the commitment inputs.
-///
-/// Skips `extract_trace`'s R1CS witness vector
-/// (`trace_len * NUM_VARS_PADDED` Fr-zeros) and `InstructionFlagData`
-/// construction — both of which the bench discards. Padding rule
-/// (noop / out-of-range → [`CycleInput::PADDING`]) matches upstream exactly,
-/// so the returned vector is byte-identical to
-/// `extract_trace(..).0` for the same inputs.
-fn extract_commitment_inputs<C: CycleRow>(
-    trace: &[C],
-    size: usize,
-    bytecode: &BytecodePreprocessing,
-    memory_layout: &MemoryLayout,
-) -> Vec<CycleInput> {
-    let mut inputs = Vec::with_capacity(size);
-    for t in 0..size {
-        if let Some(cycle) = trace.get(t).filter(|cycle| !cycle.is_noop()) {
-            inputs.push(cycle_input(cycle, bytecode, memory_layout));
-        } else {
-            inputs.push(CycleInput::PADDING);
-        }
-    }
-    inputs
 }
