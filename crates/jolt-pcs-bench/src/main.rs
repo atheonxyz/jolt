@@ -11,6 +11,8 @@ static ALLOC: dhat::Alloc = dhat::Alloc;
 
 mod dory_bench;
 mod dump;
+#[cfg(feature = "goldilocks")]
+mod fib_goldilocks;
 mod jolt_polys;
 mod logup_star;
 mod verify;

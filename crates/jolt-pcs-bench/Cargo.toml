@@ -31,6 +31,9 @@ jolt-poly = { workspace = true }
 jolt-trace = { workspace = true }
 jolt-witness = { workspace = true }
 jolt-openings = { path = "../jolt-openings" }
+# Phase-1 Goldilocks/WHIR base-commit (feature-gated; pulls `whir`). Only used by
+# the live fibonacci e2e under `--features goldilocks`.
+jolt-whir = { path = "../jolt-whir", optional = true }
 
 # Guest pipeline
 jolt-inlines-p256 = { workspace = true, features = ["host"] }
@@ -60,6 +63,15 @@ default = []
 # Enables dhat heap profiling. Bench binary installs a global allocator
 # wrapper that records every allocation; use only when running `--profile-alloc`.
 profile-alloc = ["dep:dhat"]
+# Phase-1 Goldilocks base-field-limb witness + WHIR base-commit. Gates the live
+# fibonacci e2e (`fib_goldilocks`), which compiles a RISC-V guest, traces it,
+# builds the base-Goldilocks limb columns, and commits them via WHIR.
+goldilocks = [
+    "dep:jolt-whir",
+    "jolt-whir/goldilocks",
+    "jolt-witness/goldilocks",
+    "jolt-field/goldilocks",
+]
 
 [package.metadata.cargo-machete]
 ignored = ["jolt-inlines-p256", "ark-bn254"]

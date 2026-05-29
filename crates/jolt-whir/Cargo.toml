@@ -1,0 +1,30 @@
+[package]
+name = "jolt-whir"
+version = "0.1.0"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+description = "WHIR commitment scheme for Jolt (Phase 1: Goldilocks base-field commit)"
+
+[lints]
+workspace = true
+
+[dependencies]
+jolt-field = { path = "../jolt-field" }
+jolt-poly = { path = "../jolt-poly" }
+jolt-witness = { path = "../jolt-witness" }
+# WHIR lives as a sibling of the jolt workspace; the workspace-level digest/blake3
+# pinning lets it coexist with the digest-0.11 Jolt graph (same as whir-pcs-bench).
+whir = { path = "../../../whir", features = ["parallel"], optional = true }
+ark-ff = { workspace = true, optional = true }
+
+[features]
+default = []
+goldilocks = [
+    "dep:whir",
+    "dep:ark-ff",
+    "jolt-field/goldilocks",
+    "jolt-witness/goldilocks",
+]
+
+[dev-dependencies]
+ark-std = { workspace = true }

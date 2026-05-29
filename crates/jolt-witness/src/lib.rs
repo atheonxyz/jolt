@@ -7,6 +7,9 @@
 use jolt_field::Field;
 use jolt_poly::EqPolynomial;
 
+#[cfg(feature = "goldilocks")]
+pub mod goldilocks;
+
 pub const NUM_DENSE_TRACE_COLUMNS: usize = 2;
 pub const NUM_ONE_HOT_TRACE_SOURCES: usize = 3;
 

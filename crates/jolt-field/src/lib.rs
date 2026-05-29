@@ -34,6 +34,11 @@ pub use limbs::Limbs;
 
 pub mod signed;
 
+#[cfg(feature = "goldilocks")]
+pub mod goldilocks;
+#[cfg(feature = "goldilocks")]
+pub use goldilocks::{Goldilocks, GoldilocksFp3};
+
 #[cfg(feature = "bn254")]
 pub mod arkworks;
 #[cfg(feature = "bn254")]
