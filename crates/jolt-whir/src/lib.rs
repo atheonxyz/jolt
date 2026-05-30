@@ -4,9 +4,11 @@
 //! `Fp3`).
 //!
 //! Phase 1 surface: [`commit_witness`] (commit the base-Goldilocks columns) and
-//! [`sanity_roundtrip`] (commit → open → verify a single column). The `#1521`
-//! `CommitmentScheme` trait impl, hiding (`whir_zk` over `Basefield`), LogUp\*
-//! pushforward GKR, and the shared spongefish transcript are Phase 2.
+//! [`sanity_roundtrip`] (commit → open → verify a single column).
+//!
+//! Phase 2 (in progress): the shared spongefish [`transcript`] (used concretely —
+//! see its module docs), the `CommitmentScheme` trait impl, LogUp\* pushforward
+//! GKR. Hiding (`whir_zk` over `Basefield`) remains Phase 3.
 
 #![cfg(feature = "goldilocks")]
 
@@ -14,7 +16,9 @@ pub mod commit;
 pub mod convert;
 pub mod params;
 pub mod sanity;
+pub mod transcript;
 
 pub use commit::{commit_witness, CommitReport};
 pub use params::whir_params;
 pub use sanity::sanity_roundtrip;
+pub use transcript::{ProverTranscript, VerifierTranscript};
