@@ -16,9 +16,11 @@ pub mod commit;
 pub mod convert;
 pub mod params;
 pub mod sanity;
+pub mod scheme;
 pub mod transcript;
 
 pub use commit::{commit_witness, CommitReport};
 pub use params::whir_params;
 pub use sanity::sanity_roundtrip;
+pub use scheme::{WhirCommitment, WhirConfig, WhirError, WhirHint, WhirScheme};
 pub use transcript::{ProverTranscript, VerifierTranscript};
