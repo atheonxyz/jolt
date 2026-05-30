@@ -6,8 +6,9 @@
 #![cfg(feature = "goldilocks")]
 #![expect(clippy::unwrap_used)]
 
-use jolt_field::goldilocks::decompose::sign_limbs_to_i128;
+use jolt_field::goldilocks::decompose::signed_limbs_recompose;
 use jolt_field::goldilocks::Goldilocks;
+use jolt_field::Field;
 use jolt_whir::{commit_witness, sanity_roundtrip};
 use jolt_witness::goldilocks::{FamilyLayout, GoldilocksLayout, GoldilocksWitnessColumns};
 use jolt_witness::{CommitmentTraceSources, CycleInput};
@@ -73,8 +74,8 @@ fn build_commit_and_open_synthetic_trace() {
     let layout = layout();
     let cols = GoldilocksWitnessColumns::build(&sources, &layout);
 
-    // 4 + 2 + 2 = 8 ra_dense columns, plus 2 Inc × 3 limb columns = 6.
-    assert_eq!(cols.columns.len(), 8 + 6);
+    // 4 + 2 + 2 = 8 ra_dense columns, plus 2 Inc × 2 (signed lo, hi) limbs = 4.
+    assert_eq!(cols.columns.len(), 8 + 4);
     assert_eq!(cols.log_t, 6); // TRACE_LEN = 2^6
     for c in &cols.columns {
         assert_eq!(c.values.len(), 1 << 6);
@@ -82,9 +83,9 @@ fn build_commit_and_open_synthetic_trace() {
 
     let report = commit_witness(&cols);
     assert_eq!(report.log_t, 6);
-    assert_eq!(report.num_columns, 14);
-    assert_eq!(report.total_base_elements, 14 * 64);
-    assert_eq!(report.committed_base_bytes, 14 * 64 * 8);
+    assert_eq!(report.num_columns, 12);
+    assert_eq!(report.total_base_elements, 12 * 64);
+    assert_eq!(report.committed_base_bytes, 12 * 64 * 8);
     assert!(report.commit_ms >= 0.0);
 
     // Sanity open/verify round-trips on non-degenerate columns (an ra_dense
@@ -108,14 +109,13 @@ fn inc_limbs_recompose_to_originals() {
             .unwrap()
             .values
     };
-    let sign = col("RdInc.sign");
     let lo = col("RdInc.lo");
     let hi = col("RdInc.hi");
 
     for (i, &orig) in sources.rd_inc.iter().enumerate() {
-        let recomposed = sign_limbs_to_i128(sign[i], [lo[i], hi[i]]);
         assert_eq!(
-            recomposed, orig,
+            signed_limbs_recompose([lo[i], hi[i]]),
+            Goldilocks::from_i128(orig),
             "RdInc limb recompose mismatch at cycle {i}"
         );
     }

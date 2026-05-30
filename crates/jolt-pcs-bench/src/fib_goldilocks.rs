@@ -171,7 +171,7 @@ mod tests {
     use super::*;
     use crate::dory_bench::bench_dory;
     use crate::jolt_polys::build_polynomial_set;
-    use jolt_field::goldilocks::decompose::sign_limbs_to_i128;
+    use jolt_field::goldilocks::decompose::signed_limbs_recompose;
     use jolt_field::goldilocks::Goldilocks;
     use jolt_field::Field;
     use jolt_whir::{commit_witness, sanity_roundtrip};
@@ -185,14 +185,14 @@ mod tests {
 
         let cols = GoldilocksWitnessColumns::build(&wl.sources, &layout);
 
-        // Column count = ra_dense chunks (one per family-chunk) + 2 Inc × 3 limbs.
+        // Column count = ra_dense chunks (one per family-chunk) + 2 Inc × 2 limbs.
         let expected_ra = wl.one_hot_params.instruction_d
             + wl.one_hot_params.bytecode_d
             + wl.one_hot_params.ram_d;
         assert_eq!(
             cols.columns.len(),
-            expected_ra + 6,
-            "column count mismatch (ra={expected_ra} + 6 Inc limbs)"
+            expected_ra + 4,
+            "column count mismatch (ra={expected_ra} + 4 Inc limbs)"
         );
         assert_eq!(cols.log_t, wl.log_t);
         for c in &cols.columns {
@@ -212,13 +212,12 @@ mod tests {
             ("RdInc", &wl.sources.rd_inc),
             ("RamInc", &wl.sources.ram_inc),
         ] {
-            let sign = col(&format!("{label}.sign"));
             let lo = col(&format!("{label}.lo"));
             let hi = col(&format!("{label}.hi"));
             for (i, &orig) in inc.iter().enumerate() {
-                let recomposed = sign_limbs_to_i128(sign[i], [lo[i], hi[i]]);
                 assert_eq!(
-                    recomposed, orig,
+                    signed_limbs_recompose([lo[i], hi[i]]),
+                    Goldilocks::from_i128(orig),
                     "{label} limb recompose mismatch at cycle {i}"
                 );
             }

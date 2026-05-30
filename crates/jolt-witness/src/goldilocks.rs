@@ -4,14 +4,16 @@
 //! columns of the base-field-limb representation:
 //! - `ra_dense` per one-hot chunk (`Some(k) → k`, `None → 0`), one column per
 //!   chunk of each RA family;
-//! - `RdInc`/`RamInc` decomposed into `sign + lo + hi` base-field limbs;
+//! - `RdInc`/`RamInc` decomposed into **signed two limbs** `lo + hi·2^32` (the
+//!   high limb carries the sign), so recomposition is linear in the committed
+//!   columns and the `Val = Σ inc·wa·LT` sumcheck stays degree-3;
 //!
 //! all in the base field [`Goldilocks`], padded to the committed length
 //! `2^log_t`. There is **no** pushforward `P^F` here — that is the Phase-2
 //! LogUp\* GKR. The recomposition / range-check *constraints* over these limbs
-//! are also Phase 2; Phase 1 only produces the columns to be committed.
+//! live in the Goldilocks prover crate; this module only produces the columns.
 
-use jolt_field::goldilocks::decompose::i128_to_sign_limbs;
+use jolt_field::goldilocks::decompose::i128_to_signed_limbs;
 use jolt_field::goldilocks::Goldilocks;
 use jolt_field::Field;
 
@@ -107,21 +109,15 @@ impl GoldilocksWitnessColumns {
             }
         }
 
-        // Inc columns: signed increment → (sign, lo, hi) base-field limbs.
+        // Inc columns: signed increment → (lo, hi) base-field limbs, hi signed.
         for (label, inc) in [("RdInc", &sources.rd_inc), ("RamInc", &sources.ram_inc)] {
-            let mut sign = Vec::with_capacity(trace_len);
             let mut lo = Vec::with_capacity(trace_len);
             let mut hi = Vec::with_capacity(trace_len);
             for &v in inc {
-                let (s, [l, h]) = i128_to_sign_limbs(v);
-                sign.push(s);
+                let [l, h] = i128_to_signed_limbs(v);
                 lo.push(l);
                 hi.push(h);
             }
-            columns.push(GoldilocksColumn {
-                label: format!("{label}.sign"),
-                values: pad_to(sign, committed_len),
-            });
             columns.push(GoldilocksColumn {
                 label: format!("{label}.lo"),
                 values: pad_to(lo, committed_len),

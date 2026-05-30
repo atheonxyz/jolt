@@ -28,6 +28,12 @@ pub const P: u64 = 0xFFFF_FFFF_0000_0001;
 /// `EPSILON = 2^32 − 1 = 2^64 mod p`.
 const EPSILON: u64 = 0xFFFF_FFFF;
 
+/// `2^-32 mod p`, used for the limb carry trick `carry = 2^-32·(a+b−sum)`.
+///
+/// Exists because `2^32 | p−1`; equals `1 − 2^32 mod p = 2^64 − 2^33 + 2` (derived
+/// from `2^96 ≡ −1`). Canonical (`< p`). Validated by the `carry_bit` oracle test.
+pub(crate) const INV_TWO_POW_32: Goldilocks = Goldilocks(18_446_744_065_119_617_026);
+
 /// Goldilocks field element, stored non-canonically in `[0, 2^64)`.
 #[derive(Clone, Copy, Default)]
 #[repr(transparent)]

@@ -12,7 +12,10 @@ use rand::{Rng, SeedableRng};
 use rand_chacha::ChaCha20Rng;
 
 use super::base::{Goldilocks, P};
-use super::decompose::{i128_to_sign_limbs, limbs_to_u64, sign_limbs_to_i128, u64_to_limbs};
+use super::decompose::{
+    carry_bit, i128_to_sign_limbs, i128_to_signed_limbs, limbs_to_u128, limbs_to_u64,
+    sign_limbs_to_i128, signed_limbs_recompose, u128_to_limbs, u64_to_limbs,
+};
 use super::ext3::GoldilocksFp3;
 use super::{
     Fp3Accumulator, Fp3ScalarAccumulator, GoldilocksAccumulator, GoldilocksScalarAccumulator,
@@ -414,5 +417,77 @@ fn limb_roundtrips() {
         assert_eq!(sign_limbs_to_i128(s, l), mag as i128);
         let (s, l) = i128_to_sign_limbs(-(mag as i128));
         assert_eq!(sign_limbs_to_i128(s, l), -(mag as i128));
+    }
+}
+
+#[test]
+fn signed_2limb_recompose_matches_from_i128() {
+    let mut r = rng();
+    for _ in 0..5000 {
+        let v = r.gen::<i64>() as i128;
+        assert_eq!(
+            signed_limbs_recompose(i128_to_signed_limbs(v)),
+            Goldilocks::from_i128(v)
+        );
+    }
+    // i65 boundaries (|v| < 2^64)
+    let mags: [i128; 7] = [
+        0,
+        1,
+        (1 << 32) - 1,
+        1 << 32,
+        (1i128 << 63) - 1,
+        1i128 << 63,
+        (1i128 << 64) - 1,
+    ];
+    for &mag in &mags {
+        for v in [mag, -mag] {
+            assert_eq!(
+                signed_limbs_recompose(i128_to_signed_limbs(v)),
+                Goldilocks::from_i128(v),
+                "v = {v}"
+            );
+        }
+    }
+}
+
+#[test]
+fn carry_bit_matches_real_carry() {
+    // For a, b < 2^32: carry_bit(a, b, (a+b) mod 2^32) == floor((a+b)/2^32) in {0,1}.
+    let mut r = rng();
+    for _ in 0..5000 {
+        let a = u64::from(r.gen::<u32>());
+        let b = u64::from(r.gen::<u32>());
+        let raw = a + b; // < 2^33
+        let sum = raw & 0xFFFF_FFFF;
+        let carry = raw >> 32; // 0 or 1
+        assert_eq!(
+            carry_bit(
+                Goldilocks::from_u64(a),
+                Goldilocks::from_u64(b),
+                Goldilocks::from_u64(sum),
+            ),
+            Goldilocks::from_u64(carry),
+        );
+    }
+}
+
+#[test]
+fn u128_limb_roundtrip_and_field_recompose() {
+    let p = p_big();
+    let weight = |i: usize| Goldilocks::from_u128(1u128 << (32 * i));
+    let field_recompose =
+        |limbs: [Goldilocks; 4]| -> Goldilocks { (0..4).map(|i| limbs[i] * weight(i)).sum() };
+    let mut r = rng();
+    for _ in 0..5000 {
+        let v = (u128::from(r.gen::<u64>()) << 64) | u128::from(r.gen::<u64>());
+        let limbs = u128_to_limbs(v);
+        assert_eq!(limbs_to_u128(limbs), v);
+        assert_gl_eq_big(field_recompose(limbs), BigUint::from(v) % &p);
+    }
+    // genuine 64x64 -> 128 products (the MUL site)
+    for _ in 0..2000 {
+        let prod = u128::from(r.gen::<u64>()) * u128::from(r.gen::<u64>());
+        assert_eq!(limbs_to_u128(u128_to_limbs(prod)), prod);
     }
 }
