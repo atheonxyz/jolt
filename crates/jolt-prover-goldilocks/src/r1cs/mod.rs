@@ -7,5 +7,7 @@
 //! ([`mul`]); the eq-conditional constraints + full variable layout follow.
 
 pub mod mul;
+pub mod signed_value;
 
 pub use mul::{push_mul_constraints, MulVars, NUM_MUL_ROWS};
+pub use signed_value::{push_signed_value_derivation, SignedValueVars, NUM_SIGNED_VALUE_ROWS};

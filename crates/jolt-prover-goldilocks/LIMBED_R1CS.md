@@ -28,6 +28,26 @@ Three limb conventions; the scalar field is `F = GoldilocksFp3`, limbs embed via
 Recompose weight `2³² < 2⁶³` fits `i64`, so the existing `row::<F>` helper works for
 all linear recompositions; only genuine `> i64` constants would need `row_wide`.
 
+### Dual-use operands `LEFT_INSTRUCTION_INPUT` / `RIGHT_INSTRUCTION_INPUT` (resolved)
+
+These appear **both** linearly (lookup-operand eq-constraints 7/8/9/10) **and**
+multiplicatively (the always-present `Product = Left × Right`, constraint 19).
+Grounding in jolt-core (`zkvm/r1cs/inputs.rs:281-290`): `to_instruction_inputs`
+returns `(left: u64, right: i128)` for **every** instruction, and the product is
+`S64::from_u64(left) × S128::from_i128(right)` — i.e. **Left is always unsigned**
+and only **Right is signed** (the per-opcode MUL signedness is baked into `right`).
+So:
+- `LEFT_INSTRUCTION_INPUT` = **unsigned 2-limb** `(lo, hi)`. Linear value `lo+2³²·hi`
+  is used directly in the eq-constraints; the same `(lo, hi)` are the MUL magnitude
+  limbs (the schoolbook's `left_sign` is constant `0`).
+- `RIGHT_INSTRUCTION_INPUT` = **sign + magnitude** `(sign, mlo, mhi)` for the MUL
+  schoolbook, **plus a derived signed value** `RIGHT_VAL` for the linear uses:
+  one degree-2 derivation `RIGHT_VAL = (1−2·sign)·(mlo + 2³²·mhi)` (realized as two
+  product rows `sign·mlo`, `sign·mhi` + one linear row). The eq-constraints use
+  `RIGHT_VAL` **linearly**, so they stay degree-2 in the outer sumcheck; the
+  schoolbook uses `(sign, mlo, mhi)`. This is the only place a derived value var is
+  needed (everything else recomposes linearly).
+
 ## Per-variable layout (`z`, per cycle)
 
 | Variable(s) | Repr | # cols |
