@@ -134,4 +134,74 @@ impl WhirScheme {
             .verify([&form as &dyn LinearForm<Field64_3>])
             .map_err(|_| WhirError::VerificationFailed)
     }
+
+    /// Batch-open `columns` (all of the same committed length / one size class)
+    /// at `points` via WHIR's native two-level geometric RLC — a single `prove`
+    /// over N vectors × M forms that shares the sumcheck rounds and the final
+    /// codeword. `evals` is the M×N matrix in **form-major** order:
+    /// `evals[f * columns.len() + v] = columns[v](points[f])`.
+    ///
+    /// Cross-size-class batching is the caller's job: invoke `open_batch` once per
+    /// distinct column length on the *same* [`ProverTranscript`] (the shared
+    /// sponge keeps the classes in lockstep), with the verifier mirroring the
+    /// order via [`verify_batch`](Self::verify_batch).
+    pub fn open_batch(
+        transcript: &mut ProverTranscript,
+        config: &WhirConfig,
+        columns: &[&[Goldilocks]],
+        hints: Vec<WhirHint>,
+        points: &[Vec<GoldilocksFp3>],
+        evals: &[GoldilocksFp3],
+    ) {
+        assert_eq!(hints.len(), columns.len(), "one hint per committed column");
+        assert_eq!(
+            evals.len(),
+            columns.len() * points.len(),
+            "evals must be the M×N (form-major) evaluation matrix"
+        );
+        let vectors = columns
+            .iter()
+            .map(|c| Cow::from(column_to_field64(c)))
+            .collect::<Vec<_>>();
+        let forms: Vec<Box<dyn LinearForm<Field64_3>>> = points
+            .iter()
+            .map(|p| {
+                let pt: Vec<Field64_3> = p.iter().copied().map(to_field64_3).collect();
+                Box::new(MultilinearExtension { point: pt }) as Box<dyn LinearForm<Field64_3>>
+            })
+            .collect();
+        let ev = evals.iter().copied().map(to_field64_3).collect::<Vec<_>>();
+        let _ = config.prove(
+            transcript.state_mut(),
+            vectors,
+            hints.into_iter().map(Cow::Owned).collect(),
+            forms,
+            Cow::from(ev),
+        );
+    }
+
+    /// Verifier counterpart of [`open_batch`](Self::open_batch): check the N
+    /// `commitments` open to the M×N `evals` matrix at `points`. `commitments`,
+    /// `points`, and `evals` must use the identical order/layout as the prover.
+    pub fn verify_batch(
+        transcript: &mut VerifierTranscript,
+        config: &WhirConfig,
+        commitments: &[&WhirCommitment],
+        points: &[Vec<GoldilocksFp3>],
+        evals: &[GoldilocksFp3],
+    ) -> Result<(), WhirError> {
+        let ev = evals.iter().copied().map(to_field64_3).collect::<Vec<_>>();
+        let final_claim = config
+            .verify(transcript.state_mut(), commitments, &ev)
+            .map_err(|_| WhirError::VerificationFailed)?;
+        let forms: Vec<MultilinearExtension<Field64_3>> = points
+            .iter()
+            .map(|p| MultilinearExtension {
+                point: p.iter().copied().map(to_field64_3).collect(),
+            })
+            .collect();
+        final_claim
+            .verify(forms.iter().map(|f| f as &dyn LinearForm<Field64_3>))
+            .map_err(|_| WhirError::VerificationFailed)
+    }
 }

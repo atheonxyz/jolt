@@ -9,7 +9,7 @@
 
 use jolt_field::goldilocks::{Goldilocks, GoldilocksFp3};
 use jolt_field::Field;
-use jolt_whir::{ProverTranscript, VerifierTranscript, WhirScheme};
+use jolt_whir::{ProverTranscript, VerifierTranscript, WhirCommitment, WhirScheme};
 
 /// Deterministic splitmix64.
 struct Rng(u64);
@@ -101,4 +101,65 @@ fn whir_scheme_multi_commit_then_open_one() {
         commitments.push(WhirScheme::receive_commitment(&mut vt, &config).expect("receive"));
     }
     WhirScheme::verify(&mut vt, &config, &commitments[open_idx], &pt, eval).expect("verify");
+}
+
+#[test]
+fn whir_scheme_batch_open_two_size_classes() {
+    // Class A: length 2^6, 3 columns at 2 points. Class B: length 2^4, 2 columns at 1 point.
+    let (nv_a, n_a, m_a) = (6usize, 3usize, 2usize);
+    let (nv_b, n_b, m_b) = (4usize, 2usize, 1usize);
+    let cols_a: Vec<Vec<Goldilocks>> = (0..n_a)
+        .map(|k| column(1 << nv_a, 0x2000 + k as u64))
+        .collect();
+    let cols_b: Vec<Vec<Goldilocks>> = (0..n_b)
+        .map(|k| column(1 << nv_b, 0x3000 + k as u64))
+        .collect();
+    let pts_a: Vec<Vec<GoldilocksFp3>> = (0..m_a).map(|f| point(nv_a, 0x4000 + f as u64)).collect();
+    let pts_b: Vec<Vec<GoldilocksFp3>> = (0..m_b).map(|f| point(nv_b, 0x5000 + f as u64)).collect();
+
+    let cfg_a = WhirScheme::config(1 << nv_a);
+    let cfg_b = WhirScheme::config(1 << nv_b);
+
+    // form-major evals: evals[f * N + v] = columns[v](points[f]).
+    let mut evals_a = Vec::with_capacity(m_a * n_a);
+    for pt in &pts_a {
+        for c in &cols_a {
+            evals_a.push(WhirScheme::evaluate(&cfg_a, c, pt));
+        }
+    }
+    let mut evals_b = Vec::with_capacity(m_b * n_b);
+    for pt in &pts_b {
+        for c in &cols_b {
+            evals_b.push(WhirScheme::evaluate(&cfg_b, c, pt));
+        }
+    }
+
+    // Prover: commit all (A then B) on one transcript, then batch-open per class.
+    let mut t = ProverTranscript::new("batch");
+    let hints_a: Vec<_> = cols_a
+        .iter()
+        .map(|c| WhirScheme::commit(&mut t, &cfg_a, c))
+        .collect();
+    let hints_b: Vec<_> = cols_b
+        .iter()
+        .map(|c| WhirScheme::commit(&mut t, &cfg_b, c))
+        .collect();
+    let crefs_a: Vec<&[Goldilocks]> = cols_a.iter().map(Vec::as_slice).collect();
+    let crefs_b: Vec<&[Goldilocks]> = cols_b.iter().map(Vec::as_slice).collect();
+    WhirScheme::open_batch(&mut t, &cfg_a, &crefs_a, hints_a, &pts_a, &evals_a);
+    WhirScheme::open_batch(&mut t, &cfg_b, &crefs_b, hints_b, &pts_b, &evals_b);
+    let proof = t.into_proof();
+
+    // Verifier: receive all (A then B) in order, then verify per class.
+    let mut vt = VerifierTranscript::new("batch", &proof);
+    let comms_a: Vec<WhirCommitment> = (0..n_a)
+        .map(|_| WhirScheme::receive_commitment(&mut vt, &cfg_a).expect("recv a"))
+        .collect();
+    let comms_b: Vec<WhirCommitment> = (0..n_b)
+        .map(|_| WhirScheme::receive_commitment(&mut vt, &cfg_b).expect("recv b"))
+        .collect();
+    let cref_a: Vec<&WhirCommitment> = comms_a.iter().collect();
+    let cref_b: Vec<&WhirCommitment> = comms_b.iter().collect();
+    WhirScheme::verify_batch(&mut vt, &cfg_a, &cref_a, &pts_a, &evals_a).expect("verify a");
+    WhirScheme::verify_batch(&mut vt, &cfg_b, &cref_b, &pts_b, &evals_b).expect("verify b");
 }
