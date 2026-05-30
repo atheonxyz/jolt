@@ -14,6 +14,10 @@ use rand_chacha::ChaCha20Rng;
 use super::base::{Goldilocks, P};
 use super::decompose::{i128_to_sign_limbs, limbs_to_u64, sign_limbs_to_i128, u64_to_limbs};
 use super::ext3::GoldilocksFp3;
+use super::{
+    Fp3Accumulator, Fp3ScalarAccumulator, GoldilocksAccumulator, GoldilocksScalarAccumulator,
+};
+use crate::accumulator::{FieldAccumulator, FieldScalarAccumulator};
 use crate::Field;
 
 fn p_big() -> BigUint {
@@ -210,6 +214,183 @@ fn fp3_base_embedding() {
         GoldilocksFp3::from_u64(42),
         GoldilocksFp3::from_base(Goldilocks::from_u64(42))
     );
+}
+
+#[test]
+fn fp3_mul_pow_2_matches_oracle() {
+    let mut r = rng();
+    let p = p_big();
+    for _ in 0..1000 {
+        let a = rand_fp3(&mut r);
+        let pow = r.gen_range(0..200usize);
+        // a · 2^pow is the field scalar-multiply by (2^pow mod p): componentwise.
+        let factor = (BigUint::from(1u32) << pow as u32) % &p;
+        let ab = fp3_big(&a);
+        assert_fp3_eq_big(
+            a.mul_pow_2(pow),
+            [&ab[0] * &factor, &ab[1] * &factor, &ab[2] * &factor],
+        );
+    }
+}
+
+#[test]
+fn fp3_from_u128_embeds_in_base() {
+    assert_eq!(
+        GoldilocksFp3::from(u128::MAX),
+        GoldilocksFp3::from_base(Goldilocks::from(u128::MAX))
+    );
+    assert_eq!(Goldilocks::from(7u128), Goldilocks::from_u64(7));
+}
+
+// ---------- deferred-reduction accumulators ----------
+
+#[test]
+fn goldilocks_accumulator_matches_eager_sum() {
+    let mut r = rng();
+    for _ in 0..300 {
+        let n = r.gen_range(1..80usize);
+        let mut acc = GoldilocksAccumulator::default();
+        let mut eager = Goldilocks::zero();
+        for _ in 0..n {
+            let (a, b) = (rand_gl(&mut r), rand_gl(&mut r));
+            acc.fmadd(a, b);
+            eager += a * b;
+        }
+        assert_eq!(acc.reduce(), eager);
+    }
+    assert_eq!(
+        GoldilocksAccumulator::default().reduce(),
+        Goldilocks::zero()
+    );
+}
+
+#[test]
+fn goldilocks_accumulator_merge_matches_eager() {
+    let mut r = rng();
+    let (mut a1, mut a2) = (
+        GoldilocksAccumulator::default(),
+        GoldilocksAccumulator::default(),
+    );
+    let mut eager = Goldilocks::zero();
+    for _ in 0..60 {
+        let (a, b) = (rand_gl(&mut r), rand_gl(&mut r));
+        a1.fmadd(a, b);
+        eager += a * b;
+    }
+    for _ in 0..60 {
+        let (a, b) = (rand_gl(&mut r), rand_gl(&mut r));
+        a2.fmadd(a, b);
+        eager += a * b;
+    }
+    a1.merge(a2);
+    assert_eq!(a1.reduce(), eager);
+}
+
+#[test]
+fn goldilocks_accumulator_large_exceeds_2pow20() {
+    // Exercises the 192-bit capacity with > 2^20 products of full-width operands.
+    let mut r = rng();
+    let mut acc = GoldilocksAccumulator::default();
+    let mut eager = Goldilocks::zero();
+    for _ in 0..(1usize << 20) + 7 {
+        let (a, b) = (rand_gl(&mut r), rand_gl(&mut r));
+        acc.fmadd(a, b);
+        eager += a * b;
+    }
+    assert_eq!(acc.reduce(), eager);
+}
+
+#[test]
+fn goldilocks_scalar_accumulator_matches_eager() {
+    let mut r = rng();
+    for _ in 0..300 {
+        let n = r.gen_range(1..80usize);
+        let mut acc = GoldilocksScalarAccumulator::default();
+        let mut eager = Goldilocks::zero();
+        for _ in 0..n {
+            let v = rand_gl(&mut r);
+            match r.gen_range(0..3u8) {
+                0 => {
+                    acc.add(v);
+                    eager += v;
+                }
+                1 => {
+                    let s = r.gen::<u64>();
+                    acc.add_mul_u64(v, s);
+                    eager += v.mul_u64(s);
+                }
+                _ => {
+                    let s = r.gen::<u128>();
+                    acc.add_mul_u128(v, s);
+                    eager += v.mul_u128(s);
+                }
+            }
+        }
+        assert_eq!(acc.reduce(), eager);
+    }
+}
+
+#[test]
+fn fp3_accumulator_matches_eager_sum() {
+    let mut r = rng();
+    for _ in 0..300 {
+        let n = r.gen_range(1..60usize);
+        let mut acc = Fp3Accumulator::default();
+        let mut eager = GoldilocksFp3::zero();
+        for _ in 0..n {
+            let (a, b) = (rand_fp3(&mut r), rand_fp3(&mut r));
+            acc.fmadd(a, b);
+            eager += a * b;
+        }
+        assert_eq!(acc.reduce(), eager);
+    }
+}
+
+#[test]
+fn fp3_accumulator_fmadd_base_matches_eager() {
+    let mut r = rng();
+    for _ in 0..300 {
+        let n = r.gen_range(1..60usize);
+        let mut acc = Fp3Accumulator::default();
+        let mut eager = GoldilocksFp3::zero();
+        for _ in 0..n {
+            let a = rand_fp3(&mut r);
+            let b = rand_gl(&mut r);
+            acc.fmadd_base(a, b);
+            eager += a.mul_by_base(b);
+        }
+        assert_eq!(acc.reduce(), eager);
+    }
+}
+
+#[test]
+fn fp3_scalar_accumulator_matches_eager() {
+    let mut r = rng();
+    for _ in 0..300 {
+        let n = r.gen_range(1..60usize);
+        let mut acc = Fp3ScalarAccumulator::default();
+        let mut eager = GoldilocksFp3::zero();
+        for _ in 0..n {
+            let v = rand_fp3(&mut r);
+            match r.gen_range(0..3u8) {
+                0 => {
+                    acc.add(v);
+                    eager += v;
+                }
+                1 => {
+                    let s = r.gen::<u64>();
+                    acc.add_mul_u64(v, s);
+                    eager += v.mul_u64(s);
+                }
+                _ => {
+                    let s = r.gen::<u128>();
+                    acc.add_mul_u128(v, s);
+                    eager += v.mul_u128(s);
+                }
+            }
+        }
+        assert_eq!(acc.reduce(), eager);
+    }
 }
 
 // ---------- limb decomposition ----------

@@ -8,6 +8,7 @@
 //! Arithmetic is hand-coded from the Plonky2 / lambda_vm algorithms; correctness
 //! is guarded by `num-bigint` oracle tests in `tests`.
 
+mod accumulator;
 mod base;
 pub mod decompose;
 mod ext3;
@@ -15,5 +16,8 @@ mod ext3;
 #[cfg(test)]
 mod tests;
 
+pub use accumulator::{
+    Fp3Accumulator, Fp3ScalarAccumulator, GoldilocksAccumulator, GoldilocksScalarAccumulator,
+};
 pub use base::Goldilocks;
 pub use ext3::GoldilocksFp3;

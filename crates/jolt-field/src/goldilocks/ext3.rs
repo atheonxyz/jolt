@@ -16,8 +16,8 @@ use num_traits::{One, Zero};
 use rand_core::RngCore;
 use serde::{Deserialize, Serialize};
 
+use super::accumulator::{Fp3Accumulator, Fp3ScalarAccumulator};
 use super::base::Goldilocks;
-use crate::accumulator::{NaiveAccumulator, NaiveScalarAccumulator};
 use crate::Field;
 
 /// `Fp3 = Goldilocks[x]/(x³ − 2)`. Stored as `[c0, c1, c2]`.
@@ -206,9 +206,16 @@ impl<'a> Product<&'a GoldilocksFp3> for GoldilocksFp3 {
     }
 }
 
+impl From<u128> for GoldilocksFp3 {
+    #[inline]
+    fn from(v: u128) -> Self {
+        Self::from_base(Goldilocks::from(v))
+    }
+}
+
 impl Field for GoldilocksFp3 {
-    type Accumulator = NaiveAccumulator<Self>;
-    type ScalarAccumulator = NaiveScalarAccumulator<Self>;
+    type Accumulator = Fp3Accumulator;
+    type ScalarAccumulator = Fp3ScalarAccumulator;
 
     const NUM_BYTES: usize = 24;
 

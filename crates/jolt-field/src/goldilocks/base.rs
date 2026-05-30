@@ -20,7 +20,7 @@ use num_traits::{One, Zero};
 use rand_core::RngCore;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
-use crate::accumulator::{NaiveAccumulator, NaiveScalarAccumulator};
+use super::accumulator::{GoldilocksAccumulator, GoldilocksScalarAccumulator};
 use crate::Field;
 
 /// The Goldilocks prime `p = 2^64 − 2^32 + 1`.
@@ -99,6 +99,29 @@ fn reduce128(x: u128) -> u64 {
     // x_hi_lo < 2^32 so the shift does not overflow.
     let t1 = (x_hi_lo << 32) - x_hi_lo;
     add_gl(t0, t1)
+}
+
+/// Reduce a 192-bit integer `x = x[0] + x[1]·2^64 + x[2]·2^128` to `[0, 2^64)`.
+///
+/// Uses `2^128 ≡ −2^32 (mod p)` (from `2^96 ≡ −1`): the high limb's contribution
+/// is `x[2]·2^128 ≡ −(x[2]·2^32)`, so we subtract it from the reduced low 128 bits.
+/// The backing accumulator for `Goldilocks` deferred fmadd.
+#[inline]
+pub(crate) fn reduce192(x: [u64; 3]) -> u64 {
+    let lo128 = (x[0] as u128) | ((x[1] as u128) << 64);
+    let r_lo = reduce128(lo128);
+    // x[2] < 2^64 ⇒ (x[2] << 32) < 2^96 fits a u128; reduce128 gives x[2]·2^32 mod p.
+    let hi = reduce128((x[2] as u128) << 32);
+    sub_gl(r_lo, hi)
+}
+
+/// Reduce a 256-bit integer `x = Σ x[i]·2^(64i)` to `[0, 2^64)`.
+///
+/// `2^192 ≡ 1 (mod p)` (from `2^96 ≡ −1`), so the top limb contributes `+ x[3]`.
+/// The backing accumulator for the `Goldilocks` × raw-integer scalar fmadd.
+#[inline]
+pub(crate) fn reduce256(x: [u64; 4]) -> u64 {
+    add_gl(reduce192([x[0], x[1], x[2]]), reduce128(x[3] as u128))
 }
 
 #[inline(always)]
@@ -299,9 +322,16 @@ impl<'a> Product<&'a Goldilocks> for Goldilocks {
     }
 }
 
+impl From<u128> for Goldilocks {
+    #[inline]
+    fn from(v: u128) -> Self {
+        <Self as Field>::from_u128(v)
+    }
+}
+
 impl Field for Goldilocks {
-    type Accumulator = NaiveAccumulator<Self>;
-    type ScalarAccumulator = NaiveScalarAccumulator<Self>;
+    type Accumulator = GoldilocksAccumulator;
+    type ScalarAccumulator = GoldilocksScalarAccumulator;
 
     const NUM_BYTES: usize = 8;
 
