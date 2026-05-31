@@ -7,7 +7,9 @@
 //! deferred to a later pass (OPT-E); each instance here binds all variables plainly.
 
 pub mod instruction_input;
+pub mod outer;
 pub mod shift;
 
 pub use instruction_input::{InstructionInput, InstructionInputParams};
+pub use outer::{SpartanOuter, SpartanOuterParams};
 pub use shift::{SpartanShift, SpartanShiftParams};

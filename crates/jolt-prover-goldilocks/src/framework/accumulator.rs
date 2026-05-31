@@ -139,6 +139,12 @@ pub enum VirtualPolynomial {
     RamValFinal,
     RamHammingWeight,
     UnivariateSkip,
+    /// Spartan outer R1CS matrix-vector products `Az`/`Bz`/`Cz` (the decoupled outer sumcheck's
+    /// reduced claims; jolt-core instead caches the individual `z`-input openings and reconstructs
+    /// these via the R1CS matrices — that matrix→`z` reduction is the deferred `R1CSEval`, OPT-E).
+    SpartanAz,
+    SpartanBz,
+    SpartanCz,
 }
 
 /// Map key: which polynomial an opening belongs to.
