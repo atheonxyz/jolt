@@ -7,3 +7,4 @@ pub mod instruction_lookups;
 pub mod ram;
 pub mod registers;
 pub mod shout_read_raf;
+pub mod spartan;
