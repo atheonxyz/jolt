@@ -18,15 +18,19 @@
 //! MLEs at the bound point. Degree-3 (`eq · io_mask · Val_diff`, three multilinear factors —
 //! mirrors jolt-core `OUTPUT_SUMCHECK_DEGREE_BOUND = 3`).
 //!
+//! Uses the **Gruen + Dao-Thaler split-eq** round polynomial (`GruenSplitEqPolynomial` +
+//! `gruen_poly_deg_3`) with **unreduced accumulation** (`F::Accumulator`) over the per-pair
+//! quadratic — the same optimization jolt-core uses.
+//!
 //! **Decoupled from the trace / program I/O** (the M5 convention): the instance takes the
 //! materialized `val_final`, `val_io`, and `io_mask` columns directly, instead of jolt-core's
-//! `JoltDevice`/`RangeMaskPolynomial`/`remap_address`/`eval_io_mle` machinery. jolt-core's Gruen
-//! split-eq round polynomial and the phase-1/2/3 gap-round interleaving (with the
-//! `2^phase3_cycle_rounds` pre-scaling) are perf optimizations deferred here (single-phase,
-//! plain dense `eq` table, all `log_K` rounds are address rounds).
+//! `JoltDevice`/`RangeMaskPolynomial`/`remap_address`/`eval_io_mle` machinery. The only deferral
+//! is the phase-1/2/3 gap-round interleaving (with the `2^phase3_cycle_rounds` pre-scaling), which
+//! exists solely because the real prover binds this instance on a *batched* address/cycle schedule
+//! shared with the RAM read-write checking — it lands with the M8 batched stage driver.
 
-use jolt_field::Field;
-use jolt_poly::{BindingOrder, EqPolynomial, UnivariatePoly};
+use jolt_field::{Field, FieldAccumulator};
+use jolt_poly::{BindingOrder, EqPolynomial, GruenSplitEqPolynomial, UnivariatePoly};
 
 use crate::framework::accumulator::{OpeningAccumulator, Openings, SumcheckId, VirtualPolynomial};
 use crate::framework::poly::MultilinearPolynomial;
@@ -56,7 +60,8 @@ impl<F: Field> RamOutputCheckParams<F> {
 /// (to recompute their MLEs); only `Val_final` is opened.
 pub struct RamOutputCheck<F: Field> {
     pub params: RamOutputCheckParams<F>,
-    eq: MultilinearPolynomial<F>,
+    /// Gruen + Dao-Thaler split-eq over the address variables (the `eq(r_address, ·)` factor).
+    eq: GruenSplitEqPolynomial<F>,
     io_mask: MultilinearPolynomial<F>,
     val_final: MultilinearPolynomial<F>,
     val_io: MultilinearPolynomial<F>,
@@ -73,10 +78,10 @@ impl<F: Field> RamOutputCheck<F> {
         val_io: Vec<F>,
         io_mask: Vec<F>,
     ) -> Self {
-        let eq = EqPolynomial::<F>::evals(&params.r_address, None);
+        let eq = GruenSplitEqPolynomial::new(&params.r_address, BindingOrder::LowToHigh);
         Self {
             params,
-            eq: MultilinearPolynomial::from(eq),
+            eq,
             io_mask: MultilinearPolynomial::from(io_mask.clone()),
             val_final: MultilinearPolynomial::from(val_final),
             val_io: MultilinearPolynomial::from(val_io.clone()),
@@ -87,9 +92,10 @@ impl<F: Field> RamOutputCheck<F> {
 
     /// Build a verifier instance holding only the public `io_mask`/`val_io` columns.
     pub fn new_verifier(params: RamOutputCheckParams<F>, val_io: Vec<F>, io_mask: Vec<F>) -> Self {
+        let eq = GruenSplitEqPolynomial::new(&params.r_address, BindingOrder::LowToHigh);
         Self {
             params,
-            eq: MultilinearPolynomial::from(vec![F::zero()]),
+            eq,
             io_mask: MultilinearPolynomial::from(vec![F::zero()]),
             val_final: MultilinearPolynomial::from(vec![F::zero()]),
             val_io: MultilinearPolynomial::from(vec![F::zero()]),
@@ -112,32 +118,35 @@ impl<F: Field> SumcheckInstance<F> for RamOutputCheck<F> {
         F::zero()
     }
 
-    fn compute_message(&mut self, _round: usize, _previous_claim: F) -> UnivariatePoly<F> {
-        // Degree-3 product `eq · io_mask · (val_final − val_io)` ⇒ 4 evaluation points.
-        let half = self.eq.len() / 2;
-        let mut evals = [F::zero(); 4];
-        for g in 0..half {
-            let eq_e = self
-                .eq
-                .sumcheck_evals_array::<4>(g, BindingOrder::LowToHigh);
-            let io_e = self
-                .io_mask
-                .sumcheck_evals_array::<4>(g, BindingOrder::LowToHigh);
-            let vf_e = self
-                .val_final
-                .sumcheck_evals_array::<4>(g, BindingOrder::LowToHigh);
-            let vio_e = self
-                .val_io
-                .sumcheck_evals_array::<4>(g, BindingOrder::LowToHigh);
-            for k in 0..4 {
-                evals[k] += eq_e[k] * io_e[k] * (vf_e[k] - vio_e[k]);
-            }
-        }
-        UnivariatePoly::from_evals(&evals)
+    fn compute_message(&mut self, _round: usize, previous_claim: F) -> UnivariatePoly<F> {
+        // Gruen + Dao-Thaler: the eq factor is handled by `gruen_poly_deg_3`; the per-pair
+        // quadratic `q(X) = io_mask(X)·(val_final(X) − val_io(X))` is condensed to its constant
+        // and X² coefficients, E_out·E_in-weighted via the split, accumulated unreduced.
+        let io_mask = &self.io_mask;
+        let val_final = &self.val_final;
+        let val_io = &self.val_io;
+        let [q_constant, q_quadratic] = self.eq.fold_out_in(
+            || [<F as Field>::Accumulator::default(); 2],
+            |inner: &mut [<F as Field>::Accumulator; 2], group, _x_in, e_in| {
+                let io0 = io_mask.get_bound_coeff(2 * group);
+                let io1 = io_mask.get_bound_coeff(2 * group + 1);
+                let v0 = val_final.get_bound_coeff(2 * group) - val_io.get_bound_coeff(2 * group);
+                let v1 = val_final.get_bound_coeff(2 * group + 1)
+                    - val_io.get_bound_coeff(2 * group + 1);
+                inner[0].fmadd(e_in, io0 * v0);
+                inner[1].fmadd(e_in, (io1 - io0) * (v1 - v0));
+            },
+            |_x_out, e_out, inner: [<F as Field>::Accumulator; 2]| {
+                [e_out * inner[0].reduce(), e_out * inner[1].reduce()]
+            },
+            |a: [F; 2], b: [F; 2]| [a[0] + b[0], a[1] + b[1]],
+        );
+        self.eq
+            .gruen_poly_deg_3(q_constant, q_quadratic, previous_claim)
     }
 
     fn bind(&mut self, r: F, _round: usize) {
-        self.eq.bind_parallel(r, BindingOrder::LowToHigh);
+        self.eq.bind(r);
         self.io_mask.bind_parallel(r, BindingOrder::LowToHigh);
         self.val_final.bind_parallel(r, BindingOrder::LowToHigh);
         self.val_io.bind_parallel(r, BindingOrder::LowToHigh);
