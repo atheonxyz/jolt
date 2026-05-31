@@ -15,5 +15,6 @@
 pub mod field;
 pub mod framework;
 pub mod r1cs;
+pub mod zkvm;
 
 pub use field::{Base, F};
