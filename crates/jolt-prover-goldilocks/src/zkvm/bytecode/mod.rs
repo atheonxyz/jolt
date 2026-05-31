@@ -3,4 +3,6 @@
 
 pub mod read_raf_checking;
 
-pub use read_raf_checking::{BytecodeReadRaf, BytecodeReadRafParams, ReadRafStage};
+pub use read_raf_checking::{
+    bytecode_read_raf_params, OneHotReadRaf, OneHotReadRafParams, ReadRafStage,
+};
