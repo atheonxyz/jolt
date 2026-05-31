@@ -7,9 +7,12 @@
 //! the prover is a hand-written, field-generic crate with jolt-core as parity oracle only — this
 //! module is that framework, instantiated at `F = GoldilocksFp3`, `PCS = WhirScheme`.
 //!
-//! Built incrementally: [`poly`] (dense multilinear) lands first; the opening accumulator, the
-//! sumcheck-instance traits, and the batched-sumcheck driver follow.
+//! Built incrementally: [`poly`] (dense multilinear) + [`sumcheck`] (instance trait + driver,
+//! bridged to the workspace verifier) land first; the opening accumulator and the committed/ZK
+//! path follow.
 
 pub mod poly;
+pub mod sumcheck;
 
 pub use poly::MultilinearPolynomial;
+pub use sumcheck::{prove, verify, SumcheckInstance};
