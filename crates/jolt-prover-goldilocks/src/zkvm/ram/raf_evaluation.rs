@@ -19,7 +19,7 @@
 //! phase-2/3 gap-round alignment with `2^phase3_cycle_rounds` pre-scaling are deferred here
 //! (single-phase, all `log_K` rounds are address rounds, no gap scaling).
 
-use jolt_field::Field;
+use jolt_field::{Field, FieldAccumulator};
 use jolt_poly::{BindingOrder, EqPolynomial, UnivariatePoly};
 
 use crate::framework::accumulator::{
@@ -105,7 +105,7 @@ impl<F: Field> SumcheckInstance<F> for RamRafEvaluation<F> {
     fn compute_message(&mut self, _round: usize, _previous_claim: F) -> UnivariatePoly<F> {
         // Degree-2 product `ra · unmap` ⇒ 3 evaluation points (0,1,2).
         let half = self.ra.len() / 2;
-        let mut evals = [F::zero(); 3];
+        let mut acc = [<F as Field>::Accumulator::default(); 3];
         for k in 0..half {
             let ra_e = self
                 .ra
@@ -114,9 +114,10 @@ impl<F: Field> SumcheckInstance<F> for RamRafEvaluation<F> {
                 .unmap
                 .sumcheck_evals_array::<3>(k, BindingOrder::LowToHigh);
             for i in 0..3 {
-                evals[i] += ra_e[i] * um_e[i];
+                acc[i].fmadd(ra_e[i], um_e[i]);
             }
         }
+        let evals: [F; 3] = std::array::from_fn(|i| acc[i].reduce());
         UnivariatePoly::from_evals(&evals)
     }
 

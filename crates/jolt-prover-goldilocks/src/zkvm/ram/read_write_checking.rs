@@ -20,7 +20,7 @@
 //! across the `K` address blocks). jolt-core's sparse `ReadWriteMatrix` two-phase materialization
 //! and Gruen split-eq are perf optimizations deferred here (single-phase, uniform `LowToHigh`).
 
-use jolt_field::Field;
+use jolt_field::{Field, FieldAccumulator};
 use jolt_poly::{BindingOrder, EqPolynomial, UnivariatePoly};
 use jolt_transcript::Transcript;
 
@@ -136,7 +136,7 @@ impl<F: Field> SumcheckInstance<F> for RamReadWriteChecking<F> {
         // Degree-3: eq·ra·(val + γ·(val+inc)) ⇒ 4 evaluation points (0,1,2,3).
         let gamma = self.params.gamma;
         let half = self.eq.len() / 2;
-        let mut evals = [F::zero(); 4];
+        let mut acc = [<F as Field>::Accumulator::default(); 4];
         for idx in 0..half {
             let eq_e = self
                 .eq
@@ -151,9 +151,10 @@ impl<F: Field> SumcheckInstance<F> for RamReadWriteChecking<F> {
                 .inc
                 .sumcheck_evals_array::<4>(idx, BindingOrder::LowToHigh);
             for k in 0..4 {
-                evals[k] += eq_e[k] * ra_e[k] * (val_e[k] + gamma * (val_e[k] + inc_e[k]));
+                acc[k].fmadd(eq_e[k] * ra_e[k], val_e[k] + gamma * (val_e[k] + inc_e[k]));
             }
         }
+        let evals: [F; 4] = std::array::from_fn(|k| acc[k].reduce());
         UnivariatePoly::from_evals(&evals)
     }
 

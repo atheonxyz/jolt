@@ -25,7 +25,7 @@
 //! decomposition is dropped (non-ZK), and jolt-core's split-LT + two-phase materialization are
 //! perf optimizations deferred here.
 
-use jolt_field::Field;
+use jolt_field::{Field, FieldAccumulator};
 use jolt_poly::{BindingOrder, EqPolynomial, LtPolynomial, UnivariatePoly};
 use jolt_transcript::Transcript;
 
@@ -146,10 +146,10 @@ impl<F: Field> SumcheckInstance<F> for RamValCheck<F> {
     }
 
     fn compute_message(&mut self, _round: usize, _previous_claim: F) -> UnivariatePoly<F> {
-        // Degree-3 product `inc · wa · (LT + γ)` ⇒ 4 evaluation points (0,1,2,3).
+        // Degree-3 product `inc · wa · (LT + γ)` ⇒ 4 points (0,1,2,3); unreduced accumulation.
         let gamma = self.params.gamma;
         let half = self.inc.len() / 2;
-        let mut evals = [F::zero(); 4];
+        let mut acc = [<F as Field>::Accumulator::default(); 4];
         for j in 0..half {
             let inc_e = self
                 .inc
@@ -161,9 +161,10 @@ impl<F: Field> SumcheckInstance<F> for RamValCheck<F> {
                 .lt
                 .sumcheck_evals_array::<4>(j, BindingOrder::LowToHigh);
             for k in 0..4 {
-                evals[k] += inc_e[k] * wa_e[k] * (lt_e[k] + gamma);
+                acc[k].fmadd(inc_e[k] * wa_e[k], lt_e[k] + gamma);
             }
         }
+        let evals: [F; 4] = std::array::from_fn(|k| acc[k].reduce());
         UnivariatePoly::from_evals(&evals)
     }
 

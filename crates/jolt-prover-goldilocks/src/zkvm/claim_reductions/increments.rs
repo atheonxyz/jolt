@@ -18,7 +18,7 @@
 //! pre-materialized recomposed values (`Fp3`), decoupling the sumcheck from the trace →
 //! signed-limb materialization (M8). The committed-limb opening of `ρ` is a stage-8 concern.
 
-use jolt_field::Field;
+use jolt_field::{Field, FieldAccumulator};
 use jolt_poly::{BindingOrder, EqPolynomial, UnivariatePoly};
 use jolt_transcript::Transcript;
 
@@ -164,7 +164,7 @@ impl<F: Field> SumcheckInstance<F> for IncClaimReduction<F> {
     fn compute_message(&mut self, _round: usize, _previous_claim: F) -> UnivariatePoly<F> {
         let gamma_sqr = self.params.gamma_powers[1];
         let half = self.ram_inc.len() / 2;
-        let mut evals = [F::zero(); 3];
+        let mut acc = [<F as Field>::Accumulator::default(); 3];
         for j in 0..half {
             let ri = self
                 .ram_inc
@@ -179,9 +179,11 @@ impl<F: Field> SumcheckInstance<F> for IncClaimReduction<F> {
                 .eq_rd
                 .sumcheck_evals_array::<3>(j, BindingOrder::LowToHigh);
             for k in 0..3 {
-                evals[k] += ri[k] * er[k] + gamma_sqr * di[k] * ed[k];
+                acc[k].fmadd(ri[k], er[k]);
+                acc[k].fmadd(gamma_sqr * di[k], ed[k]);
             }
         }
+        let evals: [F; 3] = std::array::from_fn(|k| acc[k].reduce());
         UnivariatePoly::from_evals(&evals)
     }
 

@@ -24,7 +24,7 @@
 //! both read matrices) are perf optimizations deferred here — this single-phase form binds every
 //! variable `LowToHigh` over uniformly-broadcast dense columns and reads `rs1_ra`/`rs2_ra` directly.
 
-use jolt_field::Field;
+use jolt_field::{Field, FieldAccumulator};
 use jolt_poly::{BindingOrder, EqPolynomial, UnivariatePoly};
 use jolt_transcript::Transcript;
 
@@ -155,7 +155,7 @@ impl<F: Field> SumcheckInstance<F> for RegistersReadWriteChecking<F> {
         let gamma = self.params.gamma;
         let gamma_sq = gamma * gamma;
         let half = self.eq.len() / 2;
-        let mut evals = [F::zero(); 4];
+        let mut acc = [<F as Field>::Accumulator::default(); 4];
         for idx in 0..half {
             let eq_e = self
                 .eq
@@ -177,9 +177,13 @@ impl<F: Field> SumcheckInstance<F> for RegistersReadWriteChecking<F> {
                 .sumcheck_evals_array::<4>(idx, BindingOrder::LowToHigh);
             for k in 0..4 {
                 let ra_merged = gamma * ra1_e[k] + gamma_sq * ra2_e[k];
-                evals[k] += eq_e[k] * (ra_merged * val_e[k] + wa_e[k] * (val_e[k] + inc_e[k]));
+                acc[k].fmadd(
+                    eq_e[k],
+                    ra_merged * val_e[k] + wa_e[k] * (val_e[k] + inc_e[k]),
+                );
             }
         }
+        let evals: [F; 4] = std::array::from_fn(|k| acc[k].reduce());
         UnivariatePoly::from_evals(&evals)
     }
 

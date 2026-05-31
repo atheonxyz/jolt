@@ -29,7 +29,7 @@
 //! flag/lookup-table-specific `Val_s` construction (incl. multi-table selection and the wide-limb
 //! range-check stages that fold in here per design §4.2), and the d-chunk one-hot *commitment*.
 
-use jolt_field::Field;
+use jolt_field::{Field, FieldAccumulator};
 use jolt_poly::{BindingOrder, EqPolynomial, UnivariatePoly};
 use jolt_transcript::Transcript;
 
@@ -194,7 +194,7 @@ impl<F: Field> SumcheckInstance<F> for OneHotReadRaf<F> {
     fn compute_message(&mut self, _round: usize, _previous_claim: F) -> UnivariatePoly<F> {
         // Degree-3: ra0·ra1·(Σ_s γ^s·eq_s·Val_s) ⇒ 4 evaluation points (0,1,2,3).
         let half = self.ra[0].len() / 2;
-        let mut evals = [F::zero(); DEGREE + 1];
+        let mut acc = [<F as Field>::Accumulator::default(); DEGREE + 1];
         for idx in 0..half {
             let ra0 = self.ra[0].sumcheck_evals_array::<4>(idx, BindingOrder::LowToHigh);
             let ra1 = self.ra[1].sumcheck_evals_array::<4>(idx, BindingOrder::LowToHigh);
@@ -207,9 +207,10 @@ impl<F: Field> SumcheckInstance<F> for OneHotReadRaf<F> {
                 }
             }
             for p in 0..=DEGREE {
-                evals[p] += ra0[p] * ra1[p] * stage_sum[p];
+                acc[p].fmadd(ra0[p] * ra1[p], stage_sum[p]);
             }
         }
+        let evals: [F; DEGREE + 1] = std::array::from_fn(|p| acc[p].reduce());
         UnivariatePoly::from_evals(&evals)
     }
 

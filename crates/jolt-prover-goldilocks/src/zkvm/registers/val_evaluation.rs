@@ -25,7 +25,7 @@
 //! folds `eq(r_address)` into a `RaPolynomial` for `wa` and uses the split-LT representation + a
 //! two-phase materialization; those are perf optimizations deferred here (correctness-first).
 
-use jolt_field::Field;
+use jolt_field::{Field, FieldAccumulator};
 use jolt_poly::{BindingOrder, LtPolynomial, UnivariatePoly};
 
 use crate::framework::accumulator::{
@@ -115,9 +115,9 @@ impl<F: Field> SumcheckInstance<F> for RegistersValEvaluation<F> {
     }
 
     fn compute_message(&mut self, _round: usize, _previous_claim: F) -> UnivariatePoly<F> {
-        // Degree-3 product ⇒ 4 evaluation points (0,1,2,3).
+        // Degree-3 product ⇒ 4 evaluation points (0,1,2,3); unreduced accumulation per point.
         let half = self.inc.len() / 2;
-        let mut evals = [F::zero(); 4];
+        let mut acc = [<F as Field>::Accumulator::default(); 4];
         for j in 0..half {
             let i = self
                 .inc
@@ -129,9 +129,10 @@ impl<F: Field> SumcheckInstance<F> for RegistersValEvaluation<F> {
                 .lt
                 .sumcheck_evals_array::<4>(j, BindingOrder::LowToHigh);
             for k in 0..4 {
-                evals[k] += i[k] * w[k] * l[k];
+                acc[k].fmadd(i[k] * w[k], l[k]);
             }
         }
+        let evals: [F; 4] = std::array::from_fn(|k| acc[k].reduce());
         UnivariatePoly::from_evals(&evals)
     }
 
