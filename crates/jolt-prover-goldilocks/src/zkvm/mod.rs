@@ -2,3 +2,4 @@
 //! prover [`crate::framework`]. Ported in dependency order; jolt-core is the parity oracle.
 
 pub mod claim_reductions;
+pub mod registers;
