@@ -13,6 +13,7 @@
 #![cfg(feature = "goldilocks")]
 
 pub mod field;
+pub mod framework;
 pub mod r1cs;
 
 pub use field::{Base, F};

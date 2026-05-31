@@ -35,4 +35,4 @@ goldilocks = [
 
 [package.metadata.cargo-machete]
 # Deps wired ahead of the leaf-subprotocol port (M5+); used as modules land.
-ignored = ["jolt-poly", "jolt-sumcheck", "jolt-r1cs", "jolt-lookup-tables", "rayon", "serde", "tracing"]
+ignored = ["jolt-sumcheck", "jolt-lookup-tables", "serde", "tracing"]
