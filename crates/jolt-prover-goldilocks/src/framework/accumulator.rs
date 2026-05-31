@@ -96,6 +96,10 @@ pub enum CommittedPolynomial {
     RamRa(usize),
     TrustedAdvice,
     UntrustedAdvice,
+    /// Limbed-RV64-R1CS auxiliary committed columns (carry/sign/limb bits), indexed. Their
+    /// booleanity (`x²−x = 0`) is the M6 range-check residual — the only booleanity surviving the
+    /// LogUp\*-GKR design (the one-hot RA booleanity is subsumed by M7).
+    R1csAux(usize),
 }
 
 /// Virtual (derived-during-proving) polynomials. Vendored subset from jolt-core `zkvm/witness.rs`;
