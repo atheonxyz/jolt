@@ -16,9 +16,13 @@ use jolt_sumcheck::{
 };
 use jolt_transcript::Transcript;
 
+use crate::framework::accumulator::{
+    OpeningAccumulator, OpeningPoint, Openings, BIG_ENDIAN, LITTLE_ENDIAN,
+};
+
 /// A prover-side sumcheck instance: one batched claim reduced over [`Self::num_rounds`] rounds.
 /// Mirrors the jolt-core `SumcheckInstanceProver`/`SumcheckInstanceParams` surface, minus the
-/// accumulator/ZK methods (added when the opening accumulator lands).
+/// `#[cfg(zk)]` BlindFold constraint methods (non-ZK this phase).
 pub trait SumcheckInstance<F: Field> {
     /// Number of sumcheck rounds (variables bound).
     fn num_rounds(&self) -> usize;
@@ -26,8 +30,8 @@ pub trait SumcheckInstance<F: Field> {
     /// Degree bound of each round polynomial.
     fn degree(&self) -> usize;
 
-    /// The claimed sum `Σ_x g(x)` this instance proves.
-    fn input_claim(&self) -> F;
+    /// The claimed sum `Σ_x g(x)`, computed from prior openings in the accumulator.
+    fn input_claim(&self, accumulator: &dyn OpeningAccumulator<F>) -> F;
 
     /// The round-`round` univariate message, given the running claim. Must have degree
     /// `≤ self.degree()` and satisfy `s(0) + s(1) = previous_claim`.
@@ -36,22 +40,38 @@ pub trait SumcheckInstance<F: Field> {
     /// Bind the round's variable to `r`.
     fn bind(&mut self, r: F, round: usize);
 
-    /// The expected final evaluation `g(r_1, …, r_n)` the verifier's reduced claim must match
-    /// (computed from the instance's fully-bound state / opening claims).
-    fn expected_output_claim(&self, challenges: &[F]) -> F;
+    /// Store this instance's output openings (claims/points) into the accumulator after the
+    /// sumcheck completes.
+    fn cache_openings(&self, accumulator: &mut Openings<F>, challenges: &[F]);
+
+    /// The expected final evaluation `g(r_1, …, r_n)` the verifier's reduced claim must match,
+    /// computed from the cached output openings + challenges.
+    fn expected_output_claim(&self, accumulator: &dyn OpeningAccumulator<F>, challenges: &[F])
+        -> F;
+
+    /// Map the sumcheck challenges (little-endian, round order) to the canonical big-endian
+    /// opening point used to key cached openings. Matches jolt-core's default.
+    fn normalize_opening_point(&self, challenges: &[F]) -> OpeningPoint<BIG_ENDIAN, F> {
+        OpeningPoint::<LITTLE_ENDIAN, F>::new(challenges.to_vec()).match_endianness()
+    }
 }
 
 /// Drive a single sumcheck instance to completion, emitting a workspace-verifiable proof and the
-/// squeezed challenge point. Absorbs each round polynomial through the same `RoundProof` path the
-/// verifier replays, so `jolt_sumcheck::SumcheckVerifier::verify` accepts the result.
-pub fn prove<F, I, T>(instance: &mut I, transcript: &mut T) -> (SumcheckProof<F>, Vec<F>)
+/// squeezed challenge point. Reads the input claim from `accumulator`, absorbs each round
+/// polynomial through the same `RoundProof` path the verifier replays (so
+/// `jolt_sumcheck::SumcheckVerifier::verify` accepts the result), then caches output openings.
+pub fn prove<F, I, T>(
+    instance: &mut I,
+    accumulator: &mut Openings<F>,
+    transcript: &mut T,
+) -> (SumcheckProof<F>, Vec<F>)
 where
     F: Field,
     I: SumcheckInstance<F>,
     T: Transcript<Challenge = F>,
 {
     let n = instance.num_rounds();
-    let mut claim = instance.input_claim();
+    let mut claim = instance.input_claim(&*accumulator);
     let mut round_polynomials = Vec::with_capacity(n);
     let mut challenges = Vec::with_capacity(n);
 
@@ -65,6 +85,7 @@ where
         round_polynomials.push(poly);
     }
 
+    instance.cache_openings(accumulator, &challenges);
     (SumcheckProof { round_polynomials }, challenges)
 }
 
@@ -124,7 +145,7 @@ mod tests {
         fn degree(&self) -> usize {
             2
         }
-        fn input_claim(&self) -> F {
+        fn input_claim(&self, _acc: &dyn OpeningAccumulator<F>) -> F {
             self.claim
         }
         fn compute_message(&mut self, _round: usize, _previous_claim: F) -> UnivariatePoly<F> {
@@ -144,7 +165,8 @@ mod tests {
             self.a.bind_parallel(r, BindingOrder::LowToHigh);
             self.b.bind_parallel(r, BindingOrder::LowToHigh);
         }
-        fn expected_output_claim(&self, _challenges: &[F]) -> F {
+        fn cache_openings(&self, _acc: &mut Openings<F>, _challenges: &[F]) {}
+        fn expected_output_claim(&self, _acc: &dyn OpeningAccumulator<F>, _challenges: &[F]) -> F {
             self.a.final_sumcheck_claim() * self.b.final_sumcheck_claim()
         }
     }
@@ -167,12 +189,13 @@ mod tests {
         let b: Vec<F> = (0..len).map(|_| F::from_u64(rng.next())).collect();
 
         let mut instance = ProductInstance::new(a, b);
-        let input_claim = instance.input_claim();
+        let mut acc = Openings::<F>::new(log_len);
+        let input_claim = instance.input_claim(&acc);
         let degree = instance.degree();
 
         let mut prover_t = Blake2bTranscript::<F>::new(b"framework-sumcheck-test");
-        let (proof, challenges) = prove(&mut instance, &mut prover_t);
-        let output = instance.expected_output_claim(&challenges);
+        let (proof, challenges) = prove(&mut instance, &mut acc, &mut prover_t);
+        let output = instance.expected_output_claim(&acc, &challenges);
 
         let claim = SumcheckClaim {
             num_vars: log_len,
@@ -210,9 +233,10 @@ mod tests {
             (1..=8).map(Goldilocks::from_u64).collect(),
             (1..=8).map(|x| Goldilocks::from_u64(x + 3)).collect(),
         );
-        let input_claim = instance.input_claim();
+        let mut acc = Openings::<Goldilocks>::new(3);
+        let input_claim = instance.input_claim(&acc);
         let mut prover_t = Blake2bTranscript::<Goldilocks>::new(b"t");
-        let (mut proof, _) = prove(&mut instance, &mut prover_t);
+        let (mut proof, _) = prove(&mut instance, &mut acc, &mut prover_t);
         // Corrupt the first round polynomial.
         proof.round_polynomials[0] = UnivariatePoly::new(vec![
             Goldilocks::from_u64(1),

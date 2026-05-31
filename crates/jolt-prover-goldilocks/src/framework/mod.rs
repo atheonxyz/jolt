@@ -11,8 +11,13 @@
 //! bridged to the workspace verifier) land first; the opening accumulator and the committed/ZK
 //! path follow.
 
+pub mod accumulator;
 pub mod poly;
 pub mod sumcheck;
 
+pub use accumulator::{
+    CommittedPolynomial, OpeningAccumulator, OpeningPoint, Openings, SumcheckId, VirtualPolynomial,
+    BIG_ENDIAN, LITTLE_ENDIAN,
+};
 pub use poly::MultilinearPolynomial;
 pub use sumcheck::{prove, verify, SumcheckInstance};
