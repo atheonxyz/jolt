@@ -71,16 +71,53 @@ column counts update accordingly.
 
 ## Constraint transformation
 
-- **Eq-conditional rows** (`guard·(left − right) = 0`): replace each multi-limb value
-  with its **linear recompose** (`Σ limbᵢ·2^{32i}`). The B-row gains terms but stays
-  degree-1; the outer (Spartan) sumcheck stays **degree-2** overall. E.g. constraint 0
-  `RamAddress = Rs1 + Imm` →
-  `[(RAM_ADDRESS,1), (RS1_LO,−1), (RS1_HI,−2³²), (IMM_LO,−1), (IMM_HI,−2³²)]`.
+> **CORRECTION (M5, locked):** an earlier draft of this section said multi-limb values
+> could be related by a single **linear field recompose** (`Σ limbᵢ·2^{32i}`). That is
+> **unsound**: in the field `2⁶⁴ ≡ 2³²−1` and `2⁹⁶ ≡ −1`, and even a 2-limb `u64 ≥ p`
+> aliases, so `recompose(value)` equals `value mod p`, not the integer. With
+> range-checked limbs `< 2³²`, two distinct `u64`s differing by `p` share a recompose,
+> so `recompose(a) = recompose(b)` does **not** force `a = b` — a prover can equivocate
+> with `a = b + p`. Multi-limb **equality** and **arithmetic** must therefore be done
+> **limb-by-limb** (with `2⁻³²` carries for add/sub), exactly the lambda_vm pattern the
+> MUL schoolbook already uses. The cost delta over the (mandatory) limbing is small
+> (~15 aux carry columns + ~30 rows; R1CS is not the Jolt bottleneck) and degree stays
+> 2. Only genuinely-small values stay single-element/recompose-free (see below).
 
-- **SUB `+2⁶⁴` (constraint 8)**: re-express the bias on the **2⁶⁴-place limb** of the
-  4-limb `RIGHT_LOOKUP_OPERAND` (i.e. `+1` on `RIGHT_LOOKUP_OPERAND_L2`), **not** a
-  `from_i128(2⁶⁴)` field constant (which silently reduces to `2³²−1`). The operand is
-  65-bit, so its `L2` limb (the `2⁶⁴` place) is `{0,1}`.
+Per-constraint-type rules (faithful to `rv64.rs`, retargeted limb-wise):
+
+- **Value equality** `guard·(a − b) = 0` (constraints 2/3/4/12 and the zero-checks
+  1/5/11): emit **per-limb** equality (`guard·(a_lo − b_lo)=0`, `guard·(a_hi − b_hi)=0`).
+  Sound because range-checked limbs uniquely determine the integer.
+
+- **Full-u64 lookup-operand add/sub** (7 ADD, 8 SUB): **limb-wise with `{0,1}` carries**.
+  Grounded in `add.rs`/`sub.rs::to_lookup_operands`: `LeftLookupOperand = 0` always, and
+  `RightLookupOperand = Left + (Right as u64)` (ADD) / `Left + (2⁶⁴ − (Right as u64))`
+  (SUB), where for the 64-bit ADD/SUB/MUL arm `Right = rs2 as i128 ≥ 0`, so its magnitude
+  limbs equal `Right as u64` and all carries are Boolean. ADD: `RLO = Left + Right`
+  (`L₂` = high carry, `L₃ = 0`). SUB: encoded as **`RLO + Right = Left + 2⁶⁴`** (all terms
+  non-negative — no signed carries, no `2⁶⁴` field constant; the `+2⁶⁴` is `+1` on the
+  `L₂` carry equation). The 4-limb `RLO` limbs are range-checked `< 2³²` (M6), so `L₂∈{0,1}`.
+
+- **`RamAddress = Rs1 + Imm` (constraint 0)**: limb-wise — limb0 carries (`{0,1}`), limb1
+  is **exact** (`rs1_hi + imm_hi + c0 = addr_hi`, both `< p`, so it pins `addr_hi` directly;
+  a too-large `Rs1` forces `addr_hi ≥ 2³²` which the address range-check rejects). `Imm`
+  is the signed 2-limb (`imm_hi` signed); no high carry variable needed.
+
+- **MUL lookup operand (constraint 9)** `RightLookupOperand = Product`: **per-limb**
+  `RLO_i = P_i` (`to_lookup_operands` gives the unsigned `Left × (Right as u64)`, and for
+  64-bit MUL both factors `≥ 0` so `Product.sign = 0`).
+
+- **Small-value / single-element (recompose safe because the integer is `< p`)**:
+  PC family (`PC, UnexpandedPC, NextPC, NextUnexpandedPC < 2³²`), flags/booleans. So
+  constraints 13/15/16/17 (PC arithmetic) and 18 use ordinary recompose — e.g. 13
+  `recompose(RdWrite) = UnexpandedPC + 4 − 2·IsCompressed` is a single row (result `< 2³³ < p`).
+
+- **MUL product (constraint 19)** `Left × Right = Product`: the 4-limb schoolbook
+  ([`mul.rs`], validated) on magnitudes, `Left.sign` pinned to 0 (`Left` always unsigned).
+
+- **Boolean products (20/21)**: `ShouldBranch = recompose(LookupOutput)·Branch`
+  (recompose safe — `LookupOutput ∈ {0,1}` whenever `Branch = 1`), `ShouldJump =
+  Jump·(1 − NextIsNoop)`.
 
 - **MUL product (constraint 19)** `Left × Right = Product`: the single A·B=C row
   expands to the **4-limb schoolbook** on the unsigned magnitudes
