@@ -116,3 +116,55 @@ pub fn idx_mle_lsb<F: Field>(point: &[F]) -> F {
     }
     acc
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use jolt_field::goldilocks::GoldilocksFp3 as F;
+
+    struct Rng(u64);
+    impl Rng {
+        fn next(&mut self) -> u64 {
+            self.0 = self.0.wrapping_add(0x9E37_79B9_7F4A_7C15);
+            let mut z = self.0;
+            z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+            z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+            z ^ (z >> 31)
+        }
+    }
+
+    /// The A-circuit leaf structural check (`gkr.rs`) recomputes the genuine numerator-leaf MLE
+    /// `Ñ_A(point) = mle_eval_lsb(eq_m_row, point)` (where `eq_m_row = lsb_eq_table(r_M_row)`) as
+    /// `EqPolynomial::mle(&r_M_row, &point)`. This confirms that identity directly:
+    /// `mle_eval_lsb(lsb_eq_table(r), p) == EqPolynomial::mle(r, p)` for LSB-first `r, p`.
+    ///
+    /// `EqPolynomial::mle` is coordinate-wise (`Π_b eq(r[b], p[b])`) and therefore order-invariant —
+    /// reversing *both* arguments is a no-op — so applying it to two LSB-first points is correct.
+    /// (Pins the structural-check formula that the round-trip exercises only indirectly.)
+    #[test]
+    fn structural_eq_recompute_is_order_consistent() {
+        let mut rng = Rng(0xEE01);
+        for n in 0..=7 {
+            let r: Vec<F> = (0..n).map(|_| F::from_u64(rng.next())).collect();
+            let p: Vec<F> = (0..n).map(|_| F::from_u64(rng.next())).collect();
+
+            // The verifier's recompute equals the genuine MLE of the LSB-first eq_m_row table.
+            let table = lsb_eq_table(&r);
+            assert_eq!(
+                mle_eval_lsb(&table, &p),
+                jolt_poly::EqPolynomial::<F>::mle(&r, &p),
+                "EqPolynomial::mle(r,p) == MLE of lsb_eq_table(r) at p (n={n})",
+            );
+
+            // Order-invariance of the coordinate-wise eq product: reversing both args is a no-op
+            // (so the review's suggested "reverse both" fix would change nothing).
+            let rr: Vec<F> = r.iter().rev().copied().collect();
+            let pr: Vec<F> = p.iter().rev().copied().collect();
+            assert_eq!(
+                jolt_poly::EqPolynomial::<F>::mle(&r, &p),
+                jolt_poly::EqPolynomial::<F>::mle(&rr, &pr),
+                "EqPolynomial::mle is invariant under reversing both arguments (n={n})",
+            );
+        }
+    }
+}
