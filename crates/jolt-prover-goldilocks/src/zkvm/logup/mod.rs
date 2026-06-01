@@ -34,6 +34,7 @@ use jolt_field::Field;
 use jolt_poly::EqPolynomial;
 
 pub mod circuit;
+pub mod gkr;
 pub mod layer;
 pub mod pushforward;
 

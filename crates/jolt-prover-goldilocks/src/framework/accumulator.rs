@@ -84,6 +84,12 @@ pub enum SumcheckId {
     AdviceClaimReduction,
     IncClaimReduction,
     HammingWeightClaimReduction,
+    /// M7 LogUp\*: the per-family pushforward-GKR leaf openings (on `ra_dense` / `P^F`). No jolt-core
+    /// analog — jolt-core is BN254/Dory and commits the one-hot `ra` directly.
+    PushforwardGkr,
+    /// M7 LogUp\*: the §4.5.2 reduction's `P̃^F(r_col) = combined_claim` opening (the upstream
+    /// read-raf claim reduced onto the committed pushforward).
+    PushforwardReduction,
 }
 
 /// Committed (PCS-opened) polynomials. Vendored from jolt-core `zkvm/witness.rs`.
@@ -100,6 +106,11 @@ pub enum CommittedPolynomial {
     /// booleanity (`x²−x = 0`) is the M6 range-check residual — the only booleanity surviving the
     /// LogUp\*-GKR design (the one-hot RA booleanity is subsumed by M7).
     R1csAux(usize),
+    /// M7 LogUp\*: the dense `ra_dense` (`M*`, the d address chunks row-concatenated) per family,
+    /// indexed by family. Replaces the committed one-hot `ra`; opened by the pushforward-GKR.
+    RaDense(usize),
+    /// M7 LogUp\*: the eq-weighted pushforward `P^F` per family, indexed by family.
+    Pushforward(usize),
 }
 
 /// Virtual (derived-during-proving) polynomials. Vendored subset from jolt-core `zkvm/witness.rs`;

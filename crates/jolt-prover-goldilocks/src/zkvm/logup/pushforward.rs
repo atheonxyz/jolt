@@ -195,6 +195,75 @@ where
     })
 }
 
+/// Verifier-side view of a prepared family: the metadata `verify_family_gkr` needs (no leaf
+/// arrays — the verifier never builds `eq_m_row`/`P^F`, and cannot check eq. 5 directly; that is
+/// discharged by the GKR + the WHIR open of `P^F(r_col)`).
+#[derive(Clone, Debug)]
+pub struct VerifierView<F: Field> {
+    pub log_t: usize,
+    pub log_d: usize,
+    pub log_m: usize,
+    pub r_m_row: Vec<F>,
+    pub r_col: Vec<F>,
+    pub alpha: F,
+    pub combined_claim: F,
+}
+
+impl<F: Field> VerifierView<F> {
+    #[inline]
+    pub fn log_size_a(&self) -> usize {
+        self.log_t + self.log_d
+    }
+
+    #[inline]
+    pub fn log_size_b(&self) -> usize {
+        self.log_m
+    }
+}
+
+/// Verifier-side replay of [`prepare_family`]'s Fiat-Shamir: absorb the d claims, squeeze
+/// `r_chunk`, recompute the combined claim, absorb it, squeeze `α`. Must thread the same transcript
+/// the prover used so the GKR challenges match.
+pub fn prepare_family_verifier<F, T>(
+    log_t: usize,
+    log_d: usize,
+    log_m: usize,
+    r_row: &[F],
+    r_col: &[F],
+    claims: &[F],
+    transcript: &mut T,
+) -> VerifierView<F>
+where
+    F: Field,
+    T: Transcript<Challenge = F>,
+{
+    debug_assert_eq!(claims.len(), 1usize << log_d);
+    for c in claims {
+        transcript.append(c);
+    }
+    let r_chunk = transcript.challenge_vector(log_d);
+    let eq_chunk = lsb_eq_table(&r_chunk);
+    let combined_claim = claims
+        .iter()
+        .zip(eq_chunk.iter())
+        .fold(F::zero(), |acc, (&c, &e)| acc + c * e);
+    transcript.append(&combined_claim);
+    let alpha: F = transcript.challenge();
+
+    let mut r_m_row = r_row.to_vec();
+    r_m_row.extend_from_slice(&r_chunk);
+
+    VerifierView {
+        log_t,
+        log_d,
+        log_m,
+        r_m_row,
+        r_col: r_col.to_vec(),
+        alpha,
+        combined_claim,
+    }
+}
+
 #[cfg(test)]
 #[expect(clippy::unwrap_used)]
 mod tests {
