@@ -356,47 +356,329 @@ clippy + fmt clean.
 
 ---
 
-## 10. Commit map (review entry points, newest first)
+## 10. Commit-by-commit review reference
 
-Each commit is a single self-contained piece with a round-trip + tamper test. Reviewing commit-by-commit
-is the fastest path.
+Every commit is one self-contained, individually-tested piece (no co-author trailer, not pushed).
+This section is detailed enough to **review each commit by reading its entry** — for the sumcheck
+ports it states the exact identity, degree, inputs, what is cached (keys/points/claims), what
+`input_claim` reads, what `expected_output_claim` recomputes, the test assertions, and the
+review-focus (where a bug would hide) + what is decoupled/deferred. Entries are in **build order
+(oldest first)** — the order you should review in. The condensed hash list is at the end (§10.7).
+
+Notation reminders (full detail in §7): `T = 2^{log_t}` cycles, `K = 2^{log_k}` addresses;
+`F = GoldilocksFp3`; bind `LowToHigh`; opening points big-endian = `reverse(challenges)`; a dense
+table from `…::evals(r)` bound `LowToHigh` converges to that poly's MLE at `reverse(challenges)`,
+which the verifier independently computes via `…::mle(r, reverse(challenges))`.
+
+---
+
+### 10.1 Phase 1 + foundation (shared crates: jolt-field / jolt-witness / jolt-whir)
+
+**`4e30d3e88` — Phase 1 complete (field / limbs / WHIR commit).**
+Files: `jolt-field/src/goldilocks/{base,ext3,decompose,tests}.rs`, `jolt-witness/src/goldilocks.rs`,
+`jolt-whir/src/{convert,params,commit,sanity}.rs`, `jolt-pcs-bench/src/fib_goldilocks.rs`.
+*What/why:* stands up Goldilocks `Fp` (Montgomery-free), `Fp3` (`X³−2`, nonresidue 2), value↔limb
+decompose, base-limb committed columns, WHIR base-commit, and a live fibonacci e2e vs BN254/Dory.
+*Review focus:* `base.rs` `reduce128` (uses `2⁶⁴≡2³²−1`, `2⁹⁶≡−1`; non-canonical `[0,2⁶⁴)` rep,
+canonicalize only at boundaries); `ext3.rs` `mul` (9 base muls) and `mul_by_base` (3); `tests.rs`
+is a **num-bigint** oracle (independent reference) — this is your correctness anchor for the field.
+`jolt-whir/tests/crosscheck.rs` cross-checks the hand-coded field op-for-op vs WHIR's `Field64`.
+*Deferred:* all sumcheck/IOP, LogUp\*-GKR, limb *constraints* (Phase 1 makes columns, doesn't
+constrain them), hiding. Full detail in `PHASE1_GOLDILOCKS_STATUS.md`.
+
+**`6d263f5d1` — M0: deferred-reduction accumulators.** File: `jolt-field/src/goldilocks/accumulator.rs`.
+*What/why:* `GoldilocksAccumulator`, `Fp3Accumulator` (+ `fmadd_base` for base×ext), impl
+`FieldAccumulator`. Defers modular reduction across a sumcheck inner loop, reduces once. Analog of
+BN254 `WideAccumulator`. *Review focus:* `fmadd`/`merge`/`reduce` must be field-equivalent to
+`acc += a*b` / `+` / identity; the `EPSILON² mod p` overflow correction in the 192-bit lane. This is
+what OPT-A (`959cf0d9d`) wires into every round-poly loop.
+
+**`08794dc74` / `60bf2696c` / `cc5af5c32` — M1/M2/M3: shared transcript + `WhirScheme`** (`jolt-whir`).
+*What/why:* one shared **spongefish** sponge for Jolt+WHIR (`challenge_fp3`); `WhirScheme`
+commit/open/verify; batch-open via WHIR's geometric RLC. *Review focus:* `WhirScheme` is an
+**inherent** API (not the `CommitmentScheme` trait — that trait pins `Transcript<Challenge=Self::Field>`
+which can't wrap spongefish's state). These are used by M8's stage-8 opening, not by the decoupled
+ports, so they're lower-priority for reviewing the sumcheck math.
+
+**`d9c7e8a99` — M4: base-field limb primitives + signed 2-limb `Inc`** (`jolt-field`, `jolt-witness`).
+*What/why:* `decompose.rs` limb helpers; the signed 2-limb `Inc` (`lo + hi·2³²`, `hi` signed).
+*Review focus:* the **signed-2-limb choice is degree-load-bearing** — it keeps `Val = Σ inc·wa·LT`
+degree-3 (a separate sign-bit factor would make it degree-4). `debug_assert |v| < 2⁶⁴`.
+
+---
+
+### 10.2 Crate skeleton + limbed RV64 R1CS (`crates/jolt-prover-goldilocks/src/{field,r1cs}`)
+
+**`ce2440668` — crate skeleton + field/PCS/transcript wiring.** Files: `lib.rs` (20),
+`field.rs` (21). *What/why:* `#![cfg(feature="goldilocks")]`; `type F = GoldilocksFp3`, `type Base =
+Goldilocks`, `WhirScheme` re-exports; module tree. *Review focus:* trivial wiring; confirm the feature
+gate + type aliases.
+
+**`7e97db47b` — `LIMBED_R1CS.md`** (pinned design). Read this *before* the R1CS code; it's the
+soundness argument (why field-recompose aliases mod p ⇒ limb-wise + `2⁻³²` carries).
+
+**`5c571d81c` — limbed MUL 4-limb schoolbook.** File: `r1cs/mul.rs` (288). *What/why:* the 128-bit
+MUL product `(Llo,Lhi)×(Rlo,Rhi)=(P0..P3)` via `2⁻³²` virtual carries; `Left.sign` pinned 0; sign
+relation `Product.sign = Left.sign ⊕ Right.sign`. *Review focus:* the carry chain
+(`t_i = Σ limb·limb + c_{i−1}`, `P_i = t_i mod 2³²`, `c_i = t_i ÷ 2³²`) and that partial products stay
+degree-2 (outer sumcheck degree preserved). Test: honest products vs an **i128 reference**, plus tamper.
+
+**`90d5926a0` — signed-value derivation.** File: `r1cs/signed_value.rs` (166). *What/why:* degree-2
+`RIGHT_VAL = (1−2·sign)·magnitude` (two product rows + one linear). *Review focus:* **built + validated
+but NOT wired** — reserved for signed-immediate multiplicative operands (not exercised by muldiv). It's
+dead code until a trace needs it; review for correctness, not integration.
+
+**`a46e62f8b` — full limbed RV64 R1CS.** File: `r1cs/rv64_limbed.rs` (951). *What/why:* all 22 RV64
+constraints, limb-wise, 70 vars / 53 rows: per-limb equality (`guard·(a_lo−b_lo)=0` AND hi); full-u64
+lookup-operand add/sub with `{0,1}` carries (`RLO = Left+Right` for ADD; `RLO+Right=Left+2⁶⁴` for SUB,
+the `+2⁶⁴` becoming `+1` on the high carry to avoid a `2⁶⁴` field constant); `RamAddress=Rs1+Imm`
+(limb1 exact); MUL via `mul.rs`; small-value single-element recompose (PCs `<2³²`, results `<p`);
+boolean products (`ShouldBranch`/`ShouldJump`). *Review focus:* this is **soundness-critical**. Check
+each constraint against `LIMBED_R1CS.md` §"Constraint transformation" and against jolt-core
+`crates/jolt-r1cs/src/constraints/rv64.rs`. Validated by hand-built honest witnesses
+(no-op/ADD/SUB/MUL/load + edges + 2000 random) and tamper rejection (`check_witness` tests).
+**Soundness depends on the M6 booleanity (`95e99b376`)** for the carry/sign columns — review them
+together.
+
+---
+
+### 10.3 The prover framework (`src/framework/`) — review FIRST
+
+**`5ed82eae9` — dense `MultilinearPolynomial`.** File: `framework/poly.rs` (241). *What/why:* vendored
+from jolt-core `poly/multilinear_polynomial.rs`. `bind_parallel(r, order) = lo + r·(hi−lo)`;
+`sumcheck_evals_array::<D>(i, order)` = linear extrapolation through the bound pair
+(`evals[k]=e0+k·(e1−e0)`); `final_sumcheck_claim`. *Review focus:* the `LowToHigh` pairing is
+`(2i, 2i+1)`; `HighToLow` is `(i, i+half)`. Dense-only is intentional (compact base-field variants
+deferred to M8). Tests: `bind` matches the recurrence; mini-sumcheck consistency (`s(0)+s(1)=claim`).
+
+**`8bf3c0143` — `SumcheckInstance` trait + driver.** File: `framework/sumcheck.rs` (257).
+*What/why:* the contract every port implements (see §3) + `prove`/`verify`. **The load-bearing
+result:** `prove` emits a `jolt_sumcheck::SumcheckProof` that the workspace
+`jolt_sumcheck::SumcheckVerifier::verify` accepts unchanged — prover and extracted verifier
+interoperate. *Review focus:* the driver absorbs each round poly via the **same** `RoundProof`
+path the verifier replays, then squeezes the challenge, then binds (so transcripts stay in lockstep);
+`compute_message` is called *before* `bind` each round (pre-bind state). The built-in `ProductInstance`
+test (`Σ A·B`) exercises the driver↔verifier bridge in isolation.
+
+**`54b0540fd` — opening accumulator.** File: `framework/accumulator.rs` (349). *What/why:* the claim
+store `HashMap<(PolynomialId, SumcheckId) → (OpeningPoint<BIG_ENDIAN,F>, F)>` shared by prover (writes
+claims) and verifier (reads). `SumcheckId` (23 variants), `CommittedPolynomial`, `VirtualPolynomial`
+vendored verbatim from jolt-core so keys match. *Review focus:* `OpeningPoint::match_endianness`
+(reverses on a tag change); `append_dense`/`append_virtual` overwrite (HashMap insert); a missing
+opening `panic!`s (a wiring bug, not recoverable input). **This is how subprotocols compose** — A's
+`cache_openings` feeds B's `input_claim`. *(Later commits add keys: `SpartanAz/Bz/Cz` in `7678e5a70`,
+`R1csAux(usize)` in `95e99b376`.)*
+
+---
+
+### 10.4 The ported sumchecks
+
+Review pattern for each: confirm (a) `input_claim` and `expected_output_claim` are the two sides of
+the **same** identity; (b) `cache_openings` stores exactly what `expected_output_claim` later reads;
+(c) the round-trip test asserts `value == expected` and cached openings == direct MLE at
+`reverse(challenges)`; (d) the tamper test rejects.
+
+**`f320f6c41` — Inc claim-reduction (THE TEMPLATE — read first).** File:
+`zkvm/claim_reductions/increments.rs` (388). jolt-core: `zkvm/claim_reductions/increments.rs`.
+*Identity (degree-2, log_t rounds):* `Σ_j RamInc(j)·[eq(r2,j)+γ·eq(r4,j)] + γ²·Σ_j RdInc(j)·[eq(s4,j)+γ·eq(s5,j)]`,
+reducing the four `RamInc`/`RdInc` openings (from RAM/register RW-checking + val-eval at distinct
+points) to a single shared point ρ. *input_claim:* `v1 + γ·v2 + γ²·w1 + γ³·w2` (the four cached
+openings). *Cached:* `RamInc(ρ)`, `RdInc(ρ)` @`IncClaimReduction`. *expected_output_claim:*
+`RamInc(ρ)·(eq(r2,ρ)+γ·eq(r4,ρ)) + γ²·RdInc(ρ)·(eq(s4,ρ)+γ·eq(s5,ρ))` (eq via `EqPolynomial::mle`).
+*Review focus:* this establishes the **endianness contract** every other port copies — verify the
+`reverse(challenges)` ↔ `mle` correspondence in the test. Takes pre-materialized recomposed `Fp3`
+Inc columns (trace→signed-limb materialization is M8). γ drawn from the transcript in `params::new`.
+
+**`d84b7de2e` — `PHASE2_HANDOFF.md`** (docs). The prior-session handoff; superseded for review by
+this guide.
+
+**`96427dc5c` — registers val-evaluation.** File: `zkvm/registers/val_evaluation.rs` (359). jolt-core:
+`zkvm/registers/val_evaluation.rs`. *Identity (degree-3, log_t rounds):*
+`Val(r_address,r_cycle) = Σ_j inc(j)·wa(j)·LT(j, r_cycle)`. *Inputs:* materialized `inc` (RdInc) +
+`wa` (write-address) columns; `LT(·,r_cycle)` table via `jolt_poly::LtPolynomial::evaluations`.
+*input_claim:* the `RegistersVal` opening from `RegistersReadWriteChecking`, split at `log_k`.
+*Cached:* `RdInc(ρ)` @`RegistersValEvaluation` (at r_cycle), `RdWa` @`RegistersValEvaluation`
+(at `r_address‖r_cycle`). *expected_output_claim:* `inc_claim·wa_claim·LT(ρ,r_cycle)` where
+`LT` = `LtPolynomial::evaluate(reverse(challenges), r_cycle)`. *Review focus:* the LT first-arg /
+second-arg orientation (jolt-core's `LT(r_cycle,j)` ≡ our `LtPolynomial::evaluate(j, r_cycle)` —
+confirmed against jolt-core's verifier loop). *Deferred:* split-LT, two-phase.
+
+**`3751b7d3b` — RAM output-check** *(later optimized by `12f90c8da`)*. File: `zkvm/ram/output_check.rs`
+(340). jolt-core: `zkvm/ram/output_check.rs`. *Identity (degree-3 zero-check, log_k rounds):*
+`0 = Σ_k eq(r_address,k)·io_mask(k)·(Val_final(k)−Val_io(k))`. *Inputs:* materialized
+`val_final`/`val_io`/`io_mask` columns (public program-I/O). *input_claim:* `0`. *Cached:*
+`RamValFinal(ρ)` @`RamOutputCheck`. *expected_output_claim:* `eq(r_address,ρ)·io_mask(ρ)·(val_final_claim − val_io(ρ))`
+— the verifier recomputes `io_mask`/`val_io` MLEs from the **public** columns (dot with `eq(ρ)`),
+reads `val_final` from cache. *Review focus:* honest test builds `val_io = val_final` on the I/O region
+and `io_mask` its indicator ⇒ the summand vanishes everywhere ⇒ input_claim 0. *Decoupled:* no
+`JoltDevice`/`RangeMaskPolynomial`. *Deferred:* phase/gap-round interleaving (M8 batched driver).
+
+**`26130df02` — RAM batched val-check.** File: `zkvm/ram/val_check.rs` (425). jolt-core:
+`zkvm/ram/val_check.rs`. *Identity (degree-3, log_t rounds):* `Σ_j inc(j)·wa(j)·(LT(j,r_cycle)+γ)`,
+batching the two RAM value identities `(1) Val−Val_init = Σ inc·wa·LT` and `(2) Val_final−Val_init = Σ inc·wa`
+via γ. *input_claim:* `(val_rw − init_eval) + γ·(val_final − init_eval)` where `val_rw` =
+`RamVal`@`RamReadWriteChecking`, `val_final` = `RamValFinal`@`RamOutputCheck`, `init_eval =
+Val_init(r_address)` (MLE of the materialized initial-RAM column). *Cached:* `RamRa` @`RamValCheck`
+(at `r_address‖r_cycle′`), `RamInc(ρ)` @`RamValCheck`. *expected_output_claim:*
+`inc_claim·wa_claim·(LT(ρ,r_cycle)+γ)`. *Review focus:* the γ-batch folds the `+γ` into the LT factor;
+the ZK `init_eval_public`/advice decomposition is **dropped** (non-ZK). The test draws γ from the
+transcript and seeds val_rw so input_claim equals the real sum.
+
+**`1f42740dc` — register read-write-checking.** File: `zkvm/registers/read_write_checking.rs` (508).
+jolt-core: `zkvm/registers/read_write_checking.rs`. *Identity (degree-3, log_k+log_t rounds):*
+`Σ_{k,j} eq(r_cycle,j)·[ra_merged(k,j)·Val(k,j) + wa(k,j)·(Val(k,j)+inc(j))]`, `ra_merged = γ·ra1 + γ²·ra2`.
+*input_claim:* `rd_wv + γ·rs1_rv + γ²·rs2_rv` (the three `RegistersClaimReduction` openings).
+*Cached:* `RegistersVal`,`Rs1Ra`,`Rs2Ra`,`RdWa` (virtual, at the full `r_address‖r_cycle` point) +
+`RdInc` (committed, at r_cycle) @`RegistersReadWriteChecking`. *expected_output_claim:*
+`eq(r_cycle,ρ_cycle)·(rd_wa·(inc+val) + γ·rs1_ra·val + γ²·rs2_ra·val)`. *Review focus:* the **single-phase
+fully-broadcast** form — `ra1/ra2/wa/val` are full `K·T` dense (index `k·T+j`); cycle-only `eq`/`inc`
+broadcast across the K address blocks so binding is uniform `LowToHigh`. `rs1_ra`/`rs2_ra` read
+**directly** from the two materialized read columns (jolt-core derives `rs2_ra` and back-solves
+`rs1_ra` — a perf trick, deferred). *Deferred:* sparse `ReadWriteMatrix` two-phase + Gruen (OPT-C).
+
+**`1bc1aa3ef` — RAM read-write-checking.** File: `zkvm/ram/read_write_checking.rs` (404). jolt-core:
+`zkvm/ram/read_write_checking.rs`. *Identity (degree-3, log_k+log_t rounds):*
+`Σ_{k,j} eq(r_cycle,j)·ra(k,j)·(Val(k,j) + γ·(inc(j)+Val(k,j))) = rv + γ·wv`. *input_claim:* `rv + γ·wv`
+(`RamReadValue`/`RamWriteValue` @`SpartanOuter`). *Cached:* `RamVal`,`RamRa` (virtual, full point) +
+`RamInc` (committed, r_cycle) @`RamReadWriteChecking`. *expected_output_claim:*
+`eq·ra·(val + γ·(val+inc))`. *Review focus:* a simpler single-`ra` analog of the register RW above
+(same broadcast convention). *Deferred:* same as registers RW (OPT-C).
+
+**`0305b1cc5` — RAM raf-evaluation.** File: `zkvm/ram/raf_evaluation.rs` (301). jolt-core:
+`zkvm/ram/raf_evaluation.rs`. *Identity (degree-2, log_k rounds):* `Σ_k ra(k)·unmap(k) = raf_claim`,
+where `ra(k) = Σ_j eq(r_cycle,j)·1[addr(j)=k]` (per-address access counts) and `unmap(k)` maps the
+remapped index back to the original RAM address. *input_claim:* the `RamAddress` opening from
+`SpartanOuter`. *Cached:* `RamRa` @`RamRafEvaluation` (at `r_address‖r_cycle`).
+*expected_output_claim:* `unmap(ρ)·ra_claim`, `unmap(ρ)` = MLE of the **public** unmap column (dot with
+`eq(ρ)`). *Review focus:* `unmap` is modeled as a materialized affine column `start_address + k`
+(decoupled); the real `UnmapRamAddressPolynomial` + split-eq `ra` materialization + phase/gap scaling
+are deferred. The `mul_pow_2` gap-scaling of jolt-core is dropped (single-phase, no gap).
+
+**`6c0bbc39e` + `50f170d80` — bytecode & instruction-lookups read-raf (shared `OneHotReadRaf`).**
+Files: `zkvm/shout_read_raf.rs` (537) + thin `zkvm/bytecode/read_raf_checking.rs` (31) and
+`zkvm/instruction_lookups/read_raf_checking.rs` (42). jolt-core:
+`zkvm/{bytecode,instruction_lookups}/read_raf_checking.rs`. *Identity (degree-3 = d+1 with d=2,
+log_k+log_t rounds):* `Σ_{j,k} ra(k,j)·Σ_s γ^s·eq_s(j)·Val_s(k) = Σ_s γ^s·rv_s`, with the one-hot read
+indicator `ra(k,j) = ∏_{i=0}^{d-1} ra_i(k_i,j)` (d-chunk product). *Generic* over the committed RA
+family (`fn(usize)→CommittedPolynomial`) + `SumcheckId`, so both ports share it: **bytecode** uses
+per-stage cycle points; **instruction-lookups** is the special case where all stages share
+`r_cycle = r_reduction` (single eq), stages `{lookup-output, left-operand, right-operand}`.
+*input_claim:* `Σ_s γ^s·rv_s` (per-stage upstream openings via the `rv_key` list). *Cached:* the d
+per-chunk `ra_i` leaf claims `ra_i(r_addr_chunk_i, r_cycle)` under `(ra_family(i), sumcheck_id)`.
+*expected_output_claim:* `ra_0·ra_1·Σ_s γ^s·eq_s(ρ_cycle)·Val_s(ρ_addr)` (eq via `mle`, Val via public
+column dot). *Review focus:* **`6c0bbc39e` first introduced this as `BytecodeReadRaf`; `50f170d80`
+generalized it into `OneHotReadRaf` and made bytecode a thin wrapper** — so review the final
+`shout_read_raf.rs`, not the intermediate. The chunk columns are **broadcast** to the full hypercube
+(index `(k0·K1+k1)·T+j`) for uniform binding. **These cached `ra_i` leaf claims are exactly the §4.5.2
+inputs the M7 LogUp\*-GKR consumes** — the sumcheck is unchanged by M7; only the leaf commitment changes
+(see the `m7-logupstar-readraf-relationship` memory). *Deferred:* prefix/suffix + two-phase, entry-point
+constraint, flag/table-specific Val construction, full-d (>2), the d-chunk one-hot *commitment* (M7).
+
+**`12f90c8da` + `959cf0d9d` — OPT-A: Gruen split-eq + unreduced accumulators.**
+*`12f90c8da`* rewrites `output_check.compute_message` to use `GruenSplitEqPolynomial::fold_out_in`
+(compute the constant + X² coeff of `q = io_mask·(val_final−val_io)`) → `gruen_poly_deg_3` (the eq
+factor handled by the eq-factorization, not as an explicit multilinear). *`959cf0d9d`* converts every
+other port's round-poly accumulation to `F::Accumulator` (`Fp3Accumulator`) — `acc[k].fmadd(a,b)` then
+reduce once per eval point. *Review focus:* both are **correctness-preserving** (all tests unchanged
+and green) — verify the Gruen `q_constant`/`q_quadratic` derivation matches jolt-core's output_check,
+and that `fmadd(a,b)` is used as `a·b` (the two-factor grouping is correct, e.g.
+`acc.fmadd(eq_e[k]*ra_e[k], val + γ(val+inc))`). The base×ext `fmadd_base` win is **not** active yet
+(needs real base witnesses, M8).
+
+**`59d5721da` — Spartan shift (PC) sumcheck.** File: `zkvm/spartan/shift.rs` (419). jolt-core:
+`zkvm/spartan/shift.rs`. *Identity (degree-2, log_t rounds):*
+`Σ_j [EqPlusOne(r_outer,j)·(s0+γs1+γ²s2+γ³s3)(j) + γ⁴·EqPlusOne(r_product,j)·(1−s4(j))]`. *Inputs:* five
+`f(j+1)`-aligned shift columns `s0..s4`; two `EqPlusOne` tables via `EqPlusOnePolynomial::evals`.
+*input_claim:* `NextUnexpandedPC + γ·NextPC + γ²·NextIsVirtual + γ³·NextIsFirstInSequence + γ⁴·(1−NextIsNoop)`
+(the first four from `SpartanOuter`, NextIsNoop from `SpartanProductVirtualization`). *Cached:* the 5
+shift openings @`SpartanShift` (keyed by the `SHIFT_KEYS` const — distinct existing variants; jolt-core
+uses `OpFlags`/`InstructionFlags`). *expected_output_claim:*
+`eqp_outer·(s0+γs1+γ²s2+γ³s3) + γ⁴·eqp_product·(1−s4)`, `eqp_* = EqPlusOnePolynomial::new(r).evaluate(ρ)`.
+*Review focus:* the **two** eq+1 points (`r_outer` for terms 0–3, `r_product` for term 4); the test
+seeds the five Next* claims (γ-independent) so input_claim equals the real shift sum for any γ.
+*Deferred:* prefix-suffix two-phase EqPlusOne (OPT-E).
+
+**`b74b0e6c3` — Spartan instruction-input virtualization.** File: `zkvm/spartan/instruction_input.rs`
+(335). jolt-core: `zkvm/spartan/instruction_input.rs`. *Identity (degree-3, log_t rounds):*
+`Σ_j eq(r_cycle,j)·(RightInput + γ·LeftInput)`, `LeftInput = left_is_rs1·rs1 + left_is_pc·upc`,
+`RightInput = right_is_rs2·rs2 + right_is_imm·imm`. *input_claim:* `right + γ·left`
+(`Left`/`RightInstructionInput` @`SpartanProductVirtualization`). *Cached:* the 8 flag/value openings
+@`InstructionInputVirtualization` (`KEYS` const, order
+`[left_is_rs1, rs1, left_is_pc, upc, right_is_rs2, rs2, right_is_imm, imm]`). *expected_output_claim:*
+`eq(r_cycle,ρ)·((right_is_rs2·rs2 + right_is_imm·imm) + γ·(left_is_rs1·rs1 + left_is_pc·upc))` from the
+8 cached openings. *Review focus:* degree-3 comes from `eq·(flag·value)`; the verifier reconstructs
+Left/RightInput from the individual openings (not from a single combined column).
+
+**`7678e5a70` — Spartan outer (R1CS satisfaction).** File: `zkvm/spartan/outer.rs` (279). jolt-core:
+`zkvm/spartan/outer.rs`. *Identity (degree-3 zero-check, |τ| rounds):*
+`0 = Σ_x eq(τ,x)·(Az(x)·Bz(x) − Cz(x))`. *Inputs:* materialized `Az`/`Bz`/`Cz` columns. *input_claim:*
+`0`. *Cached:* `SpartanAz`/`SpartanBz`/`SpartanCz` (new `VirtualPolynomial` variants, added here) @
+`SpartanOuter`. *expected_output_claim:* `eq(τ,ρ)·(Az·Bz − Cz)`. *Review focus:* honest test uses
+`Cz = Az∘Bz` so the zero-check holds. **The matrix→z reduction is deferred** — jolt-core caches the
+individual `z`-input openings (`ALL_R1CS_INPUTS`) and reconstructs `Az/Bz/Cz` via the R1CS matrices
+(the inner Spartan reduction = `R1CSEval`); the decoupled port abstracts that to direct `Az/Bz/Cz`
+columns. *Deferred (OPT-E):* univariate-skip first round, streaming, `R1CSEval`. The Spartan **product**
+sumcheck is uni-skip-intrinsic and ports with OPT-E.
+
+**`95e99b376` — booleanity (M6 range checks).** File: `zkvm/booleanity.rs` (347). jolt-core:
+`subprotocols/booleanity.rs`. *Identity (degree-3 zero-check, log_k rounds):*
+`0 = Σ_x eq(r,x)·Σ_i γ^{2i}·(b_i(x)² − b_i(x))`. *Inputs:* the boolean carry/sign columns. *input_claim:*
+`0`. *Cached:* `R1csAux(i)` (new `CommittedPolynomial` variant) @`Booleanity`. *expected_output_claim:*
+`eq(r,ρ)·Σ_i γ^{2i}·(b_i(ρ)²−b_i(ρ))` from the cached openings. *Review focus:* uses Gruen + accumulators
+(the per-pair `q` has `q_constant = b0²−b0`, X² coeff `= (b1−b0)²`). **The negative test
+(`non_boolean_column_mismatch`) is subtle and worth understanding:** `gruen_poly_deg_3` *forces*
+`s(0)+s(1)=claim`, so `verify()` *accepts* a non-boolean column — the failure surfaces only at the
+`expected_output_claim` discharge (`value != expected`). That's how booleanity actually rejects, and it
+mirrors how the M8 driver will catch it. This is the **only** booleanity surviving the LogUp\*-GKR
+design; **the limbed R1CS soundness depends on it** (review with `a46e62f8b`).
+
+---
+
+### 10.5 Cross-cutting things to verify once (apply to all ports)
+
+- **Endianness round-trip** (the subtle invariant): for every port, the test's
+  `assert_eq!(cached_claim, dot(column, EqPolynomial::evals(reverse(challenges))))` confirms the dense
+  table ↔ MLE-at-`reverse(challenges)` correspondence. If any port got this wrong, that assert fails.
+- **input/output identity symmetry:** for every port, `input_claim` (LHS, from upstream openings) and
+  `expected_output_claim` (RHS, from this port's cached openings + recomputed structural factors) are
+  the two sides of the stated identity. The test's `assert_eq!(value, expected)` is the catch-all.
+- **Degree ↔ eval points:** degree-2 → 3 points, degree-3 → 4 points (`UnivariatePoly::from_evals`).
+- **Decoupled-key artifact:** Spartan/shift/instruction-input cache under *remapped* existing
+  `VirtualPolynomial` variants (the `KEYS`/`SHIFT_KEYS` consts) because the real `OpFlags`/
+  `InstructionFlags` variants aren't wired yet — harmless for the round-trip (keys only need to be
+  distinct + consistent), to be replaced in M8.
+
+### 10.6 What is NOT yet committed (so you don't go looking for it)
+
+Spartan **product**; the M7 LogUp\*-GKR (`crates/jolt-whir/src/logup/`); the M8 stage driver, e2e tests,
+and `jolt-equivalence` cross-check; the deferred opts OPT-B…E (split-LT, sparse `ReadWriteMatrix`,
+prefix/suffix, univariate-skip + Multiquadratic + Lagrange + streaming + `R1CSEval`); the compact
+base-field MLE variants; the flag-carrying `VirtualPolynomial` variants. See §8–§9.
+
+### 10.7 Condensed hash list (newest first)
 
 ```
-95e99b376  booleanity (M6 range checks)                         zkvm/booleanity.rs, R1csAux key
-7678e5a70  Spartan outer (R1CS Az·Bz−Cz zero-check)             zkvm/spartan/outer.rs, SpartanAz/Bz/Cz keys
-b74b0e6c3  Spartan instruction-input virtualization             zkvm/spartan/instruction_input.rs
-59d5721da  Spartan shift (eq+1 PC identity)                      zkvm/spartan/shift.rs
-959cf0d9d  OPT-A: unreduced accumulators everywhere             (all compute_message loops)
-12f90c8da  OPT-A: Gruen split-eq in RAM output-check            zkvm/ram/output_check.rs
-50f170d80  instruction-lookups read-raf + shared OneHotReadRaf  zkvm/shout_read_raf.rs (+ thin modules)
-6c0bbc39e  bytecode read-raf checking                           (now thin over shout_read_raf)
-0305b1cc5  RAM raf-evaluation                                   zkvm/ram/raf_evaluation.rs
-1bc1aa3ef  RAM read-write-checking                              zkvm/ram/read_write_checking.rs
-1f42740dc  register read-write-checking                         zkvm/registers/read_write_checking.rs
-26130df02  RAM batched val-check                                zkvm/ram/val_check.rs
-3751b7d3b  RAM output-check                                     zkvm/ram/output_check.rs
-96427dc5c  registers val-evaluation                             zkvm/registers/val_evaluation.rs
-d84b7de2e  PHASE2_HANDOFF.md
-f320f6c41  Inc claim-reduction (the template)                   zkvm/claim_reductions/increments.rs
-54b0540fd  opening accumulator                                  framework/accumulator.rs
-8bf3c0143  SumcheckInstance trait + driver                      framework/sumcheck.rs
-5ed82eae9  dense MultilinearPolynomial                          framework/poly.rs
-a46e62f8b  full limbed RV64 R1CS                                r1cs/rv64_limbed.rs
-90d5926a0  signed-value derivation                              r1cs/signed_value.rs
-5c571d81c  limbed MUL 4-limb schoolbook                         r1cs/mul.rs
-7e97db47b  LIMBED_R1CS.md
-ce2440668  crate skeleton + field/PCS/transcript wiring         field.rs, lib.rs
-d9c7e8a99  M4 base-field limb primitives + signed 2-limb Inc    (jolt-field, jolt-witness)
-cc5af5c32  M3 WhirScheme batch open                             (jolt-whir)
-60bf2696c  M2 WhirScheme commit/open/verify                     (jolt-whir)
-08794dc74  M1 shared spongefish transcript                      (jolt-whir)
-6d263f5d1  M0 Goldilocks/Fp3 deferred-reduction accumulators    (jolt-field)
-4e30d3e88  Phase 1 complete (field/limbs/WHIR commit)           (jolt-field, jolt-witness, jolt-whir, jolt-pcs-bench)
+95e99b376  booleanity (M6)                       7678e5a70  Spartan outer
+b74b0e6c3  Spartan instruction-input             59d5721da  Spartan shift
+959cf0d9d  OPT-A accumulators everywhere         12f90c8da  OPT-A Gruen (output_check)
+50f170d80  instr read-raf + shared OneHotReadRaf 6c0bbc39e  bytecode read-raf
+0305b1cc5  RAM raf-evaluation                    1bc1aa3ef  RAM read-write-checking
+1f42740dc  registers read-write-checking         26130df02  RAM val-check
+3751b7d3b  RAM output-check                      96427dc5c  registers val-evaluation
+d84b7de2e  PHASE2_HANDOFF.md                     f320f6c41  Inc claim-reduction (template)
+54b0540fd  opening accumulator                   8bf3c0143  SumcheckInstance + driver
+5ed82eae9  dense MultilinearPolynomial           a46e62f8b  full limbed RV64 R1CS
+90d5926a0  signed-value derivation               5c571d81c  limbed MUL schoolbook
+7e97db47b  LIMBED_R1CS.md                        ce2440668  crate skeleton
+d9c7e8a99  M4 limb primitives + signed Inc       cc5af5c32  M3 WhirScheme batch open
+60bf2696c  M2 WhirScheme commit/open/verify      08794dc74  M1 shared spongefish transcript
+6d263f5d1  M0 deferred-reduction accumulators    4e30d3e88  Phase 1 (field/limbs/WHIR commit)
 ```
 
-**Suggested review order:** (1) `framework/` (poly → sumcheck → accumulator) to learn the engine + the
-conventions in §7; (2) `claim_reductions/increments.rs` as the canonical template; (3) the leaf ports in
-the table in §4 (they're all variations on the template); (4) `shout_read_raf.rs` (the d-chunk one-hot,
-the M7 hand-off point); (5) `r1cs/` + `LIMBED_R1CS.md` (the soundness-critical arithmetization);
-(6) `output_check.rs` for the optimized (Gruen + accumulator) pattern. The 45-test suite is the
-executable spec — every identity is checked prover→verifier with a negative case.
+**Suggested review order:** (1) `framework/` (poly → sumcheck → accumulator), §10.3, to learn the
+engine + the §7 conventions; (2) `increments.rs` (`f320f6c41`), the canonical template; (3) the leaf
+ports §10.4 top-to-bottom (variations on the template); (4) `shout_read_raf.rs` (`50f170d80`), the
+d-chunk one-hot + M7 hand-off; (5) `r1cs/` + `LIMBED_R1CS.md` (`a46e62f8b`/`5c571d81c`), the
+soundness-critical arithmetization, together with booleanity (`95e99b376`); (6) `output_check.rs`
+(`12f90c8da`) for the optimized Gruen + accumulator pattern. The 45-test suite is the executable
+spec — every identity is checked prover→verifier with a negative case.
