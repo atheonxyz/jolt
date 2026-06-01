@@ -33,6 +33,8 @@
 use jolt_field::Field;
 use jolt_poly::EqPolynomial;
 
+pub mod circuit;
+pub mod layer;
 pub mod pushforward;
 
 /// LogUp\*-GKR verification / preparation error. The three prototype `assert!`s
