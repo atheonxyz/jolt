@@ -9,6 +9,7 @@
 //!   M0 — assemble all binary-driver witnesses from the real trace; assert the limbed R1CS is
 //!        satisfied (flushes out `cycle_to_z` op-coverage on real MUL/virtual-sequence cycles).
 //!   M1 — the binary driver (Spartan -> memory -> booleanity) round-trips on the real trace.
+//!   M2 — the full prove_e2e/verify_e2e adds the stage-8 WHIR open of the R1csAux columns.
 #![cfg(feature = "goldilocks")]
 
 use common::constants::REGISTER_COUNT;
@@ -16,6 +17,7 @@ use jolt_core::host;
 use jolt_core::zkvm::ram::remap_address;
 use jolt_prover_goldilocks::field::{ProverTranscript, VerifierTranscript};
 use jolt_prover_goldilocks::zkvm::driver::{prove_binary, verify_binary};
+use jolt_prover_goldilocks::zkvm::e2e::{prove_e2e, verify_e2e, VerifierParams};
 use jolt_prover_goldilocks::zkvm::real_trace::{assemble_real_witness, RealWitness};
 use jolt_prover_goldilocks::F;
 use jolt_trace::{BytecodePreprocessing, CycleRow};
@@ -108,4 +110,19 @@ fn goldilocks_real_trace_binary_driver_round_trip() {
         &mut verifier_t,
     )
     .expect("binary driver (Spartan -> memory -> booleanity) must verify on the real muldiv trace");
+}
+
+#[test]
+fn goldilocks_real_trace_e2e_with_stage8_r1cs_aux() {
+    let (w, _trace_len) = build_muldiv_real_witness();
+
+    let mut prover_t = ProverTranscript::new("muldiv-e2e");
+    let proof = prove_e2e(&w, &mut prover_t)
+        .expect("prove_e2e (binary driver + stage-8 WHIR open of R1csAux) must succeed");
+    let narg = prover_t.into_proof();
+
+    let params = VerifierParams::from_witness(&w);
+    let mut verifier_t = VerifierTranscript::new("muldiv-e2e", &narg);
+    verify_e2e(&proof, &params, &mut verifier_t)
+        .expect("verify_e2e must accept the real muldiv proof (incl. the stage-8 R1csAux open)");
 }

@@ -60,7 +60,7 @@ pub struct BinaryProof<F: Field> {
     pub aux_evals: Vec<F>,
 }
 
-/// Top-level prover: Fiat-Shamir-threaded Spartan → memory → booleanity, on one accumulator.
+/// Top-level prover: Fiat-Shamir-threaded Spartan → memory → booleanity, on a fresh accumulator.
 pub fn prove_binary<F, T>(
     witness: &R1csWitness<F>,
     ram_w: &RamWitness<F>,
@@ -74,8 +74,34 @@ where
     T: ProverFs<F>,
 {
     let mut accumulator = Openings::<F>::new(witness.log_num_cycles);
+    prove_binary_into(
+        witness,
+        ram_w,
+        reg_w,
+        ram_public,
+        key,
+        &mut accumulator,
+        transcript,
+    )
+}
 
-    let spartan = prove_spartan(witness, key, &mut accumulator, transcript);
+/// Prove the binary stages onto a caller-owned `accumulator`, leaving its cached openings available
+/// for the stage-8 WHIR open (the full e2e in [`crate::zkvm::e2e`]). [`prove_binary`] is the wrapper
+/// that creates the accumulator.
+pub fn prove_binary_into<F, T>(
+    witness: &R1csWitness<F>,
+    ram_w: &RamWitness<F>,
+    reg_w: &RegisterWitness<F>,
+    ram_public: &RamPublicColumns<F>,
+    key: &R1csKey<F>,
+    accumulator: &mut Openings<F>,
+    transcript: &mut T,
+) -> BinaryProof<F>
+where
+    F: Field,
+    T: ProverFs<F>,
+{
+    let spartan = prove_spartan(witness, key, accumulator, transcript);
 
     let memory = prove_memory(
         ram_w,
@@ -83,7 +109,7 @@ where
         &ram_public.unmap,
         &ram_public.val_io,
         &ram_public.io_mask,
-        &mut accumulator,
+        accumulator,
         transcript,
     );
 
@@ -92,7 +118,7 @@ where
     let r_bool = transcript.challenge_vector(witness.log_num_cycles);
     let bparams = BooleanityParams::new(r_bool, n_aux, transcript);
     let mut booleanity = Booleanity::new_prover(bparams, aux_cols);
-    let _ = prove(&mut booleanity, &mut accumulator, transcript);
+    let _ = prove(&mut booleanity, accumulator, transcript);
 
     let aux_evals = (0..n_aux)
         .map(|i| {
@@ -132,15 +158,42 @@ where
     T: VerifierFs<F>,
 {
     let mut accumulator = Openings::<F>::new(log_num_cycles);
-
-    verify_spartan(
-        &proof.spartan,
+    verify_binary_into(
+        proof,
         key,
         num_row_vars,
+        log_num_cycles,
+        ram_log_k,
+        reg_log_k,
+        ram_public,
         &mut accumulator,
         transcript,
     )
-    .map_err(DriverError::Spartan)?;
+}
+
+/// Verify the binary stages against a caller-owned `accumulator`, leaving its appended openings for
+/// the stage-8 WHIR verify (the full e2e in [`crate::zkvm::e2e`]). [`verify_binary`] is the wrapper.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "mirrors prove_binary_into: proof + R1CS key + Spartan/memory geometry + RAM public columns + accumulator + transcript"
+)]
+pub fn verify_binary_into<F, T>(
+    proof: &BinaryProof<F>,
+    key: &R1csKey<F>,
+    num_row_vars: usize,
+    log_num_cycles: usize,
+    ram_log_k: usize,
+    reg_log_k: usize,
+    ram_public: &RamPublicColumns<F>,
+    accumulator: &mut Openings<F>,
+    transcript: &mut T,
+) -> Result<(), DriverError>
+where
+    F: Field,
+    T: VerifierFs<F>,
+{
+    verify_spartan(&proof.spartan, key, num_row_vars, accumulator, transcript)
+        .map_err(DriverError::Spartan)?;
 
     verify_memory(
         &proof.memory,
@@ -150,7 +203,7 @@ where
         &ram_public.unmap,
         &ram_public.val_io,
         &ram_public.io_mask,
-        &mut accumulator,
+        accumulator,
         transcript,
     )
     .map_err(DriverError::Memory)?;
@@ -176,7 +229,7 @@ where
             eval,
         );
     }
-    if value != booleanity.expected_output_claim(&accumulator, &point) {
+    if value != booleanity.expected_output_claim(&*accumulator, &point) {
         return Err(DriverError::Spartan(SpartanStageError::InnerClaim));
     }
     Ok(())

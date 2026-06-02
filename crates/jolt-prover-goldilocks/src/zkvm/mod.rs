@@ -5,6 +5,7 @@ pub mod booleanity;
 pub mod bytecode;
 pub mod claim_reductions;
 pub mod driver;
+pub mod e2e;
 pub mod instruction_lookups;
 pub mod logup;
 pub mod memory;

@@ -28,6 +28,31 @@ use crate::zkvm::witness::CommittedWitness;
 /// `RaDense` chunk-index columns + the `R1csAux` boolean columns into [`Stage8Columns`] (the generic
 /// inventory open), and the `RdInc`/`RamInc` signed limbs into [`IncLimbColumns`] (the limb
 /// reconstruct). All columns have length `2^log_t`.
+/// Lift one boolean Fp3 aux column to its base-Goldilocks commit column (coeff-0; the other Fp3
+/// coefficients are zero for a boolean value).
+pub(crate) fn r1cs_aux_base_column(col: &[F]) -> Vec<Base> {
+    col.iter()
+        .map(|x| {
+            let c = x.coeffs();
+            debug_assert!(
+                c[1] == Base::from_u64(0) && c[2] == Base::from_u64(0),
+                "R1csAux column must be base-representable (boolean)"
+            );
+            c[0]
+        })
+        .collect()
+}
+
+/// The `R1csAux(i)` committed columns alone — used by the stage-8 open before the read-raf/M7 stages
+/// land (the R1csAux discharge needs neither the `RaDense` chunk columns nor the `Inc` limbs).
+pub fn r1cs_aux_columns(aux_columns: &[Vec<F>]) -> Stage8Columns {
+    let mut columns = Stage8Columns::new();
+    for (i, col) in aux_columns.iter().enumerate() {
+        columns.insert(CommittedPolynomial::R1csAux(i), r1cs_aux_base_column(col));
+    }
+    columns
+}
+
 pub fn build_committed_columns(
     committed: &CommittedWitness<F>,
     sources: &CommitmentTraceSources,
@@ -48,18 +73,7 @@ pub fn build_committed_columns(
 
     // R1csAux: boolean Fp3 columns → base (coeff-0 lift; the other coeffs are zero for a boolean).
     for (i, col) in aux_columns.iter().enumerate() {
-        let base: Vec<Base> = col
-            .iter()
-            .map(|x| {
-                let c = x.coeffs();
-                debug_assert!(
-                    c[1] == Base::from_u64(0) && c[2] == Base::from_u64(0),
-                    "R1csAux column must be base-representable (boolean)"
-                );
-                c[0]
-            })
-            .collect();
-        columns.insert(CommittedPolynomial::R1csAux(i), base);
+        columns.insert(CommittedPolynomial::R1csAux(i), r1cs_aux_base_column(col));
     }
 
     // Inc: signed two-limb decomposition, padded to the committed length.
