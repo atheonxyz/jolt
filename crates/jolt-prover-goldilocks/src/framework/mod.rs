@@ -12,8 +12,11 @@
 //! path follow.
 
 pub mod accumulator;
+pub mod lagrange;
+pub mod multiquadratic;
 pub mod poly;
 pub mod sumcheck;
+pub mod univariate_skip;
 
 pub use accumulator::{
     CommittedPolynomial, OpeningAccumulator, OpeningPoint, Openings, SumcheckId, VirtualPolynomial,

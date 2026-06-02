@@ -12,9 +12,10 @@
 use jolt_field::Field;
 use jolt_poly::UnivariatePoly;
 use jolt_sumcheck::{
-    EvaluationClaim, RoundProof, SumcheckClaim, SumcheckError, SumcheckProof, SumcheckVerifier,
+    BatchedSumcheckVerifier, EvaluationClaim, RoundProof, SumcheckClaim, SumcheckError,
+    SumcheckProof, SumcheckVerifier,
 };
-use jolt_transcript::Transcript;
+use jolt_transcript::{AppendToTranscript, Transcript};
 
 use crate::framework::accumulator::{
     OpeningAccumulator, OpeningPoint, Openings, BIG_ENDIAN, LITTLE_ENDIAN,
@@ -54,6 +55,17 @@ pub trait SumcheckInstance<F: Field> {
     fn normalize_opening_point(&self, challenges: &[F]) -> OpeningPoint<BIG_ENDIAN, F> {
         OpeningPoint::<LITTLE_ENDIAN, F>::new(challenges.to_vec()).match_endianness()
     }
+
+    /// The global round at which this instance becomes active in a batched (front-loaded) sumcheck
+    /// of `max_num_rounds` rounds. Default = `max_num_rounds - num_rounds` (shorter instances active
+    /// in the last `num_rounds` rounds), matching jolt-core's `round_offset`.
+    fn round_offset(&self, max_num_rounds: usize) -> usize {
+        max_num_rounds - self.num_rounds()
+    }
+
+    /// End-of-protocol hook (after the last challenge is bound, before `cache_openings`) for
+    /// instances with delayed bindings. Default no-op. Mirrors jolt-core's `finalize`.
+    fn finalize(&mut self) {}
 }
 
 /// Drive a single sumcheck instance to completion, emitting a workspace-verifiable proof and the
@@ -102,6 +114,138 @@ where
     T: Transcript<Challenge = F>,
 {
     SumcheckVerifier::verify(claim, &proof.round_polynomials, transcript)
+}
+
+/// Drive a **front-loaded batched** sumcheck over many instances of (possibly) differing round
+/// counts and degrees, emitting a proof the workspace [`BatchedSumcheckVerifier`] accepts. Mirrors
+/// jolt-core `BatchedSumcheck::prove` (non-ZK), retargeted to the lean field/transcript.
+///
+/// Transcript order (must match [`BatchedSumcheckVerifier`]): absorb each instance's `input_claim`
+/// in order, squeeze the batching challenge `α`, then per round absorb the combined round polynomial
+/// and squeeze the round challenge. Batching coefficients are `α^j` (NOT jolt-core's independent
+/// `challenge_vector` — the workspace verifier uses the running power, so the prover matches it).
+///
+/// Front-loading: instance `j` is active in rounds `[offset_j, offset_j + num_rounds_j)` with
+/// `offset_j = round_offset(max)` (default `max − num_rounds_j`); in its gap rounds it contributes a
+/// constant dummy `claim_j / 2` (so `H(0)+H(1) = claim_j`), and its claim is pre-scaled by
+/// `2^{max − num_rounds_j}` so it equals the true `input_claim` at activation.
+///
+/// Returns `(proof, challenges, batching_coeffs)` — `challenges` has length `max_num_rounds`;
+/// `batching_coeffs[j] = α^j`. The verifier reduces to `Σ_j α^j · expected_output_claim_j` at each
+/// instance's `challenges[offset_j .. offset_j + num_rounds_j]` slice.
+#[expect(
+    clippy::unwrap_used,
+    reason = "instances is asserted non-empty (so max() is Some); 2 is invertible in any prime field"
+)]
+pub fn prove_batched<F, T>(
+    mut instances: Vec<&mut dyn SumcheckInstance<F>>,
+    accumulator: &mut Openings<F>,
+    transcript: &mut T,
+) -> (SumcheckProof<F>, Vec<F>, Vec<F>)
+where
+    F: Field,
+    T: Transcript<Challenge = F>,
+{
+    assert!(
+        !instances.is_empty(),
+        "batched sumcheck needs at least one instance"
+    );
+    let max_num_rounds = instances.iter().map(|s| s.num_rounds()).max().unwrap();
+
+    // Fiat-Shamir: absorb input claims (BatchedSumcheckVerifier order), squeeze α.
+    let input_claims: Vec<F> = instances
+        .iter()
+        .map(|s| s.input_claim(&*accumulator))
+        .collect();
+    for c in &input_claims {
+        c.append_to_transcript(transcript);
+    }
+    let alpha: F = transcript.challenge();
+    let mut batching_coeffs = Vec::with_capacity(instances.len());
+    let mut power = F::one();
+    for _ in 0..instances.len() {
+        batching_coeffs.push(power);
+        power *= alpha;
+    }
+
+    // Front-loaded scaling: claim_j *= 2^{max − num_rounds_j}.
+    let mut individual_claims: Vec<F> = instances
+        .iter()
+        .zip(input_claims.iter())
+        .map(|(s, &c)| c.mul_pow_2(max_num_rounds - s.num_rounds()))
+        .collect();
+
+    let two_inv = F::from_u64(2).inverse().unwrap();
+    let mut round_polynomials = Vec::with_capacity(max_num_rounds);
+    let mut challenges = Vec::with_capacity(max_num_rounds);
+
+    for round in 0..max_num_rounds {
+        let polys: Vec<UnivariatePoly<F>> = instances
+            .iter_mut()
+            .zip(individual_claims.iter())
+            .map(|(s, &prev)| {
+                let num_rounds = s.num_rounds();
+                let offset = s.round_offset(max_num_rounds);
+                if round >= offset && round < offset + num_rounds {
+                    s.compute_message(round - offset, prev)
+                } else {
+                    UnivariatePoly::new(vec![prev * two_inv])
+                }
+            })
+            .collect();
+
+        // Combined round polynomial Σ_j α^j · poly_j.
+        let mut batched = &polys[0] * batching_coeffs[0];
+        for (poly, &coeff) in polys.iter().zip(batching_coeffs.iter()).skip(1) {
+            batched += &(poly * coeff);
+        }
+
+        <UnivariatePoly<F> as RoundProof<F>>::append_to_transcript(&batched, transcript);
+        let r = transcript.challenge();
+        challenges.push(r);
+
+        for (claim, poly) in individual_claims.iter_mut().zip(polys.iter()) {
+            *claim = poly.evaluate(r);
+        }
+        for s in &mut instances {
+            let num_rounds = s.num_rounds();
+            let offset = s.round_offset(max_num_rounds);
+            if round >= offset && round < offset + num_rounds {
+                s.bind(r, round - offset);
+            }
+        }
+        round_polynomials.push(batched);
+    }
+
+    for s in &mut instances {
+        s.finalize();
+    }
+    for s in &instances {
+        let offset = s.round_offset(max_num_rounds);
+        let r_slice = &challenges[offset..offset + s.num_rounds()];
+        s.cache_openings(accumulator, r_slice);
+    }
+
+    (
+        SumcheckProof { round_polynomials },
+        challenges,
+        batching_coeffs,
+    )
+}
+
+/// Verify a batched proof via the workspace [`BatchedSumcheckVerifier`], returning the combined
+/// reduced claim `{point, value}`. The caller discharges `value` against
+/// `Σ_j α^j · expected_output_claim_j` at each instance's challenge slice.
+pub fn verify_batched<F, T>(
+    claims: &[SumcheckClaim<F>],
+    proof: &SumcheckProof<F>,
+    transcript: &mut T,
+) -> Result<EvaluationClaim<F>, SumcheckError<F>>
+where
+    F: Field,
+    T: Transcript<Challenge = F>,
+{
+    BatchedSumcheckVerifier::verify(claims, &proof.round_polynomials, transcript)
 }
 
 #[cfg(test)]
@@ -252,6 +396,98 @@ mod tests {
         assert!(
             verify(&claim, &proof, &mut verifier_t).is_err(),
             "tampered proof must be rejected"
+        );
+    }
+
+    fn product_instance(rng: &mut Rng, log_len: usize) -> ProductInstance<Goldilocks> {
+        let len = 1usize << log_len;
+        let a = (0..len).map(|_| Goldilocks::from_u64(rng.next())).collect();
+        let b = (0..len).map(|_| Goldilocks::from_u64(rng.next())).collect();
+        ProductInstance::new(a, b)
+    }
+
+    /// Front-loaded batched sumcheck over three instances of differing round counts (4, 3, 2) —
+    /// exercises the gap-round dummies — round-tripped against the workspace `BatchedSumcheckVerifier`.
+    #[test]
+    fn batched_round_trip_with_gap_rounds() {
+        let mut rng = Rng(0xBA7C);
+        let mut i0 = product_instance(&mut rng, 4);
+        let mut i1 = product_instance(&mut rng, 3);
+        let mut i2 = product_instance(&mut rng, 2);
+
+        let mut acc = Openings::<Goldilocks>::new(4);
+        let claims = vec![
+            SumcheckClaim {
+                num_vars: 4,
+                degree: 2,
+                claimed_sum: i0.input_claim(&acc),
+            },
+            SumcheckClaim {
+                num_vars: 3,
+                degree: 2,
+                claimed_sum: i1.input_claim(&acc),
+            },
+            SumcheckClaim {
+                num_vars: 2,
+                degree: 2,
+                claimed_sum: i2.input_claim(&acc),
+            },
+        ];
+
+        let mut prover_t = Blake2bTranscript::<Goldilocks>::new(b"batched");
+        let instances: Vec<&mut dyn SumcheckInstance<Goldilocks>> = vec![&mut i0, &mut i1, &mut i2];
+        let (proof, challenges, coeffs) = prove_batched(instances, &mut acc, &mut prover_t);
+        assert_eq!(challenges.len(), 4, "challenges has length max_num_rounds");
+
+        let mut verifier_t = Blake2bTranscript::<Goldilocks>::new(b"batched");
+        let EvaluationClaim { point, value } =
+            verify_batched(&claims, &proof, &mut verifier_t).expect("batched proof must verify");
+        assert_eq!(
+            point, challenges,
+            "verifier point matches prover challenges"
+        );
+
+        // Combined reduced claim = Σ_j α^j · A_j(r_slice)·B_j(r_slice) at each instance's active slice
+        // (offset_j = max − num_rounds_j: 0, 1, 2).
+        let v0 = coeffs[0] * i0.expected_output_claim(&acc, &challenges[0..4]);
+        let v1 = coeffs[1] * i1.expected_output_claim(&acc, &challenges[1..4]);
+        let v2 = coeffs[2] * i2.expected_output_claim(&acc, &challenges[2..4]);
+        assert_eq!(
+            value,
+            v0 + v1 + v2,
+            "batched reduced claim must equal Σ α^j · A_j(r)·B_j(r)"
+        );
+    }
+
+    #[test]
+    fn tampered_batched_rejected() {
+        let mut rng = Rng(0xBADB);
+        let mut i0 = product_instance(&mut rng, 4);
+        let mut i1 = product_instance(&mut rng, 3);
+        let mut acc = Openings::<Goldilocks>::new(4);
+        let claims = vec![
+            SumcheckClaim {
+                num_vars: 4,
+                degree: 2,
+                claimed_sum: i0.input_claim(&acc),
+            },
+            SumcheckClaim {
+                num_vars: 3,
+                degree: 2,
+                claimed_sum: i1.input_claim(&acc),
+            },
+        ];
+        let mut prover_t = Blake2bTranscript::<Goldilocks>::new(b"batched-t");
+        let (mut proof, _, _) = prove_batched(vec![&mut i0, &mut i1], &mut acc, &mut prover_t);
+        proof.round_polynomials[0] = UnivariatePoly::new(vec![
+            Goldilocks::from_u64(1),
+            Goldilocks::from_u64(2),
+            Goldilocks::from_u64(3),
+        ]);
+        let mut verifier_t = Blake2bTranscript::<Goldilocks>::new(b"batched-t");
+        assert!(
+            verify_batched(&claims, &proof, &mut verifier_t).is_err(),
+            "tampered batched proof must be rejected"
         );
     }
 }
