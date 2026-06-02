@@ -9,43 +9,44 @@
 //! Σ_{j,k} ra(k,j) · Σ_s γ^s · eq_s(j) · Val_s(k) = Σ_s γ^s · rv_s,
 //! ```
 //!
-//! with the one-hot read indicator `ra(k,j) = ∏_{i=0}^{D-1} ra_i(k_i, j)` (the `D`-chunk product).
-//! - **Bytecode** (`D = 2`) uses per-stage cycle points `r_cycle_s` (distinct `eq_s`) and `Val_s`
+//! with the one-hot read indicator `ra(k,j) = ∏_{i=0}^{D-1} ra_i(k_i, j)` (the `D`-chunk product),
+//! one-hot in `k` per cycle: cycle `j` reads the single address `combined(idx[j]) = Σ_i idx_i[j]·suffix_i`.
+//! - **Bytecode** (`D = 3..4`) uses per-stage cycle points `r_cycle_s` (distinct `eq_s`) and `Val_s`
 //!   encoding circuit flags / RAF identity.
-//! - **Instruction-lookups** (`D = 5`) is the special case where every stage shares
-//!   `r_cycle = r_reduction` (a single `eq`), with `Val_s` ∈ {lookup-output table value, left/right
-//!   operand}; the LHS is `rv + γ·left_op + γ²·right_op`.
+//! - **Instruction-lookups** shares `r_cycle = r_reduction` across stages; at production `LOG_K = 128`
+//!   the dense `K_total` tables below are infeasible and the address phase must use prefix/suffix —
+//!   that variant is deferred (see the `goldilocks-migration-plan` memory, P-Sparse-e).
 //!
-//! ## Const-generic `D`
+//! ## Address-first two-phase (sparse, `O(K_total + D·T)`)
 //!
-//! Generalized over the number of address chunks via **two** const params
-//! [`OneHotReadRaf<F, D, NE>`] with `NE = D + 2` (stable Rust cannot evaluate `D + 2` inside a
-//! `sumcheck_evals_array::<{D+2}>` turbofish — generic-const-expr is nightly — so `NE` is threaded
-//! explicitly, mirroring [`crate::framework::univariate_skip`]'s multi-const pattern).
-//! [`OneHotReadRafParams<F, D>`] carries `log_k_chunks: [usize; D]`.
+//! Ported from jolt-core's `BytecodeReadRafSumcheckProver`: never materializes the `K_total·T`
+//! hypercube. `num_rounds = log_K + log_T`, all bound `LowToHigh`.
+//! - **Address phase** (`rounds < log_K`): bind the per-stage address marginal
+//!   `F_s[k] = Σ_{j: read(j)=k} eq_s(j)` (built by an `O(T)` scatter) against `Val_s[k]` (length
+//!   `K_total`). The round message is `Σ_s γ^s · F_s · Val_s` (degree 2). Its `s(0)+s(1)` telescopes
+//!   to `Σ_s γ^s · Σ_k F_s[k]·Val_s[k] = Σ_s γ^s · rv_s` — the input claim.
+//! - **Hand-off** (after the last address bit): `r_addr` splits into the `D` chunk points `r_k_i`;
+//!   materialize the sparse `ra_i(r_k_i, j) = eq(r_k_i, idx_i[j])` columns (length `T`) and capture
+//!   `Val_s(r_addr)` scalars. The address-phase final claim equals the cycle-phase initial claim
+//!   (`Σ_s γ^s·Val_s(r_addr)·Σ_j ra(r_addr,j)·eq_s(j)`), so the framework's running-claim tracking
+//!   carries the hand-off with no special seam.
+//! - **Cycle phase** (`rounds ≥ log_K`): bind the `D` `ra_i` columns + the per-stage `eq_s` (length
+//!   `T`); the message is `(∏_i ra_i)·Σ_s γ^s·eq_s·Val_s(r_addr)` (degree `D + 1`).
 //!
-//! **Degree = `D + 1`.** In a cycle round the product `∏_i ra_i · eq` has degree `D + 1` (all `D`
-//! `ra_i` plus `eq` are non-constant in the bound cycle bit; `val` is address-only). In an address
-//! round only one `ra_i` and `val` are non-constant (degree 2). Declaring the uniform bound `D + 1`
-//! over-states the address rounds (their round poly's high coefficients are zero, written padded by
-//! [`crate::framework::sumcheck::write_round_poly`]). `NE = D + 2` evaluation points interpolate the
-//! degree-`(D+1)` round poly exactly.
+//! `NE = D + 2` evaluation points interpolate the degree-`(D+1)` cycle message; the degree-2 address
+//! message uses the same `NE` points (its high coefficients are zero, written padded). The per-chunk
+//! `ra_i(r_k_i, r_cycle)` openings cached by [`SumcheckInstance::cache_openings`] are the §4.5.2
+//! inputs the M7 pushforward (P7) consumes — unchanged by this sparse rewrite.
 //!
-//! The per-chunk `ra_i` leaf openings `ra_i(r_addr_chunk_i, r_cycle)` are cached under
-//! `(ra_family(i), sumcheck_id)` — these are exactly the §4.5.2 inputs the M7 LogUp\*-GKR pushforward
-//! consumes. The read-raf sumcheck itself is unchanged by M7; only how the `ra_i` leaves are
-//! committed/opened changes (one-hot → `ra_dense` + pushforward-GKR). See the
-//! `m7-logupstar-readraf-relationship` design note.
-//!
-//! **Decoupled from the trace** (the M5 convention): takes the materialized one-hot chunk columns
-//! (broadcast to the full hypercube for uniform single-phase binding) + the public per-stage
-//! `(eq cycle point, Val address column)`. Deferred: jolt-core's prefix/suffix + two-phase
-//! address-then-cycle materialization, the Gruen split-eq, the entry-point constraint, the
-//! flag/lookup-table-specific `Val_s` construction (incl. multi-table selection and the wide-limb
-//! range-check stages that fold in here per design §4.2), and the `D`-chunk one-hot *commitment*.
+//! **Decoupled from the trace** (the M5 convention): takes the dense `u32` chunk-index columns
+//! (`idx_i[j] < 2^{log_K_i}`, the `CommittedWitness.ra_dense` form) + the public per-stage
+//! `(r_cycle_s, Val_s)` columns. Deferred: jolt-core's prefix/suffix `Val_s` materialization (so the
+//! dense `Val_s`/`F_s` length-`K_total` tables only suit small `K_total`, i.e. bytecode), the Gruen
+//! split-eq cycle-phase optimization (we use plain length-`T` `eq_s`), the entry-point constraint,
+//! and the flag/lookup-table-specific `Val_s` construction.
 
 use crate::framework::transcript::{Challenge, ProverFs, VerifierFs};
-use jolt_field::{Field, FieldAccumulator};
+use jolt_field::Field;
 use jolt_poly::{BindingOrder, EqPolynomial, UnivariatePoly};
 use jolt_sumcheck::SumcheckClaim;
 
@@ -56,8 +57,8 @@ use crate::framework::poly::MultilinearPolynomial;
 use crate::framework::sumcheck::{prove, verify, SumcheckInstance};
 
 /// One batched stage: a per-stage cycle-eq point `r_cycle`, the public address-only value column
-/// `val_addr` (length `K = ∏_i 2^{log_K_i}`), and the accumulator key of the upstream read claim
-/// `rv_s`.
+/// `val_addr` (length `K_total = ∏_i 2^{log_K_i}`, indexed by the chunk-combined address), and the
+/// accumulator key of the upstream read claim `rv_s`.
 #[derive(Clone, Debug)]
 pub struct ReadRafStage<F: Field> {
     pub r_cycle: Vec<F>,
@@ -66,8 +67,7 @@ pub struct ReadRafStage<F: Field> {
 }
 
 /// Batching/opening parameters, parameterized by the chunk count `D`, the committed RA family, and
-/// the sumcheck id so the bytecode (`D = 2`) and instruction-lookups (`D = 5`) ports share one
-/// implementation.
+/// the sumcheck id so the bytecode and instruction-lookups ports share one implementation.
 #[derive(Clone, Debug)]
 pub struct OneHotReadRafParams<F: Field, const D: usize> {
     /// `[γ^0, …, γ^{S-1}]` for `S` stages.
@@ -126,7 +126,7 @@ impl<F: Field, const D: usize> OneHotReadRafParams<F, D> {
     }
 }
 
-/// Mixed-radix suffix products `[∏_{l>0} K_l, …, ∏_{l>D-2} K_l, 1]` for decomposing a flat address
+/// Mixed-radix suffix products `[∏_{l>0} K_l, …, ∏_{l>D-2} K_l, 1]` for the flat address
 /// `addr = Σ_i k_i · suffix[i]` (chunk 0 most significant): `k_i = (addr / suffix[i]) % K_i`.
 #[inline]
 fn suffix_products<const D: usize>(k_dims: &[usize; D]) -> [usize; D] {
@@ -137,80 +137,122 @@ fn suffix_products<const D: usize>(k_dims: &[usize; D]) -> [usize; D] {
     suffix
 }
 
-/// Prover/verifier instance. The prover holds the broadcast chunk + stage columns; the verifier
-/// keeps the per-stage `r_cycle`/`val_addr` (public, in `params`) to recompute `eq_s(ρ)`/`Val_s(ρ)`.
+/// Prover/verifier instance for the address-first two-phase read-raf sumcheck.
 ///
-/// `NE = D + 2` is the number of round-polynomial evaluation points (interpolating the degree-`(D+1)`
-/// round message); threaded as a separate const because stable Rust cannot compute it in a turbofish.
+/// `NE = D + 2` is the round-polynomial evaluation-point count (interpolating the degree-`(D+1)`
+/// cycle message); threaded as a separate const because stable Rust cannot compute it in a turbofish.
 pub struct OneHotReadRaf<F: Field, const D: usize, const NE: usize> {
     pub params: OneHotReadRafParams<F, D>,
-    ra: [MultilinearPolynomial<F>; D],
-    eq_full: Vec<MultilinearPolynomial<F>>,
-    val_full: Vec<MultilinearPolynomial<F>>,
+    /// Raw chunk-index columns `idx_i[j] < 2^{log_K_i}` (length `T`), kept for the hand-off `ra_i` lift.
+    indices: [Vec<u32>; D],
+    /// Address phase: per-stage marginal `F_s[k]` (length `K_total`), bound `LowToHigh`.
+    f: Vec<MultilinearPolynomial<F>>,
+    /// Address phase: per-stage `Val_s[k]` (length `K_total`), bound `LowToHigh`.
+    val: Vec<MultilinearPolynomial<F>>,
+    /// Cycle phase: per-chunk `ra_i(r_k_i, ·)` (length `T`), materialized at the hand-off.
+    ra: Vec<MultilinearPolynomial<F>>,
+    /// Cycle phase: per-stage `eq_s(·)` (length `T`), materialized at the hand-off.
+    eq: Vec<MultilinearPolynomial<F>>,
+    /// Cycle phase: per-stage `Val_s(r_addr)` scalars, captured at the hand-off.
+    bound_val: Vec<F>,
+    /// Address challenges accumulated `LowToHigh` (reversed to MSB-first `r_addr` at the hand-off).
+    addr_challenges: Vec<F>,
 }
 
 impl<F: Field, const D: usize, const NE: usize> OneHotReadRaf<F, D, NE> {
-    /// `ra_chunks[i]` is the one-hot column over `(chunk_i ∈ [0,2^{log_K_i}), cycle)` (length
-    /// `2^{log_K_i}·T`). Broadcast to the full `K·T` hypercube via the mixed-radix index
-    /// `(…((k_0·K_1 + k_1)·K_2 + k_2)…)·T + j` (chunk 0 most significant).
-    pub fn new_prover(params: OneHotReadRafParams<F, D>, ra_chunks: [Vec<F>; D]) -> Self {
+    /// `indices[i]` is chunk `i`'s dense index column (`idx_i[j] < 2^{log_K_i}`, length `T`). Builds
+    /// the per-stage address marginals `F_s` (`O(T)` scatter) + `Val_s` tables; the sparse `ra_i` are
+    /// materialized at the address→cycle hand-off.
+    pub fn new_prover(params: OneHotReadRafParams<F, D>, indices: [Vec<u32>; D]) -> Self {
         debug_assert_eq!(NE, D + 2, "NE must equal D + 2");
-        // The dense `K·T` broadcast indexes a `usize` hypercube; guard the total width so an
-        // over-wide `log_k_chunks` aborts loudly here instead of silently wrapping `k_total`/`n`
-        // (which would corrupt the broadcast). The dense path is only feasible for small `K·T`
-        // anyway — lifting this bound is the sparse prefix/suffix rewrite (Fork 4).
-        let total_bits: usize = params.log_k_chunks.iter().sum::<usize>() + params.log_t;
+        let log_k = params.log_k();
         assert!(
-            total_bits < usize::BITS as usize,
-            "read-raf dense K·T broadcast needs total address+cycle width < {} bits, got {total_bits}",
-            usize::BITS
+            log_k < usize::BITS as usize,
+            "read-raf address width {log_k} must fit in usize for the F_s/Val_s tables"
         );
         let t = 1usize << params.log_t;
         let k_dims: [usize; D] = std::array::from_fn(|i| 1usize << params.log_k_chunks[i]);
         let k_total: usize = k_dims.iter().product();
-        let n = k_total * t;
         let suffix = suffix_products(&k_dims);
 
-        let ra: [MultilinearPolynomial<F>; D] = std::array::from_fn(|i| {
-            let col: Vec<F> = (0..n)
-                .map(|idx| {
-                    let j = idx % t;
-                    let addr = idx / t;
-                    let k_i = (addr / suffix[i]) % k_dims[i];
-                    ra_chunks[i][k_i * t + j]
-                })
-                .collect();
-            MultilinearPolynomial::from(col)
-        });
+        // The single address read at each cycle: combined(idx[j]) = Σ_i idx_i[j] · suffix[i].
+        let combined: Vec<usize> = (0..t)
+            .map(|j| {
+                indices
+                    .iter()
+                    .zip(suffix.iter())
+                    .fold(0usize, |acc, (idx, &s)| acc + (idx[j] as usize) * s)
+            })
+            .collect();
 
-        let mut eq_full = Vec::with_capacity(params.stages.len());
-        let mut val_full = Vec::with_capacity(params.stages.len());
+        let mut f = Vec::with_capacity(params.stages.len());
+        let mut val = Vec::with_capacity(params.stages.len());
         for stage in &params.stages {
             let eq_cycle = EqPolynomial::<F>::evals(&stage.r_cycle, None);
-            let eqf: Vec<F> = (0..n).map(|idx| eq_cycle[idx % t]).collect();
-            let valf: Vec<F> = (0..n).map(|idx| stage.val_addr[idx / t]).collect();
-            eq_full.push(MultilinearPolynomial::from(eqf));
-            val_full.push(MultilinearPolynomial::from(valf));
+            let mut fs = vec![F::zero(); k_total];
+            for (j, &k) in combined.iter().enumerate() {
+                fs[k] += eq_cycle[j];
+            }
+            f.push(MultilinearPolynomial::from(fs));
+            val.push(MultilinearPolynomial::from(stage.val_addr.clone()));
         }
 
         Self {
             params,
-            ra,
-            eq_full,
-            val_full,
+            indices,
+            f,
+            val,
+            ra: Vec::new(),
+            eq: Vec::new(),
+            bound_val: Vec::new(),
+            addr_challenges: Vec::new(),
         }
     }
 
     pub fn new_verifier(params: OneHotReadRafParams<F, D>) -> Self {
         debug_assert_eq!(NE, D + 2, "NE must equal D + 2");
-        let ra: [MultilinearPolynomial<F>; D] =
-            std::array::from_fn(|_| MultilinearPolynomial::from(vec![F::zero()]));
         Self {
             params,
-            ra,
-            eq_full: vec![],
-            val_full: vec![],
+            indices: std::array::from_fn(|_| Vec::new()),
+            f: Vec::new(),
+            val: Vec::new(),
+            ra: Vec::new(),
+            eq: Vec::new(),
+            bound_val: Vec::new(),
+            addr_challenges: Vec::new(),
         }
+    }
+
+    /// Address→cycle hand-off: split `r_addr` into the `D` chunk points, lift the sparse
+    /// `ra_i(r_k_i, ·)` cycle columns, build the per-stage `eq_s(·)` columns, and capture the bound
+    /// `Val_s(r_addr)` scalars. Called once after the final address bit is bound.
+    fn materialize_cycle_phase(&mut self) {
+        let t = 1usize << self.params.log_t;
+        // r_addr MSB-first (the address challenges were accumulated LowToHigh = LSB-first).
+        let mut r_addr = self.addr_challenges.clone();
+        r_addr.reverse();
+
+        let mut offset = 0;
+        self.ra = Vec::with_capacity(D);
+        for i in 0..D {
+            let w = self.params.log_k_chunks[i];
+            let eq_addr = EqPolynomial::<F>::evals(&r_addr[offset..offset + w], None);
+            offset += w;
+            let col: Vec<F> = (0..t)
+                .map(|j| eq_addr[self.indices[i][j] as usize])
+                .collect();
+            self.ra.push(MultilinearPolynomial::from(col));
+        }
+
+        self.eq = self
+            .params
+            .stages
+            .iter()
+            .map(|stage| {
+                MultilinearPolynomial::from(EqPolynomial::<F>::evals(&stage.r_cycle, None))
+            })
+            .collect();
+        self.bound_val = self.val.iter().map(|v| v.final_sumcheck_claim()).collect();
     }
 }
 
@@ -227,46 +269,67 @@ impl<F: Field, const D: usize, const NE: usize> SumcheckInstance<F> for OneHotRe
         self.params.input_claim(accumulator)
     }
 
-    fn compute_message(&mut self, _round: usize, _previous_claim: F) -> UnivariatePoly<F> {
-        // Degree-(D+1): (∏_i ra_i)·(Σ_s γ^s·eq_s·Val_s) ⇒ NE = D+2 evaluation points (0..=D+1).
-        let half = self.ra[0].len() / 2;
-        let mut acc = [<F as Field>::Accumulator::default(); NE];
-        for idx in 0..half {
-            let mut ra_prod = [F::one(); NE];
-            for chunk in &self.ra {
-                let evals = chunk.sumcheck_evals_array::<NE>(idx, BindingOrder::LowToHigh);
-                for (acc_p, &e) in ra_prod.iter_mut().zip(evals.iter()) {
-                    *acc_p *= e;
+    fn compute_message(&mut self, round: usize, _previous_claim: F) -> UnivariatePoly<F> {
+        let mut acc = [F::zero(); NE];
+        if round < self.params.log_k() {
+            // Address phase: Σ_s γ^s · F_s · Val_s (degree 2, padded to NE points).
+            let half = self.f[0].len() / 2;
+            for i in 0..half {
+                for (s, &g) in self.params.gamma_powers.iter().enumerate() {
+                    let fe = self.f[s].sumcheck_evals_array::<NE>(i, BindingOrder::LowToHigh);
+                    let ve = self.val[s].sumcheck_evals_array::<NE>(i, BindingOrder::LowToHigh);
+                    for (a, (&fp, &vp)) in acc.iter_mut().zip(fe.iter().zip(ve.iter())) {
+                        *a += g * fp * vp;
+                    }
                 }
             }
-            let mut stage_sum = [F::zero(); NE];
-            for (s, &g) in self.params.gamma_powers.iter().enumerate() {
-                let eq = self.eq_full[s].sumcheck_evals_array::<NE>(idx, BindingOrder::LowToHigh);
-                let val = self.val_full[s].sumcheck_evals_array::<NE>(idx, BindingOrder::LowToHigh);
-                for (slot, (&e, &v)) in stage_sum.iter_mut().zip(eq.iter().zip(val.iter())) {
-                    *slot += g * e * v;
+        } else {
+            // Cycle phase: (∏_i ra_i) · Σ_s γ^s · eq_s · Val_s(r_addr) (degree D+1).
+            let half = self.ra[0].len() / 2;
+            for i in 0..half {
+                let mut ra_prod = [F::one(); NE];
+                for chunk in &self.ra {
+                    let e = chunk.sumcheck_evals_array::<NE>(i, BindingOrder::LowToHigh);
+                    for (a, &ep) in ra_prod.iter_mut().zip(e.iter()) {
+                        *a *= ep;
+                    }
                 }
-            }
-            for (acc_p, (&rp, &ss)) in acc.iter_mut().zip(ra_prod.iter().zip(stage_sum.iter())) {
-                acc_p.fmadd(rp, ss);
+                let mut stage_sum = [F::zero(); NE];
+                for (s, &g) in self.params.gamma_powers.iter().enumerate() {
+                    let e = self.eq[s].sumcheck_evals_array::<NE>(i, BindingOrder::LowToHigh);
+                    let gv = g * self.bound_val[s];
+                    for (a, &ep) in stage_sum.iter_mut().zip(e.iter()) {
+                        *a += gv * ep;
+                    }
+                }
+                for (a, (&rp, &ss)) in acc.iter_mut().zip(ra_prod.iter().zip(stage_sum.iter())) {
+                    *a += rp * ss;
+                }
             }
         }
-        let evals: [F; NE] = std::array::from_fn(|p| acc[p].reduce());
-        UnivariatePoly::from_evals(&evals)
+        UnivariatePoly::from_evals(&acc)
     }
 
-    fn bind(&mut self, r: F, _round: usize) {
-        for chunk in &mut self.ra {
-            chunk.bind_parallel(r, BindingOrder::LowToHigh);
-        }
-        for poly in self.eq_full.iter_mut().chain(self.val_full.iter_mut()) {
-            poly.bind_parallel(r, BindingOrder::LowToHigh);
+    fn bind(&mut self, r: F, round: usize) {
+        if round < self.params.log_k() {
+            for poly in self.f.iter_mut().chain(self.val.iter_mut()) {
+                poly.bind_parallel(r, BindingOrder::LowToHigh);
+            }
+            self.addr_challenges.push(r);
+            if round == self.params.log_k() - 1 {
+                self.materialize_cycle_phase();
+            }
+        } else {
+            for poly in self.ra.iter_mut().chain(self.eq.iter_mut()) {
+                poly.bind_parallel(r, BindingOrder::LowToHigh);
+            }
         }
     }
 
     fn cache_openings(&self, accumulator: &mut Openings<F>, challenges: &[F]) {
+        // Address bound first ⇒ BIG_ENDIAN point is [r_cycle ‖ r_addr]; split at log_t.
         let point = self.normalize_opening_point(challenges);
-        let (r_addr, r_cycle) = point.split_at(self.params.log_k());
+        let (r_cycle, r_addr) = point.split_at(self.params.log_t);
         let mut offset = 0;
         for i in 0..D {
             let w = self.params.log_k_chunks[i];
@@ -288,7 +351,7 @@ impl<F: Field, const D: usize, const NE: usize> SumcheckInstance<F> for OneHotRe
         challenges: &[F],
     ) -> F {
         let point = self.normalize_opening_point(challenges);
-        let (r_addr, r_cycle) = point.split_at(self.params.log_k());
+        let (r_cycle, r_addr) = point.split_at(self.params.log_t);
 
         let mut ra_prod = F::one();
         for i in 0..D {
@@ -350,15 +413,14 @@ pub struct ReadRafInputs<F: Field, const D: usize> {
 
 /// Prove one family's read-raf as a composable stage on the shared transcript + accumulator
 /// (analogous to [`prove_registers`](crate::zkvm::registers::stage::prove_registers)): build the
-/// [`OneHotReadRaf`] instance from the materialized one-hot chunk columns, run it, and extract the
-/// `D` cached `ra_i` openings into the proof. `ra_chunks[i]` is the one-hot lift of chunk `i`'s
-/// dense column (see [`one_hot_ra_column`](crate::zkvm::witness::one_hot_ra_column)).
+/// [`OneHotReadRaf`] instance from the dense `u32` chunk-index columns, run it, and extract the `D`
+/// cached `ra_i` openings into the proof.
 ///
 /// The per-stage `(r_cycle, val_addr, rv_key)` and the upstream `rv_s` claims are supplied via
 /// `inputs.stages` + the seeded `accumulator` (in the e2e they come from Spartan / the claim
 /// reductions).
 pub fn prove_read_raf<F, T, const D: usize, const NE: usize>(
-    ra_chunks: [Vec<F>; D],
+    indices: [Vec<u32>; D],
     inputs: ReadRafInputs<F, D>,
     accumulator: &mut Openings<F>,
     transcript: &mut T,
@@ -375,7 +437,7 @@ where
         inputs.stages,
         transcript,
     );
-    let mut instance = OneHotReadRaf::<F, D, NE>::new_prover(params, ra_chunks);
+    let mut instance = OneHotReadRaf::<F, D, NE>::new_prover(params, indices);
     let _ = prove(&mut instance, accumulator, transcript);
     let ra_family = instance.params.ra_family;
     let sumcheck_id = instance.params.sumcheck_id;
@@ -424,8 +486,9 @@ where
     };
     let eval = verify(&claim, transcript).map_err(|_| ReadRafStageError::Sumcheck)?;
 
+    // Address bound first ⇒ BIG_ENDIAN point is [r_cycle ‖ r_addr]; split at log_t.
     let point = instance.normalize_opening_point(&eval.point);
-    let (r_addr, r_cycle) = point.split_at(log_k);
+    let (r_cycle, r_addr) = point.split_at(log_t);
     let mut offset = 0;
     for (i, &c) in proof.ra_openings.iter().enumerate() {
         let w = log_k_chunks[i];
@@ -508,20 +571,17 @@ mod tests {
         }
     }
 
-    /// `addr = Σ_i k_i · suffix[i]` reconstruction of the mixed-radix index used by `new_prover`.
-    fn chunk_index<const D: usize>(
-        addr: usize,
-        i: usize,
-        suffix: &[usize; D],
-        k_dims: &[usize; D],
-    ) -> usize {
-        (addr / suffix[i]) % k_dims[i]
+    /// `addr = Σ_i k_i · suffix[i]` mixed-radix combine (chunk 0 most significant).
+    fn combine<const D: usize>(idx: &[Vec<u32>; D], j: usize, suffix: &[usize; D]) -> usize {
+        idx.iter()
+            .zip(suffix.iter())
+            .fold(0usize, |acc, (col, &s)| acc + (col[j] as usize) * s)
     }
 
-    /// Generic round-trip over `D` chunks (`NE = D + 2`). Builds random one-hot chunk columns +
-    /// per-stage `(r_cycle, val_addr)`, seeds the `rv_s` accumulator from the explicit hypercube sum,
-    /// proves the read-raf sumcheck, and checks the reduced claim closes against
-    /// `(∏_i ra_i)·Σ_s γ^s·eq_s·Val_s`.
+    /// Generic round-trip over `D` one-hot chunks (`NE = D + 2`): random per-chunk index columns →
+    /// the genuine read sum `rv_s = Σ_j eq_s(j)·Val(combined(j))` → prove the sparse address-first
+    /// read-raf → check the reduced claim closes against `(∏_i ra_i)·Σ_s γ^s·eq_s·Val_s`, and the
+    /// cached `ra_i` openings equal the genuine one-hot MLE evals.
     fn round_trip<const D: usize, const NE: usize>(
         cfg: &Config,
         seed: u64,
@@ -531,13 +591,17 @@ mod tests {
     ) {
         let mut rng = Rng(seed);
         let k_dims: [usize; D] = std::array::from_fn(|i| 1usize << log_k_chunks[i]);
-        let suffix = super::suffix_products(&k_dims);
+        let suffix = suffix_products(&k_dims);
         let k_total: usize = k_dims.iter().product();
         let t = 1usize << log_t;
 
-        let ra_chunks: [Vec<F>; D] = std::array::from_fn(|i| rand_vec(&mut rng, k_dims[i] * t));
+        let indices: [Vec<u32>; D] = std::array::from_fn(|i| {
+            (0..t)
+                .map(|_| (rng.next() as u32) % (k_dims[i] as u32))
+                .collect()
+        });
+        let combined: Vec<usize> = (0..t).map(|j| combine(&indices, j, &suffix)).collect();
 
-        // Shared cycle point (instruction) or distinct per stage (bytecode).
         let shared_r = rand_vec(&mut rng, log_t);
         let stages: Vec<ReadRafStage<F>> = (0..num_stages)
             .map(|s| ReadRafStage {
@@ -553,18 +617,10 @@ mod tests {
 
         let seed_acc = |acc: &mut Openings<F>| {
             for stage in &stages {
-                let eq_cycle = EqPolynomial::<F>::evals(&stage.r_cycle, None);
-                let mut rv = F::from_u64(0);
-                for addr in 0..k_total {
-                    for j in 0..t {
-                        let mut ra = F::from_u64(1);
-                        for (i, chunk) in ra_chunks.iter().enumerate() {
-                            let k_i = chunk_index(addr, i, &suffix, &k_dims);
-                            ra *= chunk[k_i * t + j];
-                        }
-                        rv += ra * eq_cycle[j] * stage.val_addr[addr];
-                    }
-                }
+                let eq = EqPolynomial::<F>::evals(&stage.r_cycle, None);
+                let rv = (0..t).fold(F::from_u64(0), |a, j| {
+                    a + eq[j] * stage.val_addr[combined[j]]
+                });
                 acc.append_virtual(
                     stage.rv_key.0,
                     stage.rv_key.1,
@@ -587,9 +643,8 @@ mod tests {
             stages.clone(),
             &mut prover_t,
         );
-        let degree = D + 1;
         let input_claim = params.input_claim(&prover_acc);
-        let mut prover = OneHotReadRaf::<F, D, NE>::new_prover(params, ra_chunks.clone());
+        let mut prover = OneHotReadRaf::<F, D, NE>::new_prover(params, indices.clone());
         let challenges = prove(&mut prover, &mut prover_acc, &mut prover_t);
         let narg = prover_t.into_proof();
 
@@ -607,7 +662,7 @@ mod tests {
         let verifier = OneHotReadRaf::<F, D, NE>::new_verifier(vparams);
         let claim = SumcheckClaim {
             num_vars: log_k + log_t,
-            degree,
+            degree: D + 1,
             claimed_sum: input_claim,
         };
         let EvaluationClaim { point, value } =
@@ -627,11 +682,24 @@ mod tests {
             value, expected,
             "reduced claim must match (∏_i ra_i)·Σ γ^s·eq_s·Val_s"
         );
+
+        // The cached ra_i openings equal the genuine one-hot MLE ra_i(r_k_i, r_cycle).
+        for i in 0..D {
+            let (pt, claim) =
+                prover_acc.get_committed_polynomial_opening((cfg.family)(i), cfg.sumcheck_id);
+            // pt = [r_k_i ‖ r_cycle]; evaluate the genuine one-hot column at it.
+            let one_hot = one_hot_ra_column::<F>(&indices[i], log_k_chunks[i]);
+            let eq_pt = EqPolynomial::<F>::evals(&pt.r, None);
+            let genuine = one_hot
+                .iter()
+                .zip(eq_pt.iter())
+                .fold(F::from_u64(0), |a, (v, e)| a + *v * *e);
+            assert_eq!(claim, genuine, "cached ra_{i} == genuine one-hot MLE eval");
+        }
     }
 
     #[test]
     fn bytecode_read_raf_round_trip() {
-        // Bytecode: D = 2 (NE = 4).
         let cfg = bytecode_config();
         round_trip::<2, 4>(&cfg, 0xB100, [1, 1], 2, 3);
         round_trip::<2, 4>(&cfg, 0xB101, [2, 2], 3, 3);
@@ -640,32 +708,20 @@ mod tests {
     }
 
     #[test]
-    fn instruction_read_raf_round_trip_d2() {
-        // Instruction-lookups exercised at D = 2 (NE = 4).
-        let cfg = instruction_config();
-        round_trip::<2, 4>(&cfg, 0x1100, [1, 1], 2, 3);
-        round_trip::<2, 4>(&cfg, 0x1101, [2, 2], 3, 3);
-        round_trip::<2, 4>(&cfg, 0x1102, [2, 2], 4, 2);
-        round_trip::<2, 4>(&cfg, 0x1103, [1, 2], 3, 1);
-    }
-
-    #[test]
-    fn instruction_read_raf_round_trip_d5() {
-        // Instruction-lookups at the production D = 5 (NE = 7): 5 one-bit chunks (K = 32) over a
-        // shared cycle eq, 3 batched stages.
-        let cfg = instruction_config();
-        round_trip::<5, 7>(&cfg, 0x1500, [1, 1, 1, 1, 1], 3, 3);
-        round_trip::<5, 7>(&cfg, 0x1501, [2, 1, 1, 2, 1], 2, 2);
-        round_trip::<5, 7>(&cfg, 0x1502, [1, 2, 1, 1, 1], 4, 1);
-    }
-
-    /// A third chunk count (`D = 3`, `NE = 5`) to guard the const-generic broadcast/cache split at a
-    /// value neither caller uses.
-    #[test]
-    fn bytecode_read_raf_round_trip_d3() {
+    fn bytecode_read_raf_round_trip_d3_d4() {
         let cfg = bytecode_config();
         round_trip::<3, 5>(&cfg, 0xB300, [1, 2, 1], 3, 2);
         round_trip::<3, 5>(&cfg, 0xB301, [2, 1, 2], 2, 3);
+        round_trip::<4, 6>(&cfg, 0xB400, [1, 1, 2, 1], 3, 2);
+    }
+
+    #[test]
+    fn instruction_read_raf_round_trip() {
+        let cfg = instruction_config();
+        round_trip::<2, 4>(&cfg, 0x1100, [1, 1], 2, 3);
+        round_trip::<2, 4>(&cfg, 0x1101, [2, 2], 3, 3);
+        round_trip::<5, 7>(&cfg, 0x1500, [1, 1, 1, 1, 1], 3, 3);
+        round_trip::<5, 7>(&cfg, 0x1501, [2, 1, 1, 2, 1], 2, 2);
     }
 
     #[test]
@@ -677,10 +733,15 @@ mod tests {
         let log_t = 3usize;
         let mut rng = Rng(0x11FE);
         let k_dims: [usize; D] = std::array::from_fn(|i| 1usize << log_k_chunks[i]);
-        let suffix = super::suffix_products(&k_dims);
+        let suffix = suffix_products(&k_dims);
         let k_total: usize = k_dims.iter().product();
         let t = 1usize << log_t;
-        let ra_chunks: [Vec<F>; D] = std::array::from_fn(|i| rand_vec(&mut rng, k_dims[i] * t));
+        let indices: [Vec<u32>; D] = std::array::from_fn(|i| {
+            (0..t)
+                .map(|_| (rng.next() as u32) % (k_dims[i] as u32))
+                .collect()
+        });
+        let combined: Vec<usize> = (0..t).map(|j| combine(&indices, j, &suffix)).collect();
         let r = rand_vec(&mut rng, log_t);
         let stages: Vec<ReadRafStage<F>> = (0..2)
             .map(|s| ReadRafStage {
@@ -691,18 +752,10 @@ mod tests {
             .collect();
         let mut acc = Openings::<F>::new(log_t);
         for stage in &stages {
-            let eq_cycle = EqPolynomial::<F>::evals(&stage.r_cycle, None);
-            let mut rv = F::from_u64(0);
-            for addr in 0..k_total {
-                for j in 0..t {
-                    let mut ra = F::from_u64(1);
-                    for (i, chunk) in ra_chunks.iter().enumerate() {
-                        let k_i = chunk_index(addr, i, &suffix, &k_dims);
-                        ra *= chunk[k_i * t + j];
-                    }
-                    rv += ra * eq_cycle[j] * stage.val_addr[addr];
-                }
-            }
+            let eq = EqPolynomial::<F>::evals(&stage.r_cycle, None);
+            let rv = (0..t).fold(F::from_u64(0), |a, j| {
+                a + eq[j] * stage.val_addr[combined[j]]
+            });
             acc.append_virtual(
                 stage.rv_key.0,
                 stage.rv_key.1,
@@ -720,7 +773,7 @@ mod tests {
             &mut prover_t,
         );
         let input_claim = params.input_claim(&acc);
-        let mut prover = OneHotReadRaf::<F, D, NE>::new_prover(params, ra_chunks);
+        let mut prover = OneHotReadRaf::<F, D, NE>::new_prover(params, indices);
         let _ = prove(&mut prover, &mut acc, &mut prover_t);
         let mut narg = prover_t.into_proof();
 
@@ -746,9 +799,8 @@ mod tests {
         );
     }
 
-    /// Drive the read-raf STAGE end-to-end: genuine per-chunk index columns → one-hot lift
-    /// ([`one_hot_ra_column`]) → seed the genuine read sum `rv_s = Σ_j eq_s(j)·Val(combined(j))` →
-    /// [`prove_read_raf`]/[`verify_read_raf`]. With `tamper`, corrupting a proof-carried `ra_i`
+    /// Drive the read-raf STAGE end-to-end: genuine per-chunk index columns → seed the genuine read
+    /// sum → [`prove_read_raf`]/[`verify_read_raf`]. With `tamper`, corrupting a proof-carried `ra_i`
     /// opening must trip the output-claim check.
     fn stage_round_trip<const D: usize, const NE: usize>(
         cfg: &Config,
@@ -760,7 +812,7 @@ mod tests {
     ) {
         let mut rng = Rng(seed);
         let k_dims: [usize; D] = std::array::from_fn(|i| 1usize << log_k_chunks[i]);
-        let suffix = super::suffix_products(&k_dims);
+        let suffix = suffix_products(&k_dims);
         let k_total: usize = k_dims.iter().product();
         let t = 1usize << log_t;
 
@@ -769,8 +821,7 @@ mod tests {
                 .map(|_| (rng.next() as u32) % (k_dims[i] as u32))
                 .collect()
         });
-        let ra_chunks: [Vec<F>; D] =
-            std::array::from_fn(|i| one_hot_ra_column::<F>(&indices[i], log_k_chunks[i]));
+        let combined: Vec<usize> = (0..t).map(|j| combine(&indices, j, &suffix)).collect();
 
         let shared_r = rand_vec(&mut rng, log_t);
         let stages: Vec<ReadRafStage<F>> = (0..num_stages)
@@ -785,15 +836,6 @@ mod tests {
             })
             .collect();
 
-        // Genuine one-hot read: cycle j reads the single address combined(j) = Σ_i idx_i[j]·suffix[i].
-        let combined: Vec<usize> = (0..t)
-            .map(|j| {
-                indices
-                    .iter()
-                    .zip(suffix.iter())
-                    .fold(0usize, |a, (idx, &s)| a + (idx[j] as usize) * s)
-            })
-            .collect();
         let seed_acc = |acc: &mut Openings<F>| {
             for stage in &stages {
                 let eq = EqPolynomial::<F>::evals(&stage.r_cycle, None);
@@ -820,8 +862,12 @@ mod tests {
         let mut prover_acc = Openings::<F>::new(log_t);
         seed_acc(&mut prover_acc);
         let mut prover_t = ProverTranscript::new("read-raf-stage");
-        let mut proof =
-            prove_read_raf::<F, _, D, NE>(ra_chunks, inputs(), &mut prover_acc, &mut prover_t);
+        let mut proof = prove_read_raf::<F, _, D, NE>(
+            indices.clone(),
+            inputs(),
+            &mut prover_acc,
+            &mut prover_t,
+        );
         assert_eq!(proof.ra_openings.len(), D, "one cached opening per chunk");
         let narg = prover_t.into_proof();
         if tamper {
@@ -837,7 +883,6 @@ mod tests {
             assert!(result.is_err(), "tampered ra_i opening must be rejected");
         } else {
             result.expect("read-raf stage must verify");
-            // The prover + verifier cache the same ra_i openings (= the M7 §4.5.2 inputs).
             for i in 0..D {
                 let (pp, pc) =
                     prover_acc.get_committed_polynomial_opening((cfg.family)(i), cfg.sumcheck_id);
@@ -852,9 +897,8 @@ mod tests {
     #[test]
     fn read_raf_stage_round_trip() {
         stage_round_trip::<2, 4>(&bytecode_config(), 0xB5A1, [2, 2], 4, 3, false);
-        stage_round_trip::<2, 4>(&bytecode_config(), 0xB5A2, [1, 2], 3, 2, false);
+        stage_round_trip::<3, 5>(&bytecode_config(), 0xB5A2, [1, 2, 1], 3, 2, false);
         stage_round_trip::<5, 7>(&instruction_config(), 0x15A1, [1, 1, 1, 1, 1], 4, 3, false);
-        stage_round_trip::<5, 7>(&instruction_config(), 0x15A2, [2, 1, 1, 2, 1], 3, 2, false);
     }
 
     #[test]

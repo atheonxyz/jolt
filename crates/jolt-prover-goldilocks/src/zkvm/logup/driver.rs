@@ -348,7 +348,6 @@ mod tests {
         prove_read_raf, verify_read_raf, OneHotReadRaf, OneHotReadRafParams, ReadRafInputs,
         ReadRafStage,
     };
-    use crate::zkvm::witness::one_hot_ra_column;
     use jolt_field::goldilocks::GoldilocksFp3 as F;
     use jolt_poly::EqPolynomial;
 
@@ -383,20 +382,9 @@ mod tests {
         let k1 = 1usize << log_k1;
         let t = 1usize << log_t;
 
-        // Index columns (the ra_dense), entries < 2^log_k_i.
+        // Index columns (the ra_dense), entries < 2^log_k_i — the sparse read-raf's direct input.
         let idx0: Vec<u32> = (0..t).map(|_| (rng.next() as u32) % (k0 as u32)).collect();
         let idx1: Vec<u32> = (0..t).map(|_| (rng.next() as u32) % (k1 as u32)).collect();
-
-        // Genuine one-hot read columns over (chunk_i, cycle): ra_i[k·T + j] = [idx_i[j] == k].
-        let one_hot = |idx: &[u32], k_dim: usize| -> Vec<F> {
-            let mut col = vec![F::from_u64(0); k_dim * t];
-            for (j, &k) in idx.iter().enumerate() {
-                col[(k as usize) * t + j] = F::from_u64(1);
-            }
-            col
-        };
-        let ra0 = one_hot(&idx0, k0);
-        let ra1 = one_hot(&idx1, k1);
 
         // Single read-raf stage with a shared cycle point and a random address-value column.
         let r_cycle = rand_vec(&mut rng, log_t);
@@ -434,7 +422,7 @@ mod tests {
             stages,
             &mut rr_t,
         );
-        let mut prover = OneHotReadRaf::<F, 2, 4>::new_prover(params, [ra0, ra1]);
+        let mut prover = OneHotReadRaf::<F, 2, 4>::new_prover(params, [idx0.clone(), idx1.clone()]);
         let _ = sumcheck_prove(&mut prover, &mut rr_acc, &mut rr_t);
 
         // Extract the cached per-chunk ra_i openings (point = (r_k_i, r_cycle), value = M̃^(i)).
@@ -563,16 +551,6 @@ mod tests {
         let idx0: Vec<u32> = (0..t).map(|_| (rng.next() as u32) % (k0 as u32)).collect();
         let idx1: Vec<u32> = (0..t).map(|_| (rng.next() as u32) % (k1 as u32)).collect();
 
-        let one_hot = |idx: &[u32], k_dim: usize| -> Vec<F> {
-            let mut col = vec![F::from_u64(0); k_dim * t];
-            for (j, &k) in idx.iter().enumerate() {
-                col[(k as usize) * t + j] = F::from_u64(1);
-            }
-            col
-        };
-        let ra0 = one_hot(&idx0, k0);
-        let ra1 = one_hot(&idx1, k1);
-
         let r_cycle = rand_vec(&mut rng, log_t);
         let val_addr = rand_vec(&mut rng, k0 * k1);
         let rv_key = (
@@ -603,7 +581,7 @@ mod tests {
             stages,
             &mut rr_t,
         );
-        let mut prover = OneHotReadRaf::<F, 2, 4>::new_prover(params, [ra0, ra1]);
+        let mut prover = OneHotReadRaf::<F, 2, 4>::new_prover(params, [idx0.clone(), idx1.clone()]);
         let _ = sumcheck_prove(&mut prover, &mut rr_acc, &mut rr_t);
 
         let (pt0, c0) = rr_acc.get_committed_polynomial_opening(
@@ -778,15 +756,11 @@ mod tests {
         let k_total: usize = k_dims.iter().product();
         let t = 1usize << log_t;
 
-        let indices: Vec<Vec<u32>> = (0..D)
-            .map(|i| {
-                (0..t)
-                    .map(|_| (rng.next() as u32) % (k_dims[i] as u32))
-                    .collect()
-            })
-            .collect();
-        let ra_chunks: [Vec<F>; D] =
-            std::array::from_fn(|i| one_hot_ra_column::<F>(&indices[i], log_m_chunks[i]));
+        let indices: [Vec<u32>; D] = std::array::from_fn(|i| {
+            (0..t)
+                .map(|_| (rng.next() as u32) % (k_dims[i] as u32))
+                .collect()
+        });
 
         // One read-raf stage; rv = Σ_j eq(j)·Val(combined(j)) for the genuine one-hot read.
         let r_cycle = rand_vec(&mut rng, log_t);
@@ -829,8 +803,12 @@ mod tests {
         let mut prover_acc = Openings::<F>::new(log_t);
         prover_acc.append_virtual(rv_key.0, rv_key.1, OpeningPoint::new(r_cycle.clone()), rv);
         let mut prover_t = ProverTranscript::new("p7");
-        let rr_proof =
-            prove_read_raf::<F, _, D, NE>(ra_chunks, inputs(), &mut prover_acc, &mut prover_t);
+        let rr_proof = prove_read_raf::<F, _, D, NE>(
+            indices.clone(),
+            inputs(),
+            &mut prover_acc,
+            &mut prover_t,
+        );
         let pf_proofs = prove_read_raf_pushforward(&fam, &indices, &mut prover_acc, &mut prover_t)
             .expect("pushforward prove");
         assert_eq!(pf_proofs.len(), D, "one pushforward GKR per chunk");
