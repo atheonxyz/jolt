@@ -16,6 +16,7 @@
 use common::constants::REGISTER_COUNT;
 use jolt_core::host;
 use jolt_core::zkvm::ram::remap_address;
+use jolt_equivalence::core_oracle::core_muldiv_commitment_fixture;
 use jolt_prover_goldilocks::field::{ProverTranscript, VerifierTranscript};
 use jolt_prover_goldilocks::zkvm::driver::{prove_binary, verify_binary};
 use jolt_prover_goldilocks::zkvm::e2e::{
@@ -40,7 +41,9 @@ struct Fixture {
     committed: CommittedWitness<F>,
     bytecode_rows: Vec<Instruction>,
     log_k_chunk: usize,
+    instruction_d: usize,
     bytecode_d: usize,
+    ram_d: usize,
     log_register: usize,
     trace_len: usize,
 }
@@ -122,7 +125,9 @@ fn build_muldiv_fixture() -> Fixture {
         committed,
         bytecode_rows: bytecode.bytecode.clone(),
         log_k_chunk,
+        instruction_d,
         bytecode_d,
+        ram_d,
         log_register: (REGISTER_COUNT as usize).trailing_zeros() as usize,
         trace_len: trace.len(),
     }
@@ -231,4 +236,34 @@ fn goldilocks_real_trace_e2e_with_bytecode_read_raf() {
     let mut verifier_t = VerifierTranscript::new("muldiv-e2e", &narg);
     verify_e2e::<BYTECODE_D, BYTECODE_NE>(&proof, &params, &bc_verifier, &mut verifier_t)
         .expect("verify_e2e must accept the real muldiv proof");
+}
+
+/// M4 — proof-level parity gate: the geometry the Goldilocks e2e proves matches jolt-core's
+/// `JoltProtocolParams` for the same muldiv program. The ISA/bytecode-determined fields (`log_t`,
+/// `log_k_chunk`, `instruction_d`, `bytecode_d`) must agree exactly; RAM diverges because the
+/// Goldilocks memory stage uses a zero-init, max-accessed RAM model (so `ram_d ≤ jolt-core's`), an
+/// interim gap that lands with real RAM initial-state loading. (Witness-integer parity is the
+/// separate `goldilocks_witness_gate`.)
+#[test]
+fn goldilocks_e2e_geometry_matches_core_muldiv() {
+    let core = core_muldiv_commitment_fixture();
+    let p = &core.params;
+    let fx = build_muldiv_fixture();
+
+    assert_eq!(fx.real.r1cs.log_num_cycles, p.log_t, "log_t");
+    assert_eq!(fx.log_k_chunk, p.log_k_chunk, "log_k_chunk");
+    assert_eq!(fx.instruction_d, p.instruction_d, "instruction_d");
+    assert_eq!(fx.bytecode_d, p.bytecode_d, "bytecode_d");
+    assert!(
+        fx.ram_d <= p.ram_d,
+        "Goldilocks zero-init RAM is a subset of jolt-core's (ram_d {} <= {})",
+        fx.ram_d,
+        p.ram_d
+    );
+
+    eprintln!(
+        "[goldilocks-e2e/M4] geometry parity vs jolt-core OK: log_t={}, log_k_chunk={}, \
+         instruction_d={}, bytecode_d={} (ram_d goldilocks={} <= core={})",
+        p.log_t, p.log_k_chunk, p.instruction_d, p.bytecode_d, fx.ram_d, p.ram_d,
+    );
 }
