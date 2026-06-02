@@ -4,14 +4,20 @@
 //! (the parity oracle); see [`crate::zkvm::shout_read_raf`] for the shared identity and the M5
 //! decoupling/deferral notes.
 
-use crate::framework::transcript::Challenge;
+use crate::framework::transcript::{Challenge, ProverFs, VerifierFs};
 use jolt_field::Field;
+use jolt_poly::EqPolynomial;
 use jolt_riscv::{CircuitFlags, InstructionFlags, NUM_CIRCUIT_FLAGS};
 use jolt_trace::{instruction_circuit_flags, instruction_instruction_flags, Instruction};
 
-use crate::framework::accumulator::{CommittedPolynomial, SumcheckId};
+use crate::framework::accumulator::{
+    CommittedPolynomial, OpeningPoint, Openings, SumcheckId, VirtualPolynomial,
+};
 
-pub use crate::zkvm::shout_read_raf::{OneHotReadRaf, OneHotReadRafParams, ReadRafStage};
+pub use crate::zkvm::shout_read_raf::{
+    prove_read_raf, verify_read_raf, OneHotReadRaf, OneHotReadRafParams, ReadRafInputs,
+    ReadRafStage, ReadRafStageError, ReadRafStageProof,
+};
 
 /// Bytecode address decomposition uses `D = 2` chunks (`NE = D + 2 = 4`).
 pub const BYTECODE_D: usize = 2;
@@ -120,6 +126,183 @@ pub fn bytecode_val_polys<F: Field>(
         }
     }
     vals
+}
+
+/// The bytecode read-raf stage proof: the carried interim `rv_s` seeds (one per `Val_s` stage) plus
+/// the underlying read-raf proof. As with the memory stage's `spartan_seeds` (fork 2), the verifier
+/// cannot recompute `rv_s` (it lacks the witness chunk indices), so the prover carries them; the
+/// read-raf sumcheck binds them (a wrong seed fails the round-0 / output-claim check).
+#[derive(Clone, Debug)]
+pub struct BytecodeReadRafProof<F: Field> {
+    pub rv_seeds: [F; N_BYTECODE_STAGES],
+    pub read_raf: ReadRafStageProof<F>,
+}
+
+/// Four DISTINCT interim `rv_key`s for the bytecode `Val_s` stages, each free in the binary driver:
+/// the shift/product-virtualization sumchecks aren't run, and `UnexpandedPC`/`PC` aren't seeded at
+/// `SpartanOuter` (the driver seeds only `Ram*`/`Rd*`/`Rs*`/`Spartan{Az,Bz,Cz}` there). They are
+/// labels for the interim seed slots; the sound binding to real upstream sumchecks is the deferred
+/// uni-skip Spartan (fork 2).
+fn bytecode_rv_keys() -> [(VirtualPolynomial, SumcheckId); N_BYTECODE_STAGES] {
+    [
+        (VirtualPolynomial::UnexpandedPC, SumcheckId::SpartanOuter),
+        (
+            VirtualPolynomial::PC,
+            SumcheckId::SpartanProductVirtualization,
+        ),
+        (VirtualPolynomial::Imm, SumcheckId::SpartanShift),
+        (VirtualPolynomial::PC, SumcheckId::SpartanOuter),
+    ]
+}
+
+/// γ-power vector length per `Val_s` stage (the highest `g[·]` index used in `bytecode_val_polys`).
+fn stage_gamma_lens() -> [usize; N_BYTECODE_STAGES] {
+    [2 + NUM_CIRCUIT_FLAGS, 4, 9, 3]
+}
+
+#[inline]
+fn gamma_powers<F: Field>(g: F, len: usize) -> Vec<F> {
+    let mut v = Vec::with_capacity(len);
+    let mut p = F::from_u64(1);
+    for _ in 0..len {
+        v.push(p);
+        p *= g;
+    }
+    v
+}
+
+/// Per-cycle combined bytecode index `Σ_i idx_i[j]·suffix[i]` (chunk 0 most significant) — equals the
+/// bytecode-row index, so `val_addr[combined[j]] = Val_s(row[j])`.
+fn combined_indices<const D: usize>(
+    indices: &[Vec<u32>; D],
+    log_k_chunks: [usize; D],
+    t: usize,
+) -> Vec<usize> {
+    let k_dims: [usize; D] = std::array::from_fn(|i| 1usize << log_k_chunks[i]);
+    let mut suffix = [0usize; D];
+    let mut acc = 1usize;
+    for i in (0..D).rev() {
+        suffix[i] = acc;
+        acc *= k_dims[i];
+    }
+    (0..t)
+        .map(|j| (0..D).fold(0usize, |a, i| a + (indices[i][j] as usize) * suffix[i]))
+        .collect()
+}
+
+/// Draw the per-stage γ powers + the stage-4 register point in lockstep, build the four `Val_s`
+/// columns (padded to `K_total = ∏ 2^{log_k_chunks}`), draw each stage's cycle point, and assemble
+/// the `ReadRafStage`s (WITHOUT the `rv_s` seed — that is computed by the prover / read from the
+/// proof by the verifier). Deterministic given the transcript, so prover and verifier agree.
+fn bytecode_read_raf_setup<F: Field, T: Challenge<F>, const D: usize>(
+    bytecode: &[Instruction],
+    log_k_chunks: [usize; D],
+    log_t: usize,
+    log_register: usize,
+    transcript: &mut T,
+) -> Vec<ReadRafStage<F>> {
+    let k_total: usize = log_k_chunks.iter().map(|&w| 1usize << w).product();
+    let lens = stage_gamma_lens();
+    let stage_gammas: [Vec<F>; N_BYTECODE_STAGES] =
+        std::array::from_fn(|s| gamma_powers(transcript.challenge(), lens[s]));
+    let r_register = transcript.challenge_vector(log_register);
+    let eq_r_register = EqPolynomial::<F>::evals(&r_register, None);
+    let mut vals = bytecode_val_polys::<F>(bytecode, &stage_gammas, &eq_r_register);
+    let keys = bytecode_rv_keys();
+    (0..N_BYTECODE_STAGES)
+        .map(|s| {
+            let r_cycle = transcript.challenge_vector(log_t);
+            let mut val_addr = std::mem::take(&mut vals[s]);
+            val_addr.resize(k_total, F::zero());
+            ReadRafStage {
+                r_cycle,
+                val_addr,
+                rv_key: keys[s],
+            }
+        })
+        .collect()
+}
+
+fn bytecode_read_raf_inputs<F: Field, const D: usize>(
+    log_k_chunks: [usize; D],
+    log_t: usize,
+    stages: Vec<ReadRafStage<F>>,
+) -> ReadRafInputs<F, D> {
+    ReadRafInputs {
+        ra_family: CommittedPolynomial::BytecodeRa,
+        sumcheck_id: SumcheckId::BytecodeReadRaf,
+        log_k_chunks,
+        log_t,
+        stages,
+    }
+}
+
+/// **Bytecode read-raf stage (prover).** Build the four interim-seeded `Val_s` stages, seed each
+/// stage's `rv_s = Σ_j eq(r_cycle_s, j)·Val_s(combined_index[j])` on the accumulator, then run the
+/// sparse read-raf over the `D` bytecode chunk-index columns. Returns the carried `rv_s` seeds + the
+/// read-raf proof (which caches the `D` `BytecodeRa(i)` openings for the M7 pushforward).
+pub fn prove_bytecode_read_raf<F, T, const D: usize, const NE: usize>(
+    bytecode: &[Instruction],
+    indices: [Vec<u32>; D],
+    log_k_chunks: [usize; D],
+    log_t: usize,
+    log_register: usize,
+    accumulator: &mut Openings<F>,
+    transcript: &mut T,
+) -> BytecodeReadRafProof<F>
+where
+    F: Field,
+    T: ProverFs<F>,
+{
+    let stages =
+        bytecode_read_raf_setup::<F, T, D>(bytecode, log_k_chunks, log_t, log_register, transcript);
+    let t = 1usize << log_t;
+    let combined = combined_indices(&indices, log_k_chunks, t);
+    let mut rv_seeds: [F; N_BYTECODE_STAGES] = std::array::from_fn(|_| F::zero());
+    for (s, stage) in stages.iter().enumerate() {
+        let eq = EqPolynomial::<F>::evals(&stage.r_cycle, None);
+        let rv = (0..t).fold(F::zero(), |a, j| a + eq[j] * stage.val_addr[combined[j]]);
+        rv_seeds[s] = rv;
+        accumulator.append_virtual(
+            stage.rv_key.0,
+            stage.rv_key.1,
+            OpeningPoint::new(stage.r_cycle.clone()),
+            rv,
+        );
+    }
+    let inputs = bytecode_read_raf_inputs(log_k_chunks, log_t, stages);
+    let read_raf = prove_read_raf::<F, T, D, NE>(indices, inputs, accumulator, transcript);
+    BytecodeReadRafProof { rv_seeds, read_raf }
+}
+
+/// **Bytecode read-raf stage (verifier)** (mirror of [`prove_bytecode_read_raf`]). Rebuild the same
+/// stages, re-seed each `rv_s` from the proof (the verifier lacks the chunk indices), then replay the
+/// read-raf sumcheck.
+pub fn verify_bytecode_read_raf<F, T, const D: usize, const NE: usize>(
+    proof: &BytecodeReadRafProof<F>,
+    bytecode: &[Instruction],
+    log_k_chunks: [usize; D],
+    log_t: usize,
+    log_register: usize,
+    accumulator: &mut Openings<F>,
+    transcript: &mut T,
+) -> Result<(), ReadRafStageError>
+where
+    F: Field,
+    T: VerifierFs<F>,
+{
+    let stages =
+        bytecode_read_raf_setup::<F, T, D>(bytecode, log_k_chunks, log_t, log_register, transcript);
+    for (s, stage) in stages.iter().enumerate() {
+        accumulator.append_virtual(
+            stage.rv_key.0,
+            stage.rv_key.1,
+            OpeningPoint::new(stage.r_cycle.clone()),
+            proof.rv_seeds[s],
+        );
+    }
+    let inputs = bytecode_read_raf_inputs(log_k_chunks, log_t, stages);
+    verify_read_raf::<F, T, D, NE>(&proof.read_raf, inputs, accumulator, transcript)
 }
 
 /// Build the bytecode read-raf params (`BytecodeRa` family, `BytecodeReadRaf` id).

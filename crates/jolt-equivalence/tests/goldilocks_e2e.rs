@@ -6,10 +6,11 @@
 //!   `cargo test -p jolt-equivalence --features goldilocks --test goldilocks_e2e`
 //!
 //! Milestones land incrementally:
-//!   M0 — assemble all binary-driver witnesses from the real trace; assert the limbed R1CS is
-//!        satisfied (flushes out `cycle_to_z` op-coverage on real MUL/virtual-sequence cycles).
-//!   M1 — the binary driver (Spartan -> memory -> booleanity) round-trips on the real trace.
-//!   M2 — the full prove_e2e/verify_e2e adds the stage-8 WHIR open of the R1csAux columns.
+//!   M0  — assemble all binary-driver witnesses from the real trace; assert the limbed R1CS is
+//!         satisfied (flushes out `cycle_to_z` op-coverage on real MUL/virtual-sequence cycles).
+//!   M1  — the binary driver (Spartan -> memory -> booleanity) round-trips on the real trace.
+//!   M2  — prove_e2e/verify_e2e adds the stage-8 WHIR open of the R1csAux + Inc columns.
+//!   M3b — prove_e2e/verify_e2e adds the bytecode read-raf stage.
 #![cfg(feature = "goldilocks")]
 
 use common::constants::REGISTER_COUNT;
@@ -17,14 +18,36 @@ use jolt_core::host;
 use jolt_core::zkvm::ram::remap_address;
 use jolt_prover_goldilocks::field::{ProverTranscript, VerifierTranscript};
 use jolt_prover_goldilocks::zkvm::driver::{prove_binary, verify_binary};
-use jolt_prover_goldilocks::zkvm::e2e::{prove_e2e, verify_e2e, VerifierParams};
+use jolt_prover_goldilocks::zkvm::e2e::{
+    prove_e2e, verify_e2e, BytecodeProverInputs, BytecodeVerifierInputs, VerifierParams,
+};
 use jolt_prover_goldilocks::zkvm::real_trace::{assemble_real_witness, RealWitness};
+use jolt_prover_goldilocks::zkvm::witness::CommittedWitness;
 use jolt_prover_goldilocks::F;
-use jolt_trace::{BytecodePreprocessing, CycleRow};
+use jolt_trace::{extract_trace, BytecodePreprocessing, CycleRow, Instruction};
+use jolt_witness::commitment_trace_sources;
+use jolt_witness::goldilocks::{FamilyLayout, GoldilocksLayout};
 
-/// Trace the muldiv guest with the same inputs jolt-core's fixture uses and assemble the binary
-/// driver's witnesses over Goldilocks. Returns the witnesses + the (unpadded) real trace length.
-fn build_muldiv_real_witness() -> (RealWitness<F>, usize) {
+/// muldiv has bytecode_d = 4 chunks at log_k_chunk = 4 (confirmed by the witness gate); the read-raf
+/// is const-generic over D, so the e2e test pins D = 4, NE = D + 2 = 6.
+const BYTECODE_D: usize = 4;
+const BYTECODE_NE: usize = 6;
+
+/// Everything the e2e needs from one real muldiv trace: the binary-driver witnesses, the committed
+/// witness (for the bytecode RA chunk-index columns), the padded bytecode table, and the geometry.
+struct Fixture {
+    real: RealWitness<F>,
+    committed: CommittedWitness<F>,
+    bytecode_rows: Vec<Instruction>,
+    log_k_chunk: usize,
+    bytecode_d: usize,
+    log_register: usize,
+    trace_len: usize,
+}
+
+/// Trace the muldiv guest with the same inputs jolt-core's fixture uses and assemble the full e2e
+/// witness set over Goldilocks.
+fn build_muldiv_fixture() -> Fixture {
     let inputs = postcard::to_stdvec(&[9u32, 5u32, 3u32]).expect("postcard inputs");
 
     let mut program = host::Program::new("muldiv-guest");
@@ -44,25 +67,85 @@ fn build_muldiv_real_witness() -> (RealWitness<F>, usize) {
         .unwrap_or(0);
     let ram_k = (max_ram_index + 1).next_power_of_two().max(2) as usize;
 
-    let witness = assemble_real_witness::<F>(
+    let real = assemble_real_witness::<F>(
         &trace,
         &bytecode,
         ram_lowest,
         ram_k,
         REGISTER_COUNT as usize,
     );
-    (witness, trace.len())
+
+    // Committed witness from the projected sources (same path as the witness gate). `size` is the
+    // padded committed length so the committed columns align with the binary witnesses at 2^log_t.
+    let log_t = real.r1cs.log_num_cycles;
+    let padded_len = 1usize << log_t;
+    let (cycle_inputs, _r1cs, _flags) = extract_trace::<_, F>(
+        &trace,
+        padded_len,
+        &bytecode,
+        &memory_layout,
+        real.r1cs.num_vars_padded,
+    );
+    let sources = commitment_trace_sources(&cycle_inputs);
+
+    let log_k_chunk = if log_t < 25 { 4 } else { 8 };
+    let log_k_bytecode = bytecode.code_size.trailing_zeros() as usize;
+    let bytecode_d = log_k_bytecode.div_ceil(log_k_chunk);
+    let instruction_d = 128 / log_k_chunk;
+    let log_k_ram = ram_k.trailing_zeros() as usize;
+    let ram_d = log_k_ram.div_ceil(log_k_chunk);
+    let layout = GoldilocksLayout {
+        trace_len: padded_len,
+        instruction: FamilyLayout {
+            label: "InstructionRa",
+            num_chunks: instruction_d,
+            chunk_bits: log_k_chunk,
+            padding: Some(0),
+        },
+        bytecode: FamilyLayout {
+            label: "BytecodeRa",
+            num_chunks: bytecode_d,
+            chunk_bits: log_k_chunk,
+            padding: Some(0),
+        },
+        ram: FamilyLayout {
+            label: "RamRa",
+            num_chunks: ram_d,
+            chunk_bits: log_k_chunk,
+            padding: None,
+        },
+    };
+    let committed = CommittedWitness::<F>::build(&sources, &layout);
+
+    Fixture {
+        real,
+        committed,
+        bytecode_rows: bytecode.bytecode.clone(),
+        log_k_chunk,
+        bytecode_d,
+        log_register: (REGISTER_COUNT as usize).trailing_zeros() as usize,
+        trace_len: trace.len(),
+    }
+}
+
+/// The bytecode RA chunk-index columns (`ra_dense[bytecode_range]`) as the read-raf's `D` indices.
+fn bytecode_indices(fx: &Fixture) -> [Vec<u32>; BYTECODE_D] {
+    std::array::from_fn(|i| {
+        fx.committed.ra_dense[fx.committed.bytecode_range.start + i]
+            .indices
+            .clone()
+    })
 }
 
 #[test]
 fn goldilocks_real_trace_r1cs_is_satisfied() {
-    let (w, trace_len) = build_muldiv_real_witness();
+    let fx = build_muldiv_fixture();
+    let w = &fx.real;
 
     assert!(
         w.r1cs.is_satisfied(),
         "limbed RV64 R1CS must be satisfied by the real muldiv witness"
     );
-
     assert_eq!(
         w.ram.log_t, w.registers.log_t,
         "RAM and register stages must agree on log_t"
@@ -73,19 +156,24 @@ fn goldilocks_real_trace_r1cs_is_satisfied() {
     );
 
     eprintln!(
-        "[goldilocks-e2e/M0] muldiv real-trace witness OK: trace_len={trace_len}, \
-         log_num_cycles={}, num_vars_padded={}, num_cons_padded={}, ram_log_k={}, reg_log_k={}",
+        "[goldilocks-e2e/M0] muldiv real-trace witness OK: trace_len={}, log_num_cycles={}, \
+         num_vars_padded={}, num_cons_padded={}, ram_log_k={}, reg_log_k={}, log_k_chunk={}, \
+         bytecode_d={}",
+        fx.trace_len,
         w.r1cs.log_num_cycles,
         w.r1cs.num_vars_padded,
         w.r1cs.num_cons_padded,
         w.ram.log_k,
         w.registers.log_k,
+        fx.log_k_chunk,
+        fx.bytecode_d,
     );
 }
 
 #[test]
 fn goldilocks_real_trace_binary_driver_round_trip() {
-    let (w, _trace_len) = build_muldiv_real_witness();
+    let fx = build_muldiv_fixture();
+    let w = &fx.real;
 
     let mut prover_t = ProverTranscript::new("muldiv-binary-e2e");
     let proof = prove_binary(
@@ -113,16 +201,32 @@ fn goldilocks_real_trace_binary_driver_round_trip() {
 }
 
 #[test]
-fn goldilocks_real_trace_e2e_with_stage8_r1cs_aux() {
-    let (w, _trace_len) = build_muldiv_real_witness();
+fn goldilocks_real_trace_e2e_with_bytecode_read_raf() {
+    let fx = build_muldiv_fixture();
+    assert_eq!(
+        fx.bytecode_d, BYTECODE_D,
+        "muldiv bytecode_d must match the const D this test pins"
+    );
+    let log_k_chunks = [fx.log_k_chunk; BYTECODE_D];
 
     let mut prover_t = ProverTranscript::new("muldiv-e2e");
-    let proof = prove_e2e(&w, &mut prover_t)
-        .expect("prove_e2e (binary driver + stage-8 WHIR open of R1csAux) must succeed");
+    let bc_prover = BytecodeProverInputs::<BYTECODE_D> {
+        bytecode: &fx.bytecode_rows,
+        indices: bytecode_indices(&fx),
+        log_k_chunks,
+        log_register: fx.log_register,
+    };
+    let proof = prove_e2e::<BYTECODE_D, BYTECODE_NE>(&fx.real, &bc_prover, &mut prover_t)
+        .expect("prove_e2e (binary + bytecode read-raf + stage-8 R1csAux/Inc opens) must succeed");
     let narg = prover_t.into_proof();
 
-    let params = VerifierParams::from_witness(&w);
+    let params = VerifierParams::from_witness(&fx.real);
+    let bc_verifier = BytecodeVerifierInputs::<BYTECODE_D> {
+        bytecode: &fx.bytecode_rows,
+        log_k_chunks,
+        log_register: fx.log_register,
+    };
     let mut verifier_t = VerifierTranscript::new("muldiv-e2e", &narg);
-    verify_e2e(&proof, &params, &mut verifier_t)
-        .expect("verify_e2e must accept the real muldiv proof (incl. the stage-8 R1csAux open)");
+    verify_e2e::<BYTECODE_D, BYTECODE_NE>(&proof, &params, &bc_verifier, &mut verifier_t)
+        .expect("verify_e2e must accept the real muldiv proof");
 }

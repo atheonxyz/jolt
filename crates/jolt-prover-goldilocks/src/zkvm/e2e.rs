@@ -18,27 +18,50 @@ use crate::framework::stage8::{Stage8Inventory, Stage8Request};
 use crate::framework::stage8_open::{
     prove_inc_open, prove_stage8, verify_inc_open, verify_stage8, Stage8IncProof, Stage8OpenError,
 };
+use crate::zkvm::bytecode::read_raf_checking::{
+    prove_bytecode_read_raf, verify_bytecode_read_raf, BytecodeReadRafProof,
+};
 use crate::zkvm::driver::{prove_binary_into, verify_binary_into, BinaryProof, DriverError};
 use crate::zkvm::real_trace::RealWitness;
+use crate::zkvm::shout_read_raf::ReadRafStageError;
 use crate::zkvm::stage8_columns::{inc_limb_columns, r1cs_aux_columns};
 use jolt_field::Field;
 use jolt_r1cs::R1csKey;
+use jolt_trace::Instruction;
 
 use super::driver::RamPublicColumns;
 
-/// e2e verification failure: a binary-driver stage or the stage-8 WHIR open.
+/// e2e verification failure: a binary-driver stage, the bytecode read-raf, or the stage-8 WHIR open.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum E2eError {
     Driver(DriverError),
+    BytecodeReadRaf(ReadRafStageError),
     Stage8(Stage8OpenError),
 }
 
-/// The full proof: the binary-driver sub-proof plus whatever the stage-8 open contributes (today
-/// the open's bytes live entirely in the shared NARG, so no extra fields).
+/// The full proof: the binary-driver sub-proof, the bytecode read-raf stage, and the stage-8 limb
+/// opens (the WHIR opening bytes live in the shared NARG).
 #[derive(Clone, Debug)]
 pub struct E2eProof {
     pub binary: BinaryProof<F>,
+    pub bytecode_read_raf: BytecodeReadRafProof<F>,
     pub inc: Stage8IncProof<F>,
+}
+
+/// Prover-side bytecode read-raf inputs: the padded bytecode table, the `D` committed chunk-index
+/// columns (`ra_dense[bytecode_range]`), the chunk widths, and the register-address bit width.
+pub struct BytecodeProverInputs<'a, const D: usize> {
+    pub bytecode: &'a [Instruction],
+    pub indices: [Vec<u32>; D],
+    pub log_k_chunks: [usize; D],
+    pub log_register: usize,
+}
+
+/// Verifier-side bytecode read-raf inputs (no witness chunk indices — those are the prover's).
+pub struct BytecodeVerifierInputs<'a, const D: usize> {
+    pub bytecode: &'a [Instruction],
+    pub log_k_chunks: [usize; D],
+    pub log_register: usize,
 }
 
 /// Verifier-side public parameters (geometry + the R1CS key + RAM public columns). Derived from the
@@ -105,10 +128,11 @@ fn nonzero_r1cs_aux_requests(
         .collect()
 }
 
-/// Prove the full e2e on a real-trace witness: binary stages, then the stage-8 WHIR open of the
-/// `R1csAux` columns, on one transcript.
-pub fn prove_e2e(
+/// Prove the full e2e on a real-trace witness: binary stages → bytecode read-raf → the stage-8 WHIR
+/// limb opens (`R1csAux` + `Inc`), on one transcript. `D`/`NE = D+2` are the bytecode chunk count.
+pub fn prove_e2e<const D: usize, const NE: usize>(
     real: &RealWitness<F>,
+    bc: &BytecodeProverInputs<D>,
     transcript: &mut ProverTranscript,
 ) -> Result<E2eProof, E2eError> {
     let log_t = real.r1cs.log_num_cycles;
@@ -120,6 +144,18 @@ pub fn prove_e2e(
         &real.registers,
         &real.ram_public,
         &real.key,
+        &mut accumulator,
+        transcript,
+    );
+
+    // Bytecode read-raf: caches the D BytecodeRa(i) openings (discharged by the M7 pushforward + the
+    // stage-8 RaDense open in a later milestone).
+    let bytecode_read_raf = prove_bytecode_read_raf::<F, ProverTranscript, D, NE>(
+        bc.bytecode,
+        bc.indices.clone(),
+        bc.log_k_chunks,
+        log_t,
+        bc.log_register,
         &mut accumulator,
         transcript,
     );
@@ -146,14 +182,16 @@ pub fn prove_e2e(
 
     Ok(E2eProof {
         binary,
+        bytecode_read_raf,
         inc: inc_proof,
     })
 }
 
 /// Verify the full e2e (mirror of [`prove_e2e`]).
-pub fn verify_e2e(
+pub fn verify_e2e<const D: usize, const NE: usize>(
     proof: &E2eProof,
     params: &VerifierParams,
+    bc: &BytecodeVerifierInputs<D>,
     transcript: &mut VerifierTranscript,
 ) -> Result<(), E2eError> {
     let mut accumulator = Openings::<F>::new(params.log_num_cycles);
@@ -170,6 +208,17 @@ pub fn verify_e2e(
         transcript,
     )
     .map_err(E2eError::Driver)?;
+
+    verify_bytecode_read_raf::<F, VerifierTranscript, D, NE>(
+        &proof.bytecode_read_raf,
+        bc.bytecode,
+        bc.log_k_chunks,
+        params.log_num_cycles,
+        bc.log_register,
+        &mut accumulator,
+        transcript,
+    )
+    .map_err(E2eError::BytecodeReadRaf)?;
 
     let requests = nonzero_r1cs_aux_requests(&accumulator, params.n_aux, params.log_num_cycles);
     let inventory = Stage8Inventory::from_accumulator(&accumulator, &requests);
