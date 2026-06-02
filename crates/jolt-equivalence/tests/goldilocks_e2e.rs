@@ -215,6 +215,7 @@ fn goldilocks_real_trace_e2e_with_bytecode_read_raf() {
         indices: bytecode_indices(&fx),
         log_k_chunks,
         log_register: fx.log_register,
+        base_index: fx.committed.bytecode_range.start,
     };
     let proof = prove_e2e::<BYTECODE_D, BYTECODE_NE>(&fx.real, &bc_prover, &mut prover_t)
         .expect("prove_e2e (binary + bytecode read-raf + stage-8 R1csAux/Inc opens) must succeed");
@@ -225,6 +226,7 @@ fn goldilocks_real_trace_e2e_with_bytecode_read_raf() {
         bytecode: &fx.bytecode_rows,
         log_k_chunks,
         log_register: fx.log_register,
+        base_index: fx.committed.bytecode_range.start,
     };
     let mut verifier_t = VerifierTranscript::new("muldiv-e2e", &narg);
     verify_e2e::<BYTECODE_D, BYTECODE_NE>(&proof, &params, &bc_verifier, &mut verifier_t)

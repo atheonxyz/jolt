@@ -3,25 +3,33 @@
 //! accumulator. Monomorphic on the concrete Goldilocks [`F`] — the stage-8 open commits over the
 //! base-Goldilocks alphabet.
 //!
-//! Wired incrementally:
-//!   M2  — discharge the booleanity `R1csAux(i)` openings via [`prove_stage8`]/[`verify_stage8`].
-//!   M3a — discharge `RdInc`/`RamInc` via [`prove_inc_open`]/[`verify_inc_open`] (limb recompose).
+//! Full pipeline: binary driver (Spartan → memory → booleanity) → bytecode read-raf → M7 per-chunk
+//! pushforward → stage-8 WHIR opens, on ONE transcript. Discharged via the stage-8 open:
+//!   - `R1csAux(i)` (booleanity) + bytecode `RaDense(base+i)` (pushforward GKR) — the inventory open;
+//!   - `RdInc`/`RamInc` limbs ([`prove_inc_open`]) — `lo + 2³²·hi` recompose;
+//!   - the bytecode `Pushforward` `P^F` limbs ([`prove_pushforward_open`]) — β-reconstruct.
 //!
-//! The read-raf / M7 pushforward families (the RA chunks) extend the open in a later milestone; until
-//! then the binary driver's RA-chunk openings are carried as cached claims.
+//! Instruction-lookup read-raf (production `LOG_K=128`) is deferred (needs the prefix/suffix port);
+//! the RAM family's dense `RamRa` and the uni-skip Spartan soundness binding remain interim gaps.
 
-use crate::field::{ProverTranscript, VerifierTranscript, F};
+use crate::field::{Base, ProverTranscript, VerifierTranscript, F};
 use crate::framework::accumulator::{
     CommittedPolynomial, OpeningAccumulator, Openings, SumcheckId,
 };
 use crate::framework::stage8::{Stage8Inventory, Stage8Request};
 use crate::framework::stage8_open::{
-    prove_inc_open, prove_stage8, verify_inc_open, verify_stage8, Stage8IncProof, Stage8OpenError,
+    prove_inc_open, prove_pushforward_open, prove_stage8, verify_inc_open, verify_pushforward_open,
+    verify_stage8, Fp3LimbColumns, Stage8IncProof, Stage8OpenError, Stage8PushforwardProof,
 };
 use crate::zkvm::bytecode::read_raf_checking::{
     prove_bytecode_read_raf, verify_bytecode_read_raf, BytecodeReadRafProof,
 };
 use crate::zkvm::driver::{prove_binary_into, verify_binary_into, BinaryProof, DriverError};
+use crate::zkvm::logup::driver::{
+    prove_read_raf_pushforward, verify_read_raf_pushforward, ReadRafPushforward,
+};
+use crate::zkvm::logup::gkr::GkrProof;
+use crate::zkvm::logup::GkrError;
 use crate::zkvm::real_trace::RealWitness;
 use crate::zkvm::shout_read_raf::ReadRafStageError;
 use crate::zkvm::stage8_columns::{inc_limb_columns, r1cs_aux_columns};
@@ -31,30 +39,36 @@ use jolt_trace::Instruction;
 
 use super::driver::RamPublicColumns;
 
-/// e2e verification failure: a binary-driver stage, the bytecode read-raf, or the stage-8 WHIR open.
+/// e2e verification failure: a binary-driver stage, the bytecode read-raf, the M7 pushforward, or the
+/// stage-8 WHIR open.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum E2eError {
     Driver(DriverError),
     BytecodeReadRaf(ReadRafStageError),
+    Pushforward(GkrError),
     Stage8(Stage8OpenError),
 }
 
-/// The full proof: the binary-driver sub-proof, the bytecode read-raf stage, and the stage-8 limb
-/// opens (the WHIR opening bytes live in the shared NARG).
+/// The full proof: the binary-driver sub-proof, the bytecode read-raf stage, the M7 per-chunk
+/// pushforward GKRs, and the stage-8 limb opens (the WHIR opening bytes live in the shared NARG).
 #[derive(Clone, Debug)]
 pub struct E2eProof {
     pub binary: BinaryProof<F>,
     pub bytecode_read_raf: BytecodeReadRafProof<F>,
+    pub bytecode_pushforward_gkr: Vec<GkrProof<F>>,
     pub inc: Stage8IncProof<F>,
+    pub pushforward: Stage8PushforwardProof<F>,
 }
 
 /// Prover-side bytecode read-raf inputs: the padded bytecode table, the `D` committed chunk-index
-/// columns (`ra_dense[bytecode_range]`), the chunk widths, and the register-address bit width.
+/// columns (`ra_dense[bytecode_range]`), the chunk widths, the register-address bit width, and the
+/// global RA-chunk base index (`bytecode_range.start`) for the `RaDense`/`Pushforward` keys.
 pub struct BytecodeProverInputs<'a, const D: usize> {
     pub bytecode: &'a [Instruction],
     pub indices: [Vec<u32>; D],
     pub log_k_chunks: [usize; D],
     pub log_register: usize,
+    pub base_index: usize,
 }
 
 /// Verifier-side bytecode read-raf inputs (no witness chunk indices — those are the prover's).
@@ -62,6 +76,7 @@ pub struct BytecodeVerifierInputs<'a, const D: usize> {
     pub bytecode: &'a [Instruction],
     pub log_k_chunks: [usize; D],
     pub log_register: usize,
+    pub base_index: usize,
 }
 
 /// Verifier-side public parameters (geometry + the R1CS key + RAM public columns). Derived from the
@@ -128,8 +143,74 @@ fn nonzero_r1cs_aux_requests(
         .collect()
 }
 
-/// Prove the full e2e on a real-trace witness: binary stages → bytecode read-raf → the stage-8 WHIR
-/// limb opens (`R1csAux` + `Inc`), on one transcript. `D`/`NE = D+2` are the bytecode chunk count.
+/// The bytecode family's per-chunk pushforward bridge (`BytecodeRa` read-raf → `RaDense`/`Pushforward`
+/// GKR), keyed at the global RA-chunk `base_index`.
+fn bytecode_pushforward_family<const D: usize>(
+    log_t: usize,
+    base_index: usize,
+    log_k_chunks: &[usize; D],
+) -> ReadRafPushforward {
+    ReadRafPushforward {
+        name: "BytecodeRa",
+        log_t,
+        base_index,
+        log_m_chunks: log_k_chunks.to_vec(),
+        ra_family: CommittedPolynomial::BytecodeRa,
+        read_raf_id: SumcheckId::BytecodeReadRaf,
+    }
+}
+
+/// Append the bytecode `RaDense(base+i)@PushforwardGkr` requests for chunks with a NON-ZERO claim (a
+/// zero-index chunk's column is all-zero — WHIR can't open it; skipped in lockstep, see
+/// [`nonzero_r1cs_aux_requests`]).
+fn push_bytecode_radense_requests(
+    requests: &mut Vec<Stage8Request>,
+    accumulator: &Openings<F>,
+    base_index: usize,
+    d: usize,
+    log_t: usize,
+) {
+    let zero = F::from_u64(0);
+    for i in 0..d {
+        let global = base_index + i;
+        let claim = accumulator
+            .get_committed_polynomial_opening(
+                CommittedPolynomial::RaDense(global),
+                SumcheckId::PushforwardGkr,
+            )
+            .1;
+        if claim != zero {
+            requests.push(Stage8Request {
+                poly: CommittedPolynomial::RaDense(global),
+                sumcheck: SumcheckId::PushforwardGkr,
+                committed_num_vars: log_t,
+            });
+        }
+    }
+}
+
+/// The per-chunk `Pushforward(base+i)@PushforwardReduction` open points (`r_col`) + claimed `P^F(r_col)`.
+fn bytecode_pushforward_points_claims(
+    accumulator: &Openings<F>,
+    base_index: usize,
+    d: usize,
+) -> (Vec<Vec<F>>, Vec<F>) {
+    let mut points = Vec::with_capacity(d);
+    let mut claims = Vec::with_capacity(d);
+    for i in 0..d {
+        let (pt, claim) = accumulator.get_committed_polynomial_opening(
+            CommittedPolynomial::Pushforward(base_index + i),
+            SumcheckId::PushforwardReduction,
+        );
+        points.push(pt.r);
+        claims.push(claim);
+    }
+    (points, claims)
+}
+
+/// Prove the full e2e on a real-trace witness: binary stages → bytecode read-raf → M7 pushforward →
+/// the stage-8 WHIR opens (`R1csAux` + bytecode `RaDense` inventory, `Inc` limbs, `Pushforward`
+/// limbs), on one transcript. `D`/`NE = D+2` are the bytecode chunk count.
 pub fn prove_e2e<const D: usize, const NE: usize>(
     real: &RealWitness<F>,
     bc: &BytecodeProverInputs<D>,
@@ -148,8 +229,7 @@ pub fn prove_e2e<const D: usize, const NE: usize>(
         transcript,
     );
 
-    // Bytecode read-raf: caches the D BytecodeRa(i) openings (discharged by the M7 pushforward + the
-    // stage-8 RaDense open in a later milestone).
+    // Bytecode read-raf: caches the D BytecodeRa(i) openings.
     let bytecode_read_raf = prove_bytecode_read_raf::<F, ProverTranscript, D, NE>(
         bc.bytecode,
         bc.indices.clone(),
@@ -160,10 +240,23 @@ pub fn prove_e2e<const D: usize, const NE: usize>(
         transcript,
     );
 
+    // M7 per-chunk pushforward: discharge those into RaDense(base+i)@PushforwardGkr +
+    // Pushforward(base+i)@{PushforwardGkr,PushforwardReduction}; surfaces the per-chunk P^F columns.
+    let fam = bytecode_pushforward_family(log_t, bc.base_index, &bc.log_k_chunks);
+    let (bytecode_pushforward_gkr, pf_columns) =
+        prove_read_raf_pushforward(&fam, &bc.indices, &mut accumulator, transcript)
+            .map_err(E2eError::Pushforward)?;
+
+    // Stage-8 inventory open: R1csAux + the bytecode RaDense chunk columns.
     let aux = real.r1cs.boolean_aux_columns();
-    let requests = nonzero_r1cs_aux_requests(&accumulator, aux.len(), log_t);
+    let mut requests = nonzero_r1cs_aux_requests(&accumulator, aux.len(), log_t);
+    push_bytecode_radense_requests(&mut requests, &accumulator, bc.base_index, D, log_t);
+    let mut columns = r1cs_aux_columns(&aux);
+    for (i, idx) in bc.indices.iter().enumerate() {
+        let base: Vec<Base> = idx.iter().map(|&k| Base::from_u64(u64::from(k))).collect();
+        columns.insert(CommittedPolynomial::RaDense(bc.base_index + i), base);
+    }
     let inventory = Stage8Inventory::from_accumulator(&accumulator, &requests);
-    let columns = r1cs_aux_columns(&aux);
     prove_stage8(transcript, &columns, &inventory).map_err(E2eError::Stage8)?;
 
     // Inc limb open: the committed limbs decompose the memory stage's zero-init RdInc/RamInc (the
@@ -180,10 +273,20 @@ pub fn prove_e2e<const D: usize, const NE: usize>(
     );
     let inc_proof = prove_inc_open(transcript, &inc, &rd_point.r, &ram_point.r);
 
+    // Pushforward limb open: commit the surfaced P^F columns and open at each chunk's r_col.
+    let (pf_points, _) = bytecode_pushforward_points_claims(&accumulator, bc.base_index, D);
+    let pf_chunks: Vec<Fp3LimbColumns> = pf_columns
+        .iter()
+        .map(|c| Fp3LimbColumns::from_fp3(c))
+        .collect();
+    let pushforward = prove_pushforward_open(transcript, &pf_chunks, &pf_points);
+
     Ok(E2eProof {
         binary,
         bytecode_read_raf,
+        bytecode_pushforward_gkr,
         inc: inc_proof,
+        pushforward,
     })
 }
 
@@ -220,7 +323,23 @@ pub fn verify_e2e<const D: usize, const NE: usize>(
     )
     .map_err(E2eError::BytecodeReadRaf)?;
 
-    let requests = nonzero_r1cs_aux_requests(&accumulator, params.n_aux, params.log_num_cycles);
+    let fam = bytecode_pushforward_family(params.log_num_cycles, bc.base_index, &bc.log_k_chunks);
+    verify_read_raf_pushforward(
+        &fam,
+        &proof.bytecode_pushforward_gkr,
+        &mut accumulator,
+        transcript,
+    )
+    .map_err(E2eError::Pushforward)?;
+
+    let mut requests = nonzero_r1cs_aux_requests(&accumulator, params.n_aux, params.log_num_cycles);
+    push_bytecode_radense_requests(
+        &mut requests,
+        &accumulator,
+        bc.base_index,
+        D,
+        params.log_num_cycles,
+    );
     let inventory = Stage8Inventory::from_accumulator(&accumulator, &requests);
     verify_stage8(transcript, &inventory).map_err(E2eError::Stage8)?;
 
@@ -241,6 +360,12 @@ pub fn verify_e2e<const D: usize, const NE: usize>(
         ram_claim,
     )
     .map_err(E2eError::Stage8)?;
+
+    // Pushforward limb open: points + claimed P^F(r_col) come from the accumulator (the read-raf
+    // pushforward registered Pushforward(base+i)@PushforwardReduction).
+    let (pf_points, pf_claims) = bytecode_pushforward_points_claims(&accumulator, bc.base_index, D);
+    verify_pushforward_open(transcript, &pf_points, &proof.pushforward, &pf_claims)
+        .map_err(E2eError::Stage8)?;
 
     Ok(())
 }

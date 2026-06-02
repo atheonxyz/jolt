@@ -52,6 +52,15 @@ pub struct GkrProof<F: Field> {
     _marker: PhantomData<F>,
 }
 
+/// The GKR circuit sumchecks bind LSB-first, so the leaf points `r*` are LSB-first. The framework's
+/// cached opening points (and the WHIR stage-8 open) are BIG_ENDIAN, so reverse before caching — the
+/// claim is unchanged (`MLE_BIG_ENDIAN(col, reverse(r)) = MLE_LSB(col, r)`); the structural leaf
+/// checks above use the raw LSB-first point.
+#[inline]
+fn rev<F: Field>(point: &[F]) -> Vec<F> {
+    point.iter().rev().copied().collect()
+}
+
 /// Prove one circuit top-down: write the root + each layer's sumcheck (round polys) + leaf values into
 /// the NARG. Returns the leaf point `r*` and the leaf fraction `(Ñ(r*), D̃(r*))`.
 fn prove_circuit<F, T>(
@@ -199,25 +208,25 @@ where
     let (point_a, _leaf_n_a, leaf_d_a) = prove_circuit(&circuit_a, accumulator, transcript);
     let (point_b, leaf_n_b, _leaf_d_b) = prove_circuit(&circuit_b, accumulator, transcript);
 
-    // ra_dense (M*) opening: D̃_A(r*_A) = α − M̃*(r*_A) ⇒ M̃*(r*_A) = α − D̃_A.
+    // ra_dense (M*) opening: D̃_A(r*_A) = α − M̃*(r*_A) ⇒ M̃*(r*_A) = α − D̃_A. Cached BIG_ENDIAN.
     accumulator.append_dense(
         CommittedPolynomial::RaDense(family_index),
         SumcheckId::PushforwardGkr,
-        OpeningPoint::new(point_a),
+        OpeningPoint::new(rev(&point_a)),
         data.alpha - leaf_d_a,
     );
     // P^F opening (GKR leaf): Ñ_B(r*_B) = P̃^F(r*_B).
     accumulator.append_dense(
         CommittedPolynomial::Pushforward(family_index),
         SumcheckId::PushforwardGkr,
-        OpeningPoint::new(point_b),
+        OpeningPoint::new(rev(&point_b)),
         leaf_n_b,
     );
     // P^F opening (§4.5.2 reduction): P̃^F(r_col) = combined_claim.
     accumulator.append_dense(
         CommittedPolynomial::Pushforward(family_index),
         SumcheckId::PushforwardReduction,
-        OpeningPoint::new(data.r_col.clone()),
+        OpeningPoint::new(rev(&data.r_col)),
         data.combined_claim,
     );
 
@@ -261,19 +270,19 @@ where
     accumulator.append_dense(
         CommittedPolynomial::RaDense(family_index),
         SumcheckId::PushforwardGkr,
-        OpeningPoint::new(point_a),
+        OpeningPoint::new(rev(&point_a)),
         view.alpha - leaf_d_a,
     );
     accumulator.append_dense(
         CommittedPolynomial::Pushforward(family_index),
         SumcheckId::PushforwardGkr,
-        OpeningPoint::new(point_b),
+        OpeningPoint::new(rev(&point_b)),
         leaf_n_b,
     );
     accumulator.append_dense(
         CommittedPolynomial::Pushforward(family_index),
         SumcheckId::PushforwardReduction,
-        OpeningPoint::new(view.r_col.clone()),
+        OpeningPoint::new(rev(&view.r_col)),
         view.combined_claim,
     );
 
