@@ -16,6 +16,7 @@ pub mod lagrange;
 pub mod multiquadratic;
 pub mod poly;
 pub mod sumcheck;
+pub mod transcript;
 pub mod univariate_skip;
 
 pub use accumulator::{
@@ -24,3 +25,4 @@ pub use accumulator::{
 };
 pub use poly::MultilinearPolynomial;
 pub use sumcheck::{prove, verify, SumcheckInstance};
+pub use transcript::{Challenge, ProverFs, VerifierFs};

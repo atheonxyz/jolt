@@ -13,13 +13,13 @@
 
 use jolt_field::Field;
 use jolt_r1cs::R1csKey;
-use jolt_sumcheck::{EvaluationClaim, SumcheckClaim, SumcheckProof};
-use jolt_transcript::Transcript;
+use jolt_sumcheck::{EvaluationClaim, SumcheckClaim};
 
 use crate::framework::accumulator::{
     CommittedPolynomial, OpeningAccumulator, Openings, SumcheckId,
 };
 use crate::framework::sumcheck::{prove, verify, SumcheckInstance};
+use crate::framework::transcript::{ProverFs, VerifierFs};
 use crate::zkvm::booleanity::{Booleanity, BooleanityParams};
 use crate::zkvm::r1cs_witness::R1csWitness;
 use crate::zkvm::spartan::stage::{prove_spartan, verify_spartan, SpartanProof, SpartanStageError};
@@ -30,7 +30,6 @@ const BOOLEANITY_DEGREE: usize = 3;
 #[derive(Clone, Debug)]
 pub struct BinaryProof<F: Field> {
     pub spartan: SpartanProof<F>,
-    pub booleanity: SumcheckProof<F>,
     /// `R1csAux(i)(ρ)` openings the booleanity reduction discharges against (PCS-opened at stage 8).
     pub aux_evals: Vec<F>,
 }
@@ -43,7 +42,7 @@ pub fn prove_binary<F, T>(
 ) -> BinaryProof<F>
 where
     F: Field,
-    T: Transcript<Challenge = F>,
+    T: ProverFs<F>,
 {
     let mut accumulator = Openings::<F>::new(witness.log_num_cycles);
 
@@ -54,7 +53,7 @@ where
     let r_bool = transcript.challenge_vector(witness.log_num_cycles);
     let bparams = BooleanityParams::new(r_bool, n_aux, transcript);
     let mut booleanity = Booleanity::new_prover(bparams, aux_cols);
-    let (booleanity_proof, _) = prove(&mut booleanity, &mut accumulator, transcript);
+    let _ = prove(&mut booleanity, &mut accumulator, transcript);
 
     let aux_evals = (0..n_aux)
         .map(|i| {
@@ -67,11 +66,7 @@ where
         })
         .collect();
 
-    BinaryProof {
-        spartan,
-        booleanity: booleanity_proof,
-        aux_evals,
-    }
+    BinaryProof { spartan, aux_evals }
 }
 
 /// Top-level verifier (mirror of [`prove_binary`]).
@@ -84,7 +79,7 @@ pub fn verify_binary<F, T>(
 ) -> Result<(), SpartanStageError>
 where
     F: Field,
-    T: Transcript<Challenge = F>,
+    T: VerifierFs<F>,
 {
     let mut accumulator = Openings::<F>::new(log_num_cycles);
 
@@ -106,7 +101,7 @@ where
         claimed_sum: F::zero(),
     };
     let EvaluationClaim { point, value } =
-        verify(&bclaim, &proof.booleanity, transcript).map_err(|_| SpartanStageError::Sumcheck)?;
+        verify(&bclaim, transcript).map_err(|_| SpartanStageError::Sumcheck)?;
 
     let rho = booleanity.normalize_opening_point(&point);
     for (i, &eval) in proof.aux_evals.iter().enumerate() {
@@ -127,10 +122,10 @@ where
 #[expect(clippy::expect_used)]
 mod tests {
     use super::*;
+    use crate::field::{ProverTranscript, VerifierTranscript};
     use crate::r1cs::rv64_limbed_constraints;
     use crate::zkvm::r1cs_witness::{build_limbed_z, tests_support::MockCycle};
     use jolt_field::goldilocks::GoldilocksFp3 as F;
-    use jolt_transcript::Blake2bTranscript;
 
     fn witness_and_key(trace: &[MockCycle]) -> (R1csWitness<F>, R1csKey<F>) {
         let pcs = vec![0u64; trace.len()];
@@ -154,10 +149,11 @@ mod tests {
         let (witness, key) = witness_and_key(&trace);
         assert!(witness.is_satisfied(), "witness must satisfy the R1CS");
 
-        let mut prover_t = Blake2bTranscript::<F>::new(b"binary-driver");
+        let mut prover_t = ProverTranscript::new("binary-driver");
         let proof = prove_binary(&witness, &key, &mut prover_t);
+        let narg = prover_t.into_proof();
 
-        let mut verifier_t = Blake2bTranscript::<F>::new(b"binary-driver");
+        let mut verifier_t = VerifierTranscript::new("binary-driver", &narg);
         verify_binary(
             &proof,
             &key,
@@ -173,12 +169,13 @@ mod tests {
     fn tampered_aux_rejected() {
         let trace = [MockCycle::add(0, 3, 5), MockCycle::noop_at(4)];
         let (witness, key) = witness_and_key(&trace);
-        let mut prover_t = Blake2bTranscript::<F>::new(b"binary-driver");
+        let mut prover_t = ProverTranscript::new("binary-driver");
         let mut proof = prove_binary(&witness, &key, &mut prover_t);
+        let narg = prover_t.into_proof();
         // Tamper to a NON-boolean value (2) so `b² − b ≠ 0` — flipping to 1 would stay boolean.
         proof.aux_evals[0] += F::from_u64(2);
 
-        let mut verifier_t = Blake2bTranscript::<F>::new(b"binary-driver");
+        let mut verifier_t = VerifierTranscript::new("binary-driver", &narg);
         assert!(
             verify_binary(
                 &proof,

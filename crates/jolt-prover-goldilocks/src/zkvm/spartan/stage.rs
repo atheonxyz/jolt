@@ -12,11 +12,11 @@
 
 use jolt_field::Field;
 use jolt_r1cs::R1csKey;
-use jolt_sumcheck::{EvaluationClaim, SumcheckClaim, SumcheckProof};
-use jolt_transcript::Transcript;
+use jolt_sumcheck::{EvaluationClaim, SumcheckClaim};
 
 use crate::framework::accumulator::{OpeningAccumulator, Openings, SumcheckId, VirtualPolynomial};
 use crate::framework::sumcheck::{prove, verify, SumcheckInstance};
+use crate::framework::transcript::{ProverFs, VerifierFs};
 use crate::zkvm::r1cs_witness::R1csWitness;
 use crate::zkvm::spartan::inner::{SpartanInner, SpartanInnerParams};
 use crate::zkvm::spartan::outer::{SpartanOuter, SpartanOuterParams};
@@ -35,15 +35,14 @@ pub enum SpartanStageError {
     InnerClaim,
 }
 
-/// The Spartan-stage proof: the two sumcheck transcripts + the claims the verifier discharges
-/// (`Az/Bz/Cz(r_x)` and the witness opening `z(r_y)`, the latter PCS-opened at stage 8).
+/// The Spartan-stage opening claims the verifier discharges (`Az/Bz/Cz(r_x)` and the witness opening
+/// `z(r_y)`, the latter PCS-opened at stage 8). The outer/inner sumcheck round polynomials live in
+/// the shared NARG, not here.
 #[derive(Clone, Debug)]
 pub struct SpartanProof<F: Field> {
-    pub outer: SumcheckProof<F>,
     pub az_rx: F,
     pub bz_rx: F,
     pub cz_rx: F,
-    pub inner: SumcheckProof<F>,
     pub z_ry: F,
 }
 
@@ -56,7 +55,7 @@ pub fn prove_spartan<F, T>(
 ) -> SpartanProof<F>
 where
     F: Field,
-    T: Transcript<Challenge = F>,
+    T: ProverFs<F>,
 {
     let num_row_vars = witness.num_row_vars();
     let tau = transcript.challenge_vector(num_row_vars);
@@ -67,7 +66,7 @@ where
         witness.bz.clone(),
         witness.cz.clone(),
     );
-    let (outer_proof, _) = prove(&mut outer, accumulator, transcript);
+    let _ = prove(&mut outer, accumulator, transcript);
 
     let (r_x, az_rx) = accumulator
         .get_virtual_polynomial_opening(VirtualPolynomial::SpartanAz, SumcheckId::SpartanOuter);
@@ -83,7 +82,7 @@ where
         rho: [rho[0], rho[1], rho[2]],
     };
     let mut inner = SpartanInner::new_prover(params, witness.z.clone());
-    let (inner_proof, _) = prove(&mut inner, accumulator, transcript);
+    let _ = prove(&mut inner, accumulator, transcript);
 
     let (_, z_ry) = accumulator.get_virtual_polynomial_opening(
         VirtualPolynomial::SpartanWitnessZ,
@@ -91,11 +90,9 @@ where
     );
 
     SpartanProof {
-        outer: outer_proof,
         az_rx,
         bz_rx,
         cz_rx,
-        inner: inner_proof,
         z_ry,
     }
 }
@@ -110,7 +107,7 @@ pub fn verify_spartan<F, T>(
 ) -> Result<(), SpartanStageError>
 where
     F: Field,
-    T: Transcript<Challenge = F>,
+    T: VerifierFs<F>,
 {
     let tau = transcript.challenge_vector(num_row_vars);
     let outer = SpartanOuter::new_verifier(SpartanOuterParams::new(tau));
@@ -122,7 +119,7 @@ where
     let EvaluationClaim {
         point: outer_ch,
         value: outer_value,
-    } = verify(&outer_claim, &proof.outer, transcript).map_err(|_| SpartanStageError::Sumcheck)?;
+    } = verify(&outer_claim, transcript).map_err(|_| SpartanStageError::Sumcheck)?;
 
     // Seed the sent Az/Bz/Cz(r_x) so the outer claim discharges.
     let r_x = outer.normalize_opening_point(&outer_ch);
@@ -163,7 +160,7 @@ where
     let EvaluationClaim {
         point: inner_ch,
         value: inner_value,
-    } = verify(&inner_claim, &proof.inner, transcript).map_err(|_| SpartanStageError::Sumcheck)?;
+    } = verify(&inner_claim, transcript).map_err(|_| SpartanStageError::Sumcheck)?;
 
     let r_y = inner.normalize_opening_point(&inner_ch);
     accumulator.append_virtual(
@@ -182,10 +179,10 @@ where
 #[expect(clippy::expect_used)]
 mod tests {
     use super::*;
+    use crate::field::{ProverTranscript, VerifierTranscript};
     use crate::r1cs::rv64_limbed_constraints;
     use crate::zkvm::r1cs_witness::{build_limbed_z, tests_support::MockCycle};
     use jolt_field::goldilocks::GoldilocksFp3 as F;
-    use jolt_transcript::Blake2bTranscript;
 
     /// Build a satisfying witness from a small `MockCycle` trace + the R1csKey for it.
     fn witness_and_key(trace: &[MockCycle]) -> (R1csWitness<F>, R1csKey<F>) {
@@ -211,11 +208,12 @@ mod tests {
         assert!(witness.is_satisfied(), "witness must satisfy the R1CS");
 
         let mut prover_acc = Openings::<F>::new(witness.log_num_cycles);
-        let mut prover_t = Blake2bTranscript::<F>::new(b"spartan-stage");
+        let mut prover_t = ProverTranscript::new("spartan-stage");
         let proof = prove_spartan(&witness, &key, &mut prover_acc, &mut prover_t);
+        let narg = prover_t.into_proof();
 
         let mut verifier_acc = Openings::<F>::new(witness.log_num_cycles);
-        let mut verifier_t = Blake2bTranscript::<F>::new(b"spartan-stage");
+        let mut verifier_t = VerifierTranscript::new("spartan-stage", &narg);
         verify_spartan(
             &proof,
             &key,
@@ -232,12 +230,13 @@ mod tests {
         let trace = [MockCycle::add(0, 3, 5), MockCycle::noop_at(4)];
         let (witness, key) = witness_and_key(&trace);
         let mut prover_acc = Openings::<F>::new(witness.log_num_cycles);
-        let mut prover_t = Blake2bTranscript::<F>::new(b"spartan-stage");
+        let mut prover_t = ProverTranscript::new("spartan-stage");
         let mut proof = prove_spartan(&witness, &key, &mut prover_acc, &mut prover_t);
+        let narg = prover_t.into_proof();
         proof.az_rx += F::from_u64(1);
 
         let mut verifier_acc = Openings::<F>::new(witness.log_num_cycles);
-        let mut verifier_t = Blake2bTranscript::<F>::new(b"spartan-stage");
+        let mut verifier_t = VerifierTranscript::new("spartan-stage", &narg);
         assert!(
             verify_spartan(
                 &proof,

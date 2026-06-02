@@ -18,9 +18,9 @@
 //! pre-materialized recomposed values (`Fp3`), decoupling the sumcheck from the trace →
 //! signed-limb materialization (M8). The committed-limb opening of `ρ` is a stage-8 concern.
 
+use crate::framework::transcript::Challenge;
 use jolt_field::{Field, FieldAccumulator};
 use jolt_poly::{BindingOrder, EqPolynomial, UnivariatePoly};
-use jolt_transcript::Transcript;
 
 use crate::framework::accumulator::{
     CommittedPolynomial, OpeningAccumulator, OpeningPoint, Openings, SumcheckId, BIG_ENDIAN,
@@ -47,7 +47,7 @@ impl<F: Field> IncClaimReductionParams<F> {
     pub fn new(
         n_cycle_vars: usize,
         accumulator: &dyn OpeningAccumulator<F>,
-        transcript: &mut impl Transcript<Challenge = F>,
+        transcript: &mut impl Challenge<F>,
     ) -> Self {
         let gamma = transcript.challenge();
         let gamma_sqr = gamma * gamma;
@@ -240,10 +240,10 @@ impl<F: Field> SumcheckInstance<F> for IncClaimReduction<F> {
 #[expect(clippy::expect_used)]
 mod tests {
     use super::*;
+    use crate::field::{ProverTranscript, VerifierTranscript};
     use crate::framework::sumcheck::{prove, verify};
     use jolt_field::goldilocks::GoldilocksFp3 as F;
     use jolt_sumcheck::{EvaluationClaim, SumcheckClaim};
-    use jolt_transcript::Blake2bTranscript;
 
     struct Rng(u64);
     impl Rng {
@@ -312,17 +312,18 @@ mod tests {
         // Prover
         let mut prover_acc = Openings::<F>::new(log_t);
         seed_acc(&mut prover_acc);
-        let mut prover_t = Blake2bTranscript::<F>::new(b"inc-claim-reduction");
+        let mut prover_t = ProverTranscript::new("inc-claim-reduction");
         let params = IncClaimReductionParams::new(log_t, &prover_acc, &mut prover_t);
         let input_claim = params.input_claim(&prover_acc);
         let mut prover =
             IncClaimReduction::new_prover(params.clone(), ram_inc.clone(), rd_inc.clone());
-        let (proof, challenges) = prove(&mut prover, &mut prover_acc, &mut prover_t);
+        let challenges = prove(&mut prover, &mut prover_acc, &mut prover_t);
+        let narg = prover_t.into_proof();
 
         // Verifier
         let mut verifier_acc = Openings::<F>::new(log_t);
         seed_acc(&mut verifier_acc);
-        let mut verifier_t = Blake2bTranscript::<F>::new(b"inc-claim-reduction");
+        let mut verifier_t = VerifierTranscript::new("inc-claim-reduction", &narg);
         let vparams = IncClaimReductionParams::new(log_t, &verifier_acc, &mut verifier_t);
         let verifier = IncClaimReduction::new_verifier(vparams);
         let claim = SumcheckClaim {
@@ -331,7 +332,7 @@ mod tests {
             claimed_sum: input_claim,
         };
         let EvaluationClaim { point, value } =
-            verify(&claim, &proof, &mut verifier_t).expect("inc reduction must verify");
+            verify(&claim, &mut verifier_t).expect("inc reduction must verify");
         assert_eq!(
             point, challenges,
             "verifier point matches prover challenges"

@@ -1,24 +1,26 @@
-//! Prover-side sumcheck-instance trait + batched driver, retargeted from jolt-core's
-//! `subprotocols/sumcheck_prover.rs` to the lean field/transcript and bridged to the workspace
-//! **verifier** (`jolt-sumcheck`): the driver emits a [`jolt_sumcheck::SumcheckProof`] (a
-//! `Vec<UnivariatePoly<F>>`) that `jolt_sumcheck::SumcheckVerifier` checks unchanged. Challenges
-//! are plain `F` (the `C = F = Fp3` convention; jolt-core's `F::Challenge` collapses to `F`).
+//! Prover-side sumcheck-instance trait + batched driver over the single spongefish NARG.
 //!
-//! This is the *clear* (non-ZK) path. The opening-accumulator coupling (jolt-core's
-//! `input_claim(accumulator)` / `cache_openings`) and the BlindFold committed path land with the
-//! accumulator subsystem; here `input_claim`/`expected_output_claim` are plain values so the
-//! driver↔verifier bridge can be validated standalone.
+//! Round polynomials are written into the NARG byte string as prover messages
+//! ([`ProverFs::observe`]) and read back by the verifier ([`VerifierFs::read_coeffs`]) —
+//! there is no separate `SumcheckProof` carrier (the round polys live in the proof's
+//! NARG, the same sponge WHIR commit/open drive). The workspace `SumcheckVerifier`
+//! bridge is dropped; `verify` is an inline round loop. Challenges are plain `F` (the
+//! `C = F = Fp3` convention). `SumcheckClaim`/`EvaluationClaim`/`SumcheckError` are
+//! kept as pure value types.
+//!
+//! To keep prover and verifier in lockstep over the NARG, each round writes a FIXED
+//! number of coefficients — `degree + 1` (single) / `max_degree + 1` (batched) — padding
+//! with zeros, so the verifier reads exactly that many regardless of the actual
+//! (possibly lower-degree, e.g. gap-round dummy) round polynomial.
 
 use jolt_field::Field;
 use jolt_poly::UnivariatePoly;
-use jolt_sumcheck::{
-    EvaluationClaim, RoundProof, SumcheckClaim, SumcheckError, SumcheckProof, SumcheckVerifier,
-};
-use jolt_transcript::{AppendToTranscript, Transcript};
+use jolt_sumcheck::{EvaluationClaim, SumcheckClaim, SumcheckError};
 
 use crate::framework::accumulator::{
     OpeningAccumulator, OpeningPoint, Openings, BIG_ENDIAN, LITTLE_ENDIAN,
 };
+use crate::framework::transcript::{ProverFs, VerifierFs};
 
 /// A prover-side sumcheck instance: one batched claim reduced over [`Self::num_rounds`] rounds.
 /// Mirrors the jolt-core `SumcheckInstanceProver`/`SumcheckInstanceParams` surface, minus the
@@ -67,69 +69,124 @@ pub trait SumcheckInstance<F: Field> {
     fn finalize(&mut self) {}
 }
 
-/// Drive a single sumcheck instance to completion, emitting a workspace-verifiable proof and the
-/// squeezed challenge point. Reads the input claim from `accumulator`, absorbs each round
-/// polynomial through the same `RoundProof` path the verifier replays (so
-/// `jolt_sumcheck::SumcheckVerifier::verify` accepts the result), then caches output openings.
-pub fn prove<F, I, T>(
-    instance: &mut I,
-    accumulator: &mut Openings<F>,
+/// Write a round polynomial's coefficients into the NARG, padded with zeros to `n_coeffs`
+/// (= the declared degree + 1) so the verifier always reads a fixed count.
+pub(crate) fn write_round_poly<F, T>(transcript: &mut T, poly: &UnivariatePoly<F>, n_coeffs: usize)
+where
+    F: Field,
+    T: ProverFs<F>,
+{
+    let coeffs = poly.coefficients();
+    debug_assert!(
+        coeffs.len() <= n_coeffs,
+        "round polynomial degree {} exceeds declared bound {}",
+        coeffs.len().saturating_sub(1),
+        n_coeffs - 1
+    );
+    for i in 0..n_coeffs {
+        transcript.observe(coeffs.get(i).copied().unwrap_or_else(F::zero));
+    }
+}
+
+/// Read one round polynomial (`n_coeffs` coefficients) back out of the NARG and check round
+/// consistency `s(0) + s(1) == running`; returns the reconstructed polynomial.
+fn read_and_check_round<F, T>(
     transcript: &mut T,
-) -> (SumcheckProof<F>, Vec<F>)
+    n_coeffs: usize,
+    running: F,
+    round: usize,
+    num_vars: usize,
+) -> Result<UnivariatePoly<F>, SumcheckError<F>>
+where
+    F: Field,
+    T: VerifierFs<F>,
+{
+    let coeffs = transcript
+        .read_coeffs(n_coeffs)
+        .ok_or(SumcheckError::WrongNumberOfRounds {
+            expected: num_vars,
+            got: round,
+        })?;
+    let poly = UnivariatePoly::new(coeffs);
+    let sum = poly.evaluate(F::zero()) + poly.evaluate(F::one());
+    if sum != running {
+        return Err(SumcheckError::RoundCheckFailed {
+            round,
+            expected: running,
+            actual: sum,
+        });
+    }
+    Ok(poly)
+}
+
+/// Drive a single sumcheck instance to completion, writing each round polynomial into the NARG
+/// and returning the squeezed challenge point. Reads the input claim from `accumulator`, then
+/// caches output openings.
+pub fn prove<F, I, T>(instance: &mut I, accumulator: &mut Openings<F>, transcript: &mut T) -> Vec<F>
 where
     F: Field,
     I: SumcheckInstance<F>,
-    T: Transcript<Challenge = F>,
+    T: ProverFs<F>,
 {
     let n = instance.num_rounds();
+    let n_coeffs = instance.degree() + 1;
     let mut claim = instance.input_claim(&*accumulator);
-    let mut round_polynomials = Vec::with_capacity(n);
     let mut challenges = Vec::with_capacity(n);
 
     for round in 0..n {
         let poly = instance.compute_message(round, claim);
-        <UnivariatePoly<F> as RoundProof<F>>::append_to_transcript(&poly, transcript);
+        write_round_poly(transcript, &poly, n_coeffs);
         let r = transcript.challenge();
         instance.bind(r, round);
         claim = poly.evaluate(r);
         challenges.push(r);
-        round_polynomials.push(poly);
     }
 
     instance.cache_openings(accumulator, &challenges);
-    (SumcheckProof { round_polynomials }, challenges)
+    challenges
 }
 
-/// Verify a single-instance proof via the workspace verifier, returning the reduced evaluation
-/// claim `g(r) = v`. The caller discharges `v` against [`SumcheckInstance::expected_output_claim`]
-/// (and, later, the opening accumulator).
+/// Verify a single-instance proof by replaying the round loop over the verifier's NARG, returning
+/// the reduced evaluation claim `g(r) = v`. The caller discharges `v` against
+/// [`SumcheckInstance::expected_output_claim`] (and the opening accumulator).
 pub fn verify<F, T>(
     claim: &SumcheckClaim<F>,
-    proof: &SumcheckProof<F>,
     transcript: &mut T,
 ) -> Result<EvaluationClaim<F>, SumcheckError<F>>
 where
     F: Field,
-    T: Transcript<Challenge = F>,
+    T: VerifierFs<F>,
 {
-    SumcheckVerifier::verify(claim, &proof.round_polynomials, transcript)
+    let n_coeffs = claim.degree + 1;
+    let mut running = claim.claimed_sum;
+    let mut challenges = Vec::with_capacity(claim.num_vars);
+
+    for round in 0..claim.num_vars {
+        let poly = read_and_check_round(transcript, n_coeffs, running, round, claim.num_vars)?;
+        let r = transcript.challenge();
+        running = poly.evaluate(r);
+        challenges.push(r);
+    }
+
+    Ok(EvaluationClaim {
+        point: challenges,
+        value: running,
+    })
 }
 
 /// Drive a **front-loaded batched** sumcheck over many instances of (possibly) differing round
-/// counts and degrees, emitting a proof the workspace [`BatchedSumcheckVerifier`] accepts. Mirrors
-/// jolt-core `BatchedSumcheck::prove` (non-ZK), retargeted to the lean field/transcript.
+/// counts and degrees. Mirrors jolt-core `BatchedSumcheck::prove` (non-ZK).
 ///
-/// Transcript order (must match [`BatchedSumcheckVerifier`]): absorb each instance's `input_claim`
-/// in order, squeeze the batching challenge `α`, then per round absorb the combined round polynomial
-/// and squeeze the round challenge. Batching coefficients are `α^j` (NOT jolt-core's independent
-/// `challenge_vector` — the workspace verifier uses the running power, so the prover matches it).
+/// Transcript order: observe each instance's `input_claim` into the NARG, squeeze the batching
+/// challenge `α`, then per round write the combined round polynomial and squeeze the round
+/// challenge. Batching coefficients are `α^j` (the running power).
 ///
 /// Front-loading: instance `j` is active in rounds `[offset_j, offset_j + num_rounds_j)` with
 /// `offset_j = round_offset(max)` (default `max − num_rounds_j`); in its gap rounds it contributes a
 /// constant dummy `claim_j / 2` (so `H(0)+H(1) = claim_j`), and its claim is pre-scaled by
 /// `2^{max − num_rounds_j}` so it equals the true `input_claim` at activation.
 ///
-/// Returns `(proof, challenges, batching_coeffs)` — `challenges` has length `max_num_rounds`;
+/// Returns `(challenges, batching_coeffs)` — `challenges` has length `max_num_rounds`;
 /// `batching_coeffs[j] = α^j`. The verifier reduces to `Σ_j α^j · expected_output_claim_j` at each
 /// instance's `challenges[offset_j .. offset_j + num_rounds_j]` slice.
 #[expect(
@@ -140,24 +197,27 @@ pub fn prove_batched<F, T>(
     mut instances: Vec<&mut dyn SumcheckInstance<F>>,
     accumulator: &mut Openings<F>,
     transcript: &mut T,
-) -> (SumcheckProof<F>, Vec<F>, Vec<F>)
+) -> (Vec<F>, Vec<F>)
 where
     F: Field,
-    T: Transcript<Challenge = F>,
+    T: ProverFs<F>,
 {
     assert!(
         !instances.is_empty(),
         "batched sumcheck needs at least one instance"
     );
     let max_num_rounds = instances.iter().map(|s| s.num_rounds()).max().unwrap();
+    let max_degree = instances.iter().map(|s| s.degree()).max().unwrap();
+    let n_coeffs = max_degree + 1;
 
-    // Fiat-Shamir: absorb input claims (BatchedSumcheckVerifier order), squeeze α.
+    // Fiat-Shamir: observe input claims into the NARG, squeeze α. A wrong claim desyncs the
+    // verifier's round-0 `s(0)+s(1) == combined_sum` check (combined_sum uses the true claims).
     let input_claims: Vec<F> = instances
         .iter()
         .map(|s| s.input_claim(&*accumulator))
         .collect();
     for c in &input_claims {
-        c.append_to_transcript(transcript);
+        transcript.observe(*c);
     }
     let alpha: F = transcript.challenge();
     let mut batching_coeffs = Vec::with_capacity(instances.len());
@@ -175,7 +235,6 @@ where
         .collect();
 
     let two_inv = F::from_u64(2).inverse().unwrap();
-    let mut round_polynomials = Vec::with_capacity(max_num_rounds);
     let mut challenges = Vec::with_capacity(max_num_rounds);
 
     for round in 0..max_num_rounds {
@@ -199,7 +258,7 @@ where
             batched += &(poly * coeff);
         }
 
-        <UnivariatePoly<F> as RoundProof<F>>::append_to_transcript(&batched, transcript);
+        write_round_poly(transcript, &batched, n_coeffs);
         let r = transcript.challenge();
         challenges.push(r);
 
@@ -213,7 +272,6 @@ where
                 s.bind(r, round - offset);
             }
         }
-        round_polynomials.push(batched);
     }
 
     for s in &mut instances {
@@ -225,30 +283,24 @@ where
         s.cache_openings(accumulator, r_slice);
     }
 
-    (
-        SumcheckProof { round_polynomials },
-        challenges,
-        batching_coeffs,
-    )
+    (challenges, batching_coeffs)
 }
 
 /// Verify a batched proof, returning the combined reduced claim `{point, value}` **and** the
 /// batching coefficients `α^j`. The caller discharges `value` against
 /// `Σ_j α^j · expected_output_claim_j` at each instance's challenge slice — so it needs the `α^j`.
 ///
-/// This inlines the [`BatchedSumcheckVerifier`] front-loaded combination (absorb the claimed sums →
-/// squeeze `α` → scale each by `2^{max−n_j}` → combine with `α^j`) *verbatim*, then delegates the
-/// actual sumcheck check to the workspace single-instance [`SumcheckVerifier`]. Reimplemented (rather
-/// than calling `BatchedSumcheckVerifier::verify`) solely to expose the `α^j` the caller needs;
-/// the Fiat-Shamir order + scaling are identical, so the proof is the same one `prove_batched` emits.
+/// Reads the prover's observed input claims back out of the NARG (to keep the sponge in lockstep),
+/// then squeezes `α`, scales each *known* claim by `2^{max−n_j}`, combines with `α^j`, and replays
+/// the round loop on the combined claim. The combined sum uses the passed-in (true) claims, so a
+/// prover that observed a wrong claim is caught at round 0.
 pub fn verify_batched<F, T>(
     claims: &[SumcheckClaim<F>],
-    proof: &SumcheckProof<F>,
     transcript: &mut T,
 ) -> Result<(EvaluationClaim<F>, Vec<F>), SumcheckError<F>>
 where
     F: Field,
-    T: Transcript<Challenge = F>,
+    T: VerifierFs<F>,
 {
     let (first, rest) = claims.split_first().ok_or(SumcheckError::EmptyClaims)?;
     let max_num_vars = rest
@@ -256,9 +308,11 @@ where
         .fold(first.num_vars, |acc, c| acc.max(c.num_vars));
     let max_degree = rest.iter().fold(first.degree, |acc, c| acc.max(c.degree));
 
-    for claim in claims {
-        claim.claimed_sum.append_to_transcript(transcript);
-    }
+    // Advance the sponge over the prover's observed input claims (values discarded — the
+    // combined sum below is computed from the verifier's own claims).
+    let _claims = transcript
+        .read_coeffs(claims.len())
+        .ok_or(SumcheckError::EmptyClaims)?;
     let alpha: F = transcript.challenge();
 
     let mut batching_coeffs = Vec::with_capacity(claims.len());
@@ -271,40 +325,51 @@ where
         power *= alpha;
     }
 
-    let combined_claim = SumcheckClaim {
-        num_vars: max_num_vars,
-        degree: max_degree,
-        claimed_sum: combined_sum,
-    };
-    let eval = SumcheckVerifier::verify(&combined_claim, &proof.round_polynomials, transcript)?;
-    Ok((eval, batching_coeffs))
+    let n_coeffs = max_degree + 1;
+    let mut running = combined_sum;
+    let mut challenges = Vec::with_capacity(max_num_vars);
+    for round in 0..max_num_vars {
+        let poly = read_and_check_round(transcript, n_coeffs, running, round, max_num_vars)?;
+        let r = transcript.challenge();
+        running = poly.evaluate(r);
+        challenges.push(r);
+    }
+
+    Ok((
+        EvaluationClaim {
+            point: challenges,
+            value: running,
+        },
+        batching_coeffs,
+    ))
 }
 
 #[cfg(test)]
 #[expect(clippy::expect_used)]
 mod tests {
     use super::*;
+    use crate::field::{ProverTranscript, VerifierTranscript};
     use crate::framework::poly::MultilinearPolynomial;
-    use jolt_field::goldilocks::{Goldilocks, GoldilocksFp3};
+    use jolt_field::goldilocks::GoldilocksFp3 as F;
+    use jolt_field::Field;
     use jolt_poly::BindingOrder;
-    use jolt_transcript::Blake2bTranscript;
 
     /// Proves `Σ_x A(x)·B(x)` over two dense polynomials (degree-2 round messages).
-    struct ProductInstance<F: Field> {
+    struct ProductInstance {
         a: MultilinearPolynomial<F>,
         b: MultilinearPolynomial<F>,
         num_rounds: usize,
         claim: F,
     }
 
-    impl<F: Field> ProductInstance<F> {
+    impl ProductInstance {
         fn new(a: Vec<F>, b: Vec<F>) -> Self {
             assert_eq!(a.len(), b.len());
             let num_rounds = a.len().trailing_zeros() as usize;
             let claim = a
                 .iter()
                 .zip(b.iter())
-                .fold(F::zero(), |acc, (x, y)| acc + *x * *y);
+                .fold(F::from_u64(0), |acc, (x, y)| acc + *x * *y);
             Self {
                 a: MultilinearPolynomial::from(a),
                 b: MultilinearPolynomial::from(b),
@@ -314,7 +379,7 @@ mod tests {
         }
     }
 
-    impl<F: Field> SumcheckInstance<F> for ProductInstance<F> {
+    impl SumcheckInstance<F> for ProductInstance {
         fn num_rounds(&self) -> usize {
             self.num_rounds
         }
@@ -326,8 +391,7 @@ mod tests {
         }
         fn compute_message(&mut self, _round: usize, _previous_claim: F) -> UnivariatePoly<F> {
             let half = self.a.len() / 2;
-            // round message at points 0, 1, 2 (degree-2 product of two linear factors)
-            let evals = (0..half).fold([F::zero(); 3], |mut acc, i| {
+            let evals = (0..half).fold([F::from_u64(0); 3], |mut acc, i| {
                 let ae = self.a.sumcheck_evals_array::<3>(i, BindingOrder::LowToHigh);
                 let be = self.b.sumcheck_evals_array::<3>(i, BindingOrder::LowToHigh);
                 for k in 0..3 {
@@ -358,7 +422,7 @@ mod tests {
         }
     }
 
-    fn product_round_trip<F: Field>(seed: u64, log_len: usize) {
+    fn product_round_trip(seed: u64, log_len: usize) {
         let mut rng = Rng(seed);
         let len = 1usize << log_len;
         let a: Vec<F> = (0..len).map(|_| F::from_u64(rng.next())).collect();
@@ -369,18 +433,19 @@ mod tests {
         let input_claim = instance.input_claim(&acc);
         let degree = instance.degree();
 
-        let mut prover_t = Blake2bTranscript::<F>::new(b"framework-sumcheck-test");
-        let (proof, challenges) = prove(&mut instance, &mut acc, &mut prover_t);
+        let mut prover_t = ProverTranscript::new("framework-sumcheck-test");
+        let challenges = prove(&mut instance, &mut acc, &mut prover_t);
         let output = instance.expected_output_claim(&acc, &challenges);
+        let proof = prover_t.into_proof();
 
         let claim = SumcheckClaim {
             num_vars: log_len,
             degree,
             claimed_sum: input_claim,
         };
-        let mut verifier_t = Blake2bTranscript::<F>::new(b"framework-sumcheck-test");
+        let mut verifier_t = VerifierTranscript::new("framework-sumcheck-test", &proof);
         let EvaluationClaim { point, value } =
-            verify(&claim, &proof, &mut verifier_t).expect("proof must verify");
+            verify(&claim, &mut verifier_t).expect("proof must verify");
 
         assert_eq!(
             point, challenges,
@@ -390,56 +455,46 @@ mod tests {
     }
 
     #[test]
-    fn product_sumcheck_round_trip_goldilocks() {
-        for log_len in 1..=8 {
-            product_round_trip::<Goldilocks>(0xD000 + log_len as u64, log_len);
-        }
-    }
-
-    #[test]
     fn product_sumcheck_round_trip_fp3() {
         for log_len in 1..=8 {
-            product_round_trip::<GoldilocksFp3>(0xE000 + log_len as u64, log_len);
+            product_round_trip(0xE000 + log_len as u64, log_len);
         }
     }
 
     #[test]
     fn tampered_proof_rejected() {
-        let mut instance = ProductInstance::<Goldilocks>::new(
-            (1..=8).map(Goldilocks::from_u64).collect(),
-            (1..=8).map(|x| Goldilocks::from_u64(x + 3)).collect(),
+        let mut instance = ProductInstance::new(
+            (1..=8).map(F::from_u64).collect(),
+            (1..=8).map(|x| F::from_u64(x + 3)).collect(),
         );
-        let mut acc = Openings::<Goldilocks>::new(3);
+        let mut acc = Openings::<F>::new(3);
         let input_claim = instance.input_claim(&acc);
-        let mut prover_t = Blake2bTranscript::<Goldilocks>::new(b"t");
-        let (mut proof, _) = prove(&mut instance, &mut acc, &mut prover_t);
-        // Corrupt the first round polynomial.
-        proof.round_polynomials[0] = UnivariatePoly::new(vec![
-            Goldilocks::from_u64(1),
-            Goldilocks::from_u64(2),
-            Goldilocks::from_u64(3),
-        ]);
+        let mut prover_t = ProverTranscript::new("t");
+        let _ = prove(&mut instance, &mut acc, &mut prover_t);
+        let mut proof = prover_t.into_proof();
+        // Corrupt the first round polynomial's bytes in the NARG.
+        proof.narg_string[0] ^= 0x01;
         let claim = SumcheckClaim {
             num_vars: 3,
             degree: 2,
             claimed_sum: input_claim,
         };
-        let mut verifier_t = Blake2bTranscript::<Goldilocks>::new(b"t");
+        let mut verifier_t = VerifierTranscript::new("t", &proof);
         assert!(
-            verify(&claim, &proof, &mut verifier_t).is_err(),
+            verify(&claim, &mut verifier_t).is_err(),
             "tampered proof must be rejected"
         );
     }
 
-    fn product_instance(rng: &mut Rng, log_len: usize) -> ProductInstance<Goldilocks> {
+    fn product_instance(rng: &mut Rng, log_len: usize) -> ProductInstance {
         let len = 1usize << log_len;
-        let a = (0..len).map(|_| Goldilocks::from_u64(rng.next())).collect();
-        let b = (0..len).map(|_| Goldilocks::from_u64(rng.next())).collect();
+        let a = (0..len).map(|_| F::from_u64(rng.next())).collect();
+        let b = (0..len).map(|_| F::from_u64(rng.next())).collect();
         ProductInstance::new(a, b)
     }
 
     /// Front-loaded batched sumcheck over three instances of differing round counts (4, 3, 2) —
-    /// exercises the gap-round dummies — round-tripped against the workspace `BatchedSumcheckVerifier`.
+    /// exercises the gap-round dummies — round-tripped over the NARG.
     #[test]
     fn batched_round_trip_with_gap_rounds() {
         let mut rng = Rng(0xBA7C);
@@ -447,7 +502,7 @@ mod tests {
         let mut i1 = product_instance(&mut rng, 3);
         let mut i2 = product_instance(&mut rng, 2);
 
-        let mut acc = Openings::<Goldilocks>::new(4);
+        let mut acc = Openings::<F>::new(4);
         let claims = vec![
             SumcheckClaim {
                 num_vars: 4,
@@ -466,14 +521,15 @@ mod tests {
             },
         ];
 
-        let mut prover_t = Blake2bTranscript::<Goldilocks>::new(b"batched");
-        let instances: Vec<&mut dyn SumcheckInstance<Goldilocks>> = vec![&mut i0, &mut i1, &mut i2];
-        let (proof, challenges, coeffs) = prove_batched(instances, &mut acc, &mut prover_t);
+        let mut prover_t = ProverTranscript::new("batched");
+        let instances: Vec<&mut dyn SumcheckInstance<F>> = vec![&mut i0, &mut i1, &mut i2];
+        let (challenges, coeffs) = prove_batched(instances, &mut acc, &mut prover_t);
         assert_eq!(challenges.len(), 4, "challenges has length max_num_rounds");
+        let proof = prover_t.into_proof();
 
-        let mut verifier_t = Blake2bTranscript::<Goldilocks>::new(b"batched");
+        let mut verifier_t = VerifierTranscript::new("batched", &proof);
         let (EvaluationClaim { point, value }, vcoeffs) =
-            verify_batched(&claims, &proof, &mut verifier_t).expect("batched proof must verify");
+            verify_batched(&claims, &mut verifier_t).expect("batched proof must verify");
         assert_eq!(
             point, challenges,
             "verifier point matches prover challenges"
@@ -483,8 +539,8 @@ mod tests {
             "verifier recomputes the prover's α^j coeffs"
         );
 
-        // Combined reduced claim = Σ_j α^j · A_j(r_slice)·B_j(r_slice) at each instance's active slice
-        // (offset_j = max − num_rounds_j: 0, 1, 2).
+        // Combined reduced claim = Σ_j α^j · A_j(r_slice)·B_j(r_slice) at each instance's active
+        // slice (offset_j = max − num_rounds_j: 0, 1, 2).
         let v0 = coeffs[0] * i0.expected_output_claim(&acc, &challenges[0..4]);
         let v1 = coeffs[1] * i1.expected_output_claim(&acc, &challenges[1..4]);
         let v2 = coeffs[2] * i2.expected_output_claim(&acc, &challenges[2..4]);
@@ -500,7 +556,7 @@ mod tests {
         let mut rng = Rng(0xBADB);
         let mut i0 = product_instance(&mut rng, 4);
         let mut i1 = product_instance(&mut rng, 3);
-        let mut acc = Openings::<Goldilocks>::new(4);
+        let mut acc = Openings::<F>::new(4);
         let claims = vec![
             SumcheckClaim {
                 num_vars: 4,
@@ -513,16 +569,15 @@ mod tests {
                 claimed_sum: i1.input_claim(&acc),
             },
         ];
-        let mut prover_t = Blake2bTranscript::<Goldilocks>::new(b"batched-t");
-        let (mut proof, _, _) = prove_batched(vec![&mut i0, &mut i1], &mut acc, &mut prover_t);
-        proof.round_polynomials[0] = UnivariatePoly::new(vec![
-            Goldilocks::from_u64(1),
-            Goldilocks::from_u64(2),
-            Goldilocks::from_u64(3),
-        ]);
-        let mut verifier_t = Blake2bTranscript::<Goldilocks>::new(b"batched-t");
+        let mut prover_t = ProverTranscript::new("batched-t");
+        let _ = prove_batched(vec![&mut i0, &mut i1], &mut acc, &mut prover_t);
+        let mut proof = prover_t.into_proof();
+        // Corrupt a round polynomial byte (past the two observed input-claim scalars).
+        let off = proof.narg_string.len() / 2;
+        proof.narg_string[off] ^= 0x01;
+        let mut verifier_t = VerifierTranscript::new("batched-t", &proof);
         assert!(
-            verify_batched(&claims, &proof, &mut verifier_t).is_err(),
+            verify_batched(&claims, &mut verifier_t).is_err(),
             "tampered batched proof must be rejected"
         );
     }

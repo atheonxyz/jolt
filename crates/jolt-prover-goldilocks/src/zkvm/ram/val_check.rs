@@ -25,9 +25,9 @@
 //! decomposition is dropped (non-ZK), and jolt-core's split-LT + two-phase materialization are
 //! perf optimizations deferred here.
 
+use crate::framework::transcript::Challenge;
 use jolt_field::{Field, FieldAccumulator};
 use jolt_poly::{BindingOrder, EqPolynomial, LtPolynomial, UnivariatePoly};
-use jolt_transcript::Transcript;
 
 use crate::framework::accumulator::{
     CommittedPolynomial, OpeningAccumulator, OpeningPoint, Openings, SumcheckId, VirtualPolynomial,
@@ -55,7 +55,7 @@ impl<F: Field> RamValCheckParams<F> {
         accumulator: &dyn OpeningAccumulator<F>,
         log_k: usize,
         initial_ram_state: &[F],
-        transcript: &mut impl Transcript<Challenge = F>,
+        transcript: &mut impl Challenge<F>,
     ) -> Self {
         let gamma = transcript.challenge();
         let (r, _) = accumulator.get_virtual_polynomial_opening(
@@ -212,10 +212,11 @@ impl<F: Field> SumcheckInstance<F> for RamValCheck<F> {
 #[expect(clippy::expect_used)]
 mod tests {
     use super::*;
+    use crate::field::{ProverTranscript, VerifierTranscript};
     use crate::framework::sumcheck::{prove, verify};
+    use crate::framework::transcript::Challenge;
     use jolt_field::goldilocks::GoldilocksFp3 as F;
     use jolt_sumcheck::{EvaluationClaim, SumcheckClaim};
-    use jolt_transcript::Blake2bTranscript;
 
     struct Rng(u64);
     impl Rng {
@@ -281,25 +282,25 @@ mod tests {
         };
 
         // Determine gamma by running params::new on a throwaway transcript primed identically.
-        let mut probe_t = Blake2bTranscript::<F>::new(b"ram-val-check");
+        let mut probe_t = ProverTranscript::new("ram-val-check");
         let gamma = {
             // params::new draws challenge first; mirror by drawing here.
-            use jolt_transcript::Transcript as _;
             probe_t.challenge()
         };
         let (mut prover_acc, s) = build_acc(gamma);
 
-        let mut prover_t = Blake2bTranscript::<F>::new(b"ram-val-check");
+        let mut prover_t = ProverTranscript::new("ram-val-check");
         let params = RamValCheckParams::new(&prover_acc, log_k, &initial_ram_state, &mut prover_t);
         assert_eq!(params.gamma, gamma, "gamma draw matches the probe");
         let input_claim = params.input_claim(&prover_acc);
         assert_eq!(input_claim, s, "input claim equals Σ inc·wa·(LT+γ)");
         let mut prover = RamValCheck::new_prover(params, inc.clone(), wa.clone());
-        let (proof, challenges) = prove(&mut prover, &mut prover_acc, &mut prover_t);
+        let challenges = prove(&mut prover, &mut prover_acc, &mut prover_t);
+        let narg = prover_t.into_proof();
 
         // Verifier
         let (mut verifier_acc, _) = build_acc(gamma);
-        let mut verifier_t = Blake2bTranscript::<F>::new(b"ram-val-check");
+        let mut verifier_t = VerifierTranscript::new("ram-val-check", &narg);
         let vparams =
             RamValCheckParams::new(&verifier_acc, log_k, &initial_ram_state, &mut verifier_t);
         let verifier = RamValCheck::new_verifier(vparams);
@@ -309,7 +310,7 @@ mod tests {
             claimed_sum: input_claim,
         };
         let EvaluationClaim { point, value } =
-            verify(&claim, &proof, &mut verifier_t).expect("val-check must verify");
+            verify(&claim, &mut verifier_t).expect("val-check must verify");
         assert_eq!(
             point, challenges,
             "verifier point matches prover challenges"
@@ -377,11 +378,8 @@ mod tests {
         let val_final = F::from_u64(rng.next());
         let r_combined: Vec<F> = [r_address.as_slice(), r_cycle.as_slice()].concat();
 
-        let mut probe_t = Blake2bTranscript::<F>::new(b"t");
-        let gamma = {
-            use jolt_transcript::Transcript as _;
-            probe_t.challenge()
-        };
+        let mut probe_t = ProverTranscript::new("t");
+        let gamma = { probe_t.challenge() };
         let s: F = (0..t).fold(F::from_u64(0), |acc, j| {
             acc + inc[j] * wa[j] * (lt_table[j] + gamma)
         });
@@ -399,26 +397,24 @@ mod tests {
             OpeningPoint::new(r_address),
             val_final,
         );
-        let mut prover_t = Blake2bTranscript::<F>::new(b"t");
+        let mut prover_t = ProverTranscript::new("t");
         let params = RamValCheckParams::new(&acc, log_k, &initial_ram_state, &mut prover_t);
         let input_claim = params.input_claim(&acc);
         let mut prover = RamValCheck::new_prover(params, inc, wa);
-        let (mut proof, _) = prove(&mut prover, &mut acc, &mut prover_t);
+        let _ = prove(&mut prover, &mut acc, &mut prover_t);
+        let mut narg = prover_t.into_proof();
 
-        proof.round_polynomials[0] = UnivariatePoly::new(vec![
-            F::from_u64(1),
-            F::from_u64(2),
-            F::from_u64(3),
-            F::from_u64(4),
-        ]);
+        narg.narg_string[0] ^= 0x01;
         let claim = SumcheckClaim {
             num_vars: log_t,
             degree: DEGREE,
             claimed_sum: input_claim,
         };
-        let mut verifier_t = Blake2bTranscript::<F>::new(b"t");
+        let mut verifier_t = VerifierTranscript::new("t", &narg);
+        // Replay the prover's pre-round γ squeeze to keep the verifier transcript aligned.
+        let _ = RamValCheckParams::new(&acc, log_k, &initial_ram_state, &mut verifier_t);
         assert!(
-            verify(&claim, &proof, &mut verifier_t).is_err(),
+            verify(&claim, &mut verifier_t).is_err(),
             "tampered proof must be rejected"
         );
     }

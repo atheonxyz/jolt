@@ -24,13 +24,13 @@
 
 use jolt_field::Field;
 use jolt_poly::EqPolynomial;
-use jolt_sumcheck::{SumcheckClaim, SumcheckProof};
-use jolt_transcript::Transcript;
+use jolt_sumcheck::SumcheckClaim;
 
 use crate::framework::accumulator::{
     CommittedPolynomial, OpeningAccumulator, OpeningPoint, Openings, SumcheckId, VirtualPolynomial,
 };
 use crate::framework::sumcheck::{prove, verify, SumcheckInstance};
+use crate::framework::transcript::{ProverFs, VerifierFs};
 use crate::zkvm::claim_reductions::{
     IncClaimReduction, IncClaimReductionParams, RamRaClaimReduction, RamRaReductionParams,
 };
@@ -59,10 +59,8 @@ pub enum MemoryStageError {
 pub struct MemoryStageProof<F: Field> {
     pub ram: RamStageProof<F>,
     pub registers: RegistersStageProof<F>,
-    pub ram_ra_reduction: SumcheckProof<F>,
     /// `RamRa` @ RamRaClaimReduction (the consolidated RAM-access opening).
     pub ram_ra_opening: F,
-    pub inc_reduction: SumcheckProof<F>,
     /// `(RamInc, RdInc)` @ IncClaimReduction (the consolidated increment openings).
     pub inc_openings: [F; 2],
 }
@@ -90,7 +88,7 @@ pub fn prove_memory<F, T>(
 ) -> MemoryStageProof<F>
 where
     F: Field,
-    T: Transcript<Challenge = F>,
+    T: ProverFs<F>,
 {
     assert_eq!(
         ram_w.log_t, reg_w.log_t,
@@ -106,7 +104,7 @@ where
     let ramra_params = RamRaReductionParams::new(log_t, ram_log_k, accumulator, transcript);
     let ra_col = ra_at_address(&ram_w.ra, &ramra_params.r_address, log_t, ram_log_k);
     let mut ramra = RamRaClaimReduction::new_prover(ramra_params, ra_col);
-    let (ram_ra_reduction, _) = prove(&mut ramra, accumulator, transcript);
+    let _ = prove(&mut ramra, accumulator, transcript);
     let ram_ra_opening = accumulator
         .get_virtual_polynomial_opening(VirtualPolynomial::RamRa, SumcheckId::RamRaClaimReduction)
         .1;
@@ -114,7 +112,7 @@ where
     // Batch the four Inc openings (RamInc@{RW,ValCheck} + RdInc@{RegistersRW,RegistersValEval}).
     let inc_params = IncClaimReductionParams::new(log_t, accumulator, transcript);
     let mut inc = IncClaimReduction::new_prover(inc_params, ram_w.inc.clone(), reg_w.inc.clone());
-    let (inc_reduction, _) = prove(&mut inc, accumulator, transcript);
+    let _ = prove(&mut inc, accumulator, transcript);
     let inc_openings = [
         accumulator
             .get_committed_polynomial_opening(
@@ -133,9 +131,7 @@ where
     MemoryStageProof {
         ram,
         registers,
-        ram_ra_reduction,
         ram_ra_opening,
-        inc_reduction,
         inc_openings,
     }
 }
@@ -158,7 +154,7 @@ pub fn verify_memory<F, T>(
 ) -> Result<(), MemoryStageError>
 where
     F: Field,
-    T: Transcript<Challenge = F>,
+    T: VerifierFs<F>,
 {
     verify_ram(
         &proof.ram,
@@ -185,7 +181,6 @@ where
             degree: RAM_RA_REDUCTION_DEGREE,
             claimed_sum: ramra_input,
         },
-        &proof.ram_ra_reduction,
         transcript,
     )
     .map_err(|_| MemoryStageError::Sumcheck)?;
@@ -211,7 +206,6 @@ where
             degree: INC_REDUCTION_DEGREE,
             claimed_sum: inc_input,
         },
-        &proof.inc_reduction,
         transcript,
     )
     .map_err(|_| MemoryStageError::Sumcheck)?;
@@ -239,11 +233,11 @@ where
 #[expect(clippy::expect_used)]
 mod tests {
     use super::*;
+    use crate::field::{ProverTranscript, VerifierTranscript};
     use crate::zkvm::r1cs_witness::tests_support::MockCycle;
     use crate::zkvm::ram::witness::ram_witness;
     use crate::zkvm::registers::witness::register_witness;
     use jolt_field::goldilocks::GoldilocksFp3 as F;
-    use jolt_transcript::Blake2bTranscript;
 
     /// A trace exercising both register writes/reads AND RAM loads/stores in the same cycles.
     fn sample_trace() -> Vec<MockCycle> {
@@ -278,7 +272,7 @@ mod tests {
         let (unmap, val_io, io_mask) = public_columns(ram_w.log_k);
 
         let mut prover_acc = Openings::<F>::new(ram_w.log_t);
-        let mut prover_t = Blake2bTranscript::<F>::new(b"memory-stage");
+        let mut prover_t = ProverTranscript::new("memory-stage");
         let proof = prove_memory(
             &ram_w,
             &reg_w,
@@ -288,9 +282,10 @@ mod tests {
             &mut prover_acc,
             &mut prover_t,
         );
+        let narg = prover_t.into_proof();
 
         let mut verifier_acc = Openings::<F>::new(ram_w.log_t);
-        let mut verifier_t = Blake2bTranscript::<F>::new(b"memory-stage");
+        let mut verifier_t = VerifierTranscript::new("memory-stage", &narg);
         verify_memory(
             &proof,
             ram_w.log_t,
@@ -313,7 +308,7 @@ mod tests {
         let (unmap, val_io, io_mask) = public_columns(ram_w.log_k);
 
         let mut prover_acc = Openings::<F>::new(ram_w.log_t);
-        let mut prover_t = Blake2bTranscript::<F>::new(b"memory-stage");
+        let mut prover_t = ProverTranscript::new("memory-stage");
         let mut proof = prove_memory(
             &ram_w,
             &reg_w,
@@ -323,11 +318,12 @@ mod tests {
             &mut prover_acc,
             &mut prover_t,
         );
+        let narg = prover_t.into_proof();
         // Corrupt the consolidated RdInc(ρ) opening → IncClaimReduction output-claim check fails.
         proof.inc_openings[1] += F::from_u64(1);
 
         let mut verifier_acc = Openings::<F>::new(ram_w.log_t);
-        let mut verifier_t = Blake2bTranscript::<F>::new(b"memory-stage");
+        let mut verifier_t = VerifierTranscript::new("memory-stage", &narg);
         assert!(
             verify_memory(
                 &proof,

@@ -19,9 +19,9 @@
 //! `ra(r_address, ·)` column is taken pre-materialized (`Fp3`), decoupling from the trace → RAM
 //! address-remap extraction (M8).
 
+use crate::framework::transcript::Challenge;
 use jolt_field::{Field, FieldAccumulator};
 use jolt_poly::{BindingOrder, EqPolynomial, UnivariatePoly};
-use jolt_transcript::Transcript;
 
 use crate::framework::accumulator::{
     OpeningAccumulator, OpeningPoint, Openings, SumcheckId, VirtualPolynomial, BIG_ENDIAN,
@@ -54,7 +54,7 @@ impl<F: Field> RamRaReductionParams<F> {
         log_t: usize,
         log_k: usize,
         accumulator: &dyn OpeningAccumulator<F>,
-        transcript: &mut impl Transcript<Challenge = F>,
+        transcript: &mut impl Challenge<F>,
     ) -> Self {
         let (r_raf, claim_raf) = accumulator
             .get_virtual_polynomial_opening(VirtualPolynomial::RamRa, SumcheckId::RamRafEvaluation);
@@ -215,10 +215,10 @@ impl<F: Field> SumcheckInstance<F> for RamRaClaimReduction<F> {
 #[expect(clippy::expect_used)]
 mod tests {
     use super::*;
+    use crate::field::{ProverTranscript, VerifierTranscript};
     use crate::framework::sumcheck::{prove, verify};
     use jolt_field::goldilocks::GoldilocksFp3 as F;
     use jolt_sumcheck::{EvaluationClaim, SumcheckClaim};
-    use jolt_transcript::Blake2bTranscript;
 
     struct Rng(u64);
     impl Rng {
@@ -280,15 +280,16 @@ mod tests {
 
         let mut prover_acc = Openings::<F>::new(log_t);
         seed_both(&mut prover_acc);
-        let mut prover_t = Blake2bTranscript::<F>::new(b"ram-ra-claim-reduction");
+        let mut prover_t = ProverTranscript::new("ram-ra-claim-reduction");
         let params = RamRaReductionParams::new(log_t, log_k, &prover_acc, &mut prover_t);
         let input_claim = params.input_claim();
         let mut prover = RamRaClaimReduction::new_prover(params.clone(), ra.clone());
-        let (proof, challenges) = prove(&mut prover, &mut prover_acc, &mut prover_t);
+        let challenges = prove(&mut prover, &mut prover_acc, &mut prover_t);
+        let narg = prover_t.into_proof();
 
         let mut verifier_acc = Openings::<F>::new(log_t);
         seed_both(&mut verifier_acc);
-        let mut verifier_t = Blake2bTranscript::<F>::new(b"ram-ra-claim-reduction");
+        let mut verifier_t = VerifierTranscript::new("ram-ra-claim-reduction", &narg);
         let vparams = RamRaReductionParams::new(log_t, log_k, &verifier_acc, &mut verifier_t);
         let verifier = RamRaClaimReduction::new_verifier(vparams);
         let claim = SumcheckClaim {
@@ -297,7 +298,7 @@ mod tests {
             claimed_sum: input_claim,
         };
         let EvaluationClaim { point, value } =
-            verify(&claim, &proof, &mut verifier_t).expect("ram ra reduction must verify");
+            verify(&claim, &mut verifier_t).expect("ram ra reduction must verify");
         assert_eq!(
             point, challenges,
             "verifier point matches prover challenges"
@@ -360,10 +361,10 @@ mod tests {
                 (&SumcheckId::RamValCheck, &r_cycle_val),
             ],
         );
-        let mut prover_t = Blake2bTranscript::<F>::new(b"ram-ra-claim-reduction");
+        let mut prover_t = ProverTranscript::new("ram-ra-claim-reduction");
         let params = RamRaReductionParams::new(log_t, log_k, &prover_acc, &mut prover_t);
         let mut prover = RamRaClaimReduction::new_prover(params.clone(), ra);
-        let (_, challenges) = prove(&mut prover, &mut prover_acc, &mut prover_t);
+        let challenges = prove(&mut prover, &mut prover_acc, &mut prover_t);
 
         let verifier = RamRaClaimReduction::new_verifier(params);
         let (_, ra_rho) = prover_acc.get_virtual_polynomial_opening(

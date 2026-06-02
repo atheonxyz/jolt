@@ -4,8 +4,8 @@
 //! (the parity oracle); see [`crate::zkvm::shout_read_raf`] for the shared identity and the M5
 //! decoupling/deferral notes.
 
+use crate::framework::transcript::Challenge;
 use jolt_field::Field;
-use jolt_transcript::Transcript;
 
 use crate::framework::accumulator::{CommittedPolynomial, SumcheckId};
 
@@ -18,7 +18,7 @@ pub fn bytecode_read_raf_params<F: Field>(
     log_k_chunks: [usize; NUM_CHUNKS],
     log_t: usize,
     stages: Vec<ReadRafStage<F>>,
-    transcript: &mut impl Transcript<Challenge = F>,
+    transcript: &mut impl Challenge<F>,
 ) -> OneHotReadRafParams<F> {
     OneHotReadRafParams::new(
         CommittedPolynomial::BytecodeRa,

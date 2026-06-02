@@ -20,13 +20,13 @@
 
 use jolt_field::Field;
 use jolt_poly::EqPolynomial;
-use jolt_sumcheck::{EvaluationClaim, SumcheckClaim, SumcheckProof};
-use jolt_transcript::Transcript;
+use jolt_sumcheck::{EvaluationClaim, SumcheckClaim};
 
 use crate::framework::accumulator::{
     CommittedPolynomial, OpeningAccumulator, OpeningPoint, Openings, SumcheckId, VirtualPolynomial,
 };
 use crate::framework::sumcheck::{prove, verify, SumcheckInstance};
+use crate::framework::transcript::{ProverFs, VerifierFs};
 use crate::zkvm::claim_reductions::{RegistersClaimReduction, RegistersClaimReductionParams};
 use crate::zkvm::registers::read_write_checking::{
     RegistersReadWriteChecking, RegistersReadWriteCheckingParams,
@@ -49,20 +49,17 @@ pub enum RegistersStageError {
     ValEvaluationClaim,
 }
 
-/// The registers-stage proof: three sumcheck transcripts + the opening claims the verifier
-/// discharges (the interim SpartanOuter seeds + each stage's cached openings — the committed `RdInc`
-/// openings are PCS-opened at stage 8).
+/// The registers-stage opening claims the verifier discharges (the interim SpartanOuter seeds + each
+/// stage's cached openings — the committed `RdInc` openings are PCS-opened at stage 8). The three
+/// sumcheck round-polynomial streams live in the shared NARG, not here.
 #[derive(Clone, Debug)]
 pub struct RegistersStageProof<F: Field> {
     /// Interim SpartanOuter seeds `(RdWriteValue, Rs1Value, Rs2Value)(r_spartan)` (fork 2).
     pub spartan_seeds: [F; 3],
-    pub claim_reduction: SumcheckProof<F>,
     /// `(RdWriteValue, Rs1Value, Rs2Value)` @ RegistersClaimReduction.
     pub cr_openings: [F; 3],
-    pub rw_checking: SumcheckProof<F>,
     /// `(RegistersVal, Rs1Ra, Rs2Ra, RdWa, RdInc)` @ RegistersReadWriteChecking.
     pub rw_openings: [F; 5],
-    pub val_evaluation: SumcheckProof<F>,
     /// `(RdInc, RdWa)` @ RegistersValEvaluation.
     pub ve_openings: [F; 2],
 }
@@ -104,7 +101,7 @@ pub fn prove_registers<F, T>(
 ) -> RegistersStageProof<F>
 where
     F: Field,
-    T: Transcript<Challenge = F>,
+    T: ProverFs<F>,
 {
     let r_spartan = transcript.challenge_vector(reg.log_t);
     let eq_spartan = EqPolynomial::<F>::evals(&r_spartan, None);
@@ -123,7 +120,7 @@ where
         reg.rs1_value.clone(),
         reg.rs2_value.clone(),
     );
-    let (claim_reduction, _) = prove(&mut cr, accumulator, transcript);
+    let _ = prove(&mut cr, accumulator, transcript);
     let cr_openings = read_virtual(
         accumulator,
         SumcheckId::RegistersClaimReduction,
@@ -144,7 +141,7 @@ where
         reg.val.clone(),
         reg.inc.clone(),
     );
-    let (rw_checking, _) = prove(&mut rw, accumulator, transcript);
+    let _ = prove(&mut rw, accumulator, transcript);
     let rw_openings = [
         get_virtual(
             accumulator,
@@ -182,7 +179,7 @@ where
     let wa_col = wa_at_address(reg, &r_address.r);
     let ve_params = RegistersValEvaluationParams::new(accumulator, reg.log_k);
     let mut ve = RegistersValEvaluation::new_prover(ve_params, reg.inc.clone(), wa_col);
-    let (val_evaluation, _) = prove(&mut ve, accumulator, transcript);
+    let _ = prove(&mut ve, accumulator, transcript);
     let ve_openings = [
         get_committed(
             accumulator,
@@ -198,11 +195,8 @@ where
 
     RegistersStageProof {
         spartan_seeds,
-        claim_reduction,
         cr_openings,
-        rw_checking,
         rw_openings,
-        val_evaluation,
         ve_openings,
     }
 }
@@ -217,7 +211,7 @@ pub fn verify_registers<F, T>(
 ) -> Result<(), RegistersStageError>
 where
     F: Field,
-    T: Transcript<Challenge = F>,
+    T: VerifierFs<F>,
 {
     let r_spartan = transcript.challenge_vector(log_t);
     seed_spartan_outer(accumulator, &r_spartan, proof.spartan_seeds);
@@ -233,7 +227,6 @@ where
             degree: CLAIM_REDUCTION_DEGREE,
             claimed_sum: cr_input,
         },
-        &proof.claim_reduction,
         transcript,
     )
     .map_err(|_| RegistersStageError::Sumcheck)?;
@@ -263,7 +256,6 @@ where
             degree: RW_DEGREE,
             claimed_sum: rw_input,
         },
-        &proof.rw_checking,
         transcript,
     )
     .map_err(|_| RegistersStageError::Sumcheck)?;
@@ -312,7 +304,6 @@ where
             degree: VAL_EVAL_DEGREE,
             claimed_sum: proof.rw_openings[0],
         },
-        &proof.val_evaluation,
         transcript,
     )
     .map_err(|_| RegistersStageError::Sumcheck)?;
@@ -391,10 +382,10 @@ fn seed_virtual<F: Field>(
 #[expect(clippy::expect_used)]
 mod tests {
     use super::*;
+    use crate::field::{ProverTranscript, VerifierTranscript};
     use crate::zkvm::r1cs_witness::tests_support::MockCycle;
     use crate::zkvm::registers::witness::register_witness;
     use jolt_field::goldilocks::GoldilocksFp3 as F;
-    use jolt_transcript::Blake2bTranscript;
 
     fn sample_trace() -> Vec<MockCycle> {
         vec![
@@ -415,11 +406,12 @@ mod tests {
         let reg = register_witness::<MockCycle, F>(&trace, 8);
 
         let mut prover_acc = Openings::<F>::new(reg.log_t);
-        let mut prover_t = Blake2bTranscript::<F>::new(b"registers-stage");
+        let mut prover_t = ProverTranscript::new("registers-stage");
         let proof = prove_registers(&reg, &mut prover_acc, &mut prover_t);
+        let narg = prover_t.into_proof();
 
         let mut verifier_acc = Openings::<F>::new(reg.log_t);
-        let mut verifier_t = Blake2bTranscript::<F>::new(b"registers-stage");
+        let mut verifier_t = VerifierTranscript::new("registers-stage", &narg);
         verify_registers(
             &proof,
             reg.log_t,
@@ -435,13 +427,14 @@ mod tests {
         let trace = sample_trace();
         let reg = register_witness::<MockCycle, F>(&trace, 8);
         let mut prover_acc = Openings::<F>::new(reg.log_t);
-        let mut prover_t = Blake2bTranscript::<F>::new(b"registers-stage");
+        let mut prover_t = ProverTranscript::new("registers-stage");
         let mut proof = prove_registers(&reg, &mut prover_acc, &mut prover_t);
+        let narg = prover_t.into_proof();
         // Corrupt the cached RegistersVal opening (rw_openings[0]) → the read-write claim check fails.
         proof.rw_openings[0] += F::from_u64(1);
 
         let mut verifier_acc = Openings::<F>::new(reg.log_t);
-        let mut verifier_t = Blake2bTranscript::<F>::new(b"registers-stage");
+        let mut verifier_t = VerifierTranscript::new("registers-stage", &narg);
         assert!(
             verify_registers(
                 &proof,

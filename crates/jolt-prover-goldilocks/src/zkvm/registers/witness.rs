@@ -124,6 +124,7 @@ pub fn register_witness<C: CycleRow, F: Field>(
 #[expect(clippy::expect_used)]
 mod tests {
     use super::*;
+    use crate::field::{ProverTranscript, VerifierTranscript};
     use crate::framework::accumulator::{
         OpeningAccumulator, OpeningPoint, Openings, SumcheckId, VirtualPolynomial,
     };
@@ -135,7 +136,6 @@ mod tests {
     use jolt_field::goldilocks::GoldilocksFp3 as F;
     use jolt_poly::EqPolynomial;
     use jolt_sumcheck::{EvaluationClaim, SumcheckClaim};
-    use jolt_transcript::{Blake2bTranscript, Transcript};
 
     const DEGREE: usize = 3;
 
@@ -216,7 +216,7 @@ mod tests {
 
         let mut prover_acc = Openings::<F>::new(w.log_t);
         seed(&mut prover_acc);
-        let mut prover_t = Blake2bTranscript::<F>::new(b"reg-witness-rw");
+        let mut prover_t = ProverTranscript::new("reg-witness-rw");
         let params = RegistersReadWriteCheckingParams::new(&prover_acc, w.log_k, &mut prover_t);
         // input_claim = rd_wv + γ·rs1 + γ²·rs2 (the private params method is module-local).
         let input_claim = rd_wv + params.gamma * (rs1 + params.gamma * rs2);
@@ -228,11 +228,12 @@ mod tests {
             w.val.clone(),
             w.inc.clone(),
         );
-        let (proof, challenges) = prove(&mut prover, &mut prover_acc, &mut prover_t);
+        let challenges = prove(&mut prover, &mut prover_acc, &mut prover_t);
+        let narg = prover_t.into_proof();
 
         let mut verifier_acc = Openings::<F>::new(w.log_t);
         seed(&mut verifier_acc);
-        let mut verifier_t = Blake2bTranscript::<F>::new(b"reg-witness-rw");
+        let mut verifier_t = VerifierTranscript::new("reg-witness-rw", &narg);
         let vparams =
             RegistersReadWriteCheckingParams::new(&verifier_acc, w.log_k, &mut verifier_t);
         let verifier = RegistersReadWriteChecking::new_verifier(vparams);
@@ -241,7 +242,7 @@ mod tests {
             degree: DEGREE,
             claimed_sum: input_claim,
         };
-        let EvaluationClaim { point, value } = verify(&claim, &proof, &mut verifier_t)
+        let EvaluationClaim { point, value } = verify(&claim, &mut verifier_t)
             .expect("materialized register witness must satisfy read-write-checking");
         assert_eq!(point, challenges);
 

@@ -19,9 +19,9 @@
 //! The five shift openings are cached under [`SumcheckId::SpartanShift`]; the flag-carrying
 //! `VirtualPolynomial` variants jolt-core keys them with are mapped to distinct existing variants.
 
+use crate::framework::transcript::Challenge;
 use jolt_field::{Field, FieldAccumulator};
 use jolt_poly::{BindingOrder, EqPlusOnePolynomial, UnivariatePoly};
-use jolt_transcript::Transcript;
 
 use crate::framework::accumulator::{OpeningAccumulator, Openings, SumcheckId, VirtualPolynomial};
 use crate::framework::poly::MultilinearPolynomial;
@@ -56,7 +56,7 @@ impl<F: Field> SpartanShiftParams<F> {
     pub fn new(
         accumulator: &dyn OpeningAccumulator<F>,
         log_t: usize,
-        transcript: &mut impl Transcript<Challenge = F>,
+        transcript: &mut impl Challenge<F>,
     ) -> Self {
         let gamma = transcript.challenge();
         let mut gp = [F::one(); 5];
@@ -220,11 +220,11 @@ impl<F: Field> SumcheckInstance<F> for SpartanShift<F> {
 #[expect(clippy::expect_used)]
 mod tests {
     use super::*;
+    use crate::field::{ProverTranscript, VerifierTranscript};
     use crate::framework::accumulator::OpeningPoint;
     use crate::framework::sumcheck::{prove, verify};
     use jolt_field::goldilocks::GoldilocksFp3 as F;
     use jolt_sumcheck::{EvaluationClaim, SumcheckClaim};
-    use jolt_transcript::Blake2bTranscript;
 
     struct Rng(u64);
     impl Rng {
@@ -304,15 +304,16 @@ mod tests {
 
         let mut prover_acc = Openings::<F>::new(log_t);
         seed_acc(&mut prover_acc);
-        let mut prover_t = Blake2bTranscript::<F>::new(b"spartan-shift");
+        let mut prover_t = ProverTranscript::new("spartan-shift");
         let params = SpartanShiftParams::new(&prover_acc, log_t, &mut prover_t);
         let input_claim = params.input_claim(&prover_acc);
         let mut prover = SpartanShift::new_prover(params, shift_cols.clone());
-        let (proof, challenges) = prove(&mut prover, &mut prover_acc, &mut prover_t);
+        let challenges = prove(&mut prover, &mut prover_acc, &mut prover_t);
+        let narg = prover_t.into_proof();
 
         let mut verifier_acc = Openings::<F>::new(log_t);
         seed_acc(&mut verifier_acc);
-        let mut verifier_t = Blake2bTranscript::<F>::new(b"spartan-shift");
+        let mut verifier_t = VerifierTranscript::new("spartan-shift", &narg);
         let vparams = SpartanShiftParams::new(&verifier_acc, log_t, &mut verifier_t);
         let verifier = SpartanShift::new_verifier(vparams);
         let claim = SumcheckClaim {
@@ -321,7 +322,7 @@ mod tests {
             claimed_sum: input_claim,
         };
         let EvaluationClaim { point, value } =
-            verify(&claim, &proof, &mut verifier_t).expect("spartan shift must verify");
+            verify(&claim, &mut verifier_t).expect("spartan shift must verify");
         assert_eq!(
             point, challenges,
             "verifier point matches prover challenges"
@@ -398,21 +399,23 @@ mod tests {
             F::from_u64(1) - term4,
         );
 
-        let mut prover_t = Blake2bTranscript::<F>::new(b"t");
+        let mut prover_t = ProverTranscript::new("t");
         let params = SpartanShiftParams::new(&acc, log_t, &mut prover_t);
         let input_claim = params.input_claim(&acc);
         let mut prover = SpartanShift::new_prover(params, shift_cols);
-        let (mut proof, _) = prove(&mut prover, &mut acc, &mut prover_t);
-        proof.round_polynomials[0] =
-            UnivariatePoly::new(vec![F::from_u64(1), F::from_u64(2), F::from_u64(3)]);
+        let _ = prove(&mut prover, &mut acc, &mut prover_t);
+        let mut narg = prover_t.into_proof();
+        narg.narg_string[0] ^= 0x01;
         let claim = SumcheckClaim {
             num_vars: log_t,
             degree: DEGREE,
             claimed_sum: input_claim,
         };
-        let mut verifier_t = Blake2bTranscript::<F>::new(b"t");
+        let mut verifier_t = VerifierTranscript::new("t", &narg);
+        // Replay the prover's pre-round γ squeeze to keep the verifier transcript aligned.
+        let _ = SpartanShiftParams::new(&acc, log_t, &mut verifier_t);
         assert!(
-            verify(&claim, &proof, &mut verifier_t).is_err(),
+            verify(&claim, &mut verifier_t).is_err(),
             "tampered proof must be rejected"
         );
     }

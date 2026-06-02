@@ -14,8 +14,8 @@
 //! materialization (multi-table selection + operand prefixes giving the full `(k,j)` value), which
 //! here is modeled as opaque address-only per-stage `Val_s(k)` columns — the M8 witness-gen layer.
 
+use crate::framework::transcript::Challenge;
 use jolt_field::Field;
-use jolt_transcript::Transcript;
 
 use crate::framework::accumulator::{CommittedPolynomial, SumcheckId};
 
@@ -29,7 +29,7 @@ pub fn instruction_read_raf_params<F: Field>(
     log_k_chunks: [usize; NUM_CHUNKS],
     log_t: usize,
     stages: Vec<ReadRafStage<F>>,
-    transcript: &mut impl Transcript<Challenge = F>,
+    transcript: &mut impl Challenge<F>,
 ) -> OneHotReadRafParams<F> {
     OneHotReadRafParams::new(
         CommittedPolynomial::InstructionRa,

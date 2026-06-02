@@ -29,9 +29,9 @@
 //! flag/lookup-table-specific `Val_s` construction (incl. multi-table selection and the wide-limb
 //! range-check stages that fold in here per design §4.2), and the d-chunk one-hot *commitment*.
 
+use crate::framework::transcript::Challenge;
 use jolt_field::{Field, FieldAccumulator};
 use jolt_poly::{BindingOrder, EqPolynomial, UnivariatePoly};
-use jolt_transcript::Transcript;
 
 use crate::framework::accumulator::{
     CommittedPolynomial, OpeningAccumulator, OpeningPoint, Openings, SumcheckId, VirtualPolynomial,
@@ -77,7 +77,7 @@ impl<F: Field> OneHotReadRafParams<F> {
         log_k_chunks: [usize; NUM_CHUNKS],
         log_t: usize,
         stages: Vec<ReadRafStage<F>>,
-        transcript: &mut impl Transcript<Challenge = F>,
+        transcript: &mut impl Challenge<F>,
     ) -> Self {
         let gamma = transcript.challenge();
         let mut gamma_powers = Vec::with_capacity(stages.len());
@@ -280,10 +280,10 @@ impl<F: Field> SumcheckInstance<F> for OneHotReadRaf<F> {
 #[expect(clippy::expect_used)]
 mod tests {
     use super::*;
+    use crate::field::{ProverTranscript, VerifierTranscript};
     use crate::framework::sumcheck::{prove, verify};
     use jolt_field::goldilocks::GoldilocksFp3 as F;
     use jolt_sumcheck::{EvaluationClaim, SumcheckClaim};
-    use jolt_transcript::{Blake2bTranscript, Transcript};
 
     struct Rng(u64);
     impl Rng {
@@ -399,7 +399,7 @@ mod tests {
 
         let mut prover_acc = Openings::<F>::new(log_t);
         seed_acc(&mut prover_acc);
-        let mut prover_t = Blake2bTranscript::<F>::new(b"shout-read-raf");
+        let mut prover_t = ProverTranscript::new("shout-read-raf");
         let params = OneHotReadRafParams::new(
             cfg.family,
             cfg.sumcheck_id,
@@ -410,11 +410,12 @@ mod tests {
         );
         let input_claim = params.input_claim(&prover_acc);
         let mut prover = OneHotReadRaf::new_prover(params, [ra0.clone(), ra1.clone()]);
-        let (proof, challenges) = prove(&mut prover, &mut prover_acc, &mut prover_t);
+        let challenges = prove(&mut prover, &mut prover_acc, &mut prover_t);
+        let narg = prover_t.into_proof();
 
         let mut verifier_acc = Openings::<F>::new(log_t);
         seed_acc(&mut verifier_acc);
-        let mut verifier_t = Blake2bTranscript::<F>::new(b"shout-read-raf");
+        let mut verifier_t = VerifierTranscript::new("shout-read-raf", &narg);
         let vparams = OneHotReadRafParams::new(
             cfg.family,
             cfg.sumcheck_id,
@@ -430,7 +431,7 @@ mod tests {
             claimed_sum: input_claim,
         };
         let EvaluationClaim { point, value } =
-            verify(&claim, &proof, &mut verifier_t).expect("shout read-raf must verify");
+            verify(&claim, &mut verifier_t).expect("shout read-raf must verify");
         assert_eq!(
             point, challenges,
             "verifier point matches prover challenges"
@@ -504,33 +505,38 @@ mod tests {
                 rv,
             );
         }
-        let mut prover_t = Blake2bTranscript::<F>::new(b"t");
+        let mut prover_t = ProverTranscript::new("t");
         let params = OneHotReadRafParams::new(
             cfg.family,
             cfg.sumcheck_id,
             [log_k0, log_k1],
             log_t,
-            stages,
+            stages.clone(),
             &mut prover_t,
         );
         let input_claim = params.input_claim(&acc);
         let mut prover = OneHotReadRaf::new_prover(params, [ra0, ra1]);
-        let (mut proof, _) = prove(&mut prover, &mut acc, &mut prover_t);
+        let _ = prove(&mut prover, &mut acc, &mut prover_t);
+        let mut narg = prover_t.into_proof();
 
-        proof.round_polynomials[0] = UnivariatePoly::new(vec![
-            F::from_u64(1),
-            F::from_u64(2),
-            F::from_u64(3),
-            F::from_u64(4),
-        ]);
+        narg.narg_string[0] ^= 0x01;
         let claim = SumcheckClaim {
             num_vars: log_k0 + log_k1 + log_t,
             degree: DEGREE,
             claimed_sum: input_claim,
         };
-        let mut verifier_t = Blake2bTranscript::<F>::new(b"t");
+        let mut verifier_t = VerifierTranscript::new("t", &narg);
+        // Replay the prover's pre-round γ squeeze to keep the verifier transcript aligned.
+        let _ = OneHotReadRafParams::new(
+            cfg.family,
+            cfg.sumcheck_id,
+            [log_k0, log_k1],
+            log_t,
+            stages,
+            &mut verifier_t,
+        );
         assert!(
-            verify(&claim, &proof, &mut verifier_t).is_err(),
+            verify(&claim, &mut verifier_t).is_err(),
             "tampered proof must be rejected"
         );
     }

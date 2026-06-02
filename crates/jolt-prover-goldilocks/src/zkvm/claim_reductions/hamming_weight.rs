@@ -19,9 +19,9 @@
 //! the `RamHammingWeight` opening for RAM. The `G_i` columns are taken pre-materialized (`Fp3`),
 //! decoupling from the trace → `compute_all_G` pushforward (M8). Single instance (no prefix/suffix).
 
+use crate::framework::transcript::Challenge;
 use jolt_field::{Field, FieldAccumulator};
 use jolt_poly::{BindingOrder, EqPolynomial, UnivariatePoly};
-use jolt_transcript::Transcript;
 
 use crate::framework::accumulator::{
     CommittedPolynomial, OpeningAccumulator, OpeningPoint, Openings, SumcheckId, VirtualPolynomial,
@@ -81,7 +81,7 @@ impl<F: Field> HammingWeightClaimReductionParams<F> {
         counts: FamilyCounts,
         log_k_chunk: usize,
         accumulator: &dyn OpeningAccumulator<F>,
-        transcript: &mut impl Transcript<Challenge = F>,
+        transcript: &mut impl Challenge<F>,
     ) -> Self {
         let polynomial_types = counts.polynomial_types();
         let n = polynomial_types.len();
@@ -286,10 +286,10 @@ impl<F: Field> SumcheckInstance<F> for HammingWeightClaimReduction<F> {
 #[expect(clippy::expect_used)]
 mod tests {
     use super::*;
+    use crate::field::{ProverTranscript, VerifierTranscript};
     use crate::framework::sumcheck::{prove, verify};
     use jolt_field::goldilocks::GoldilocksFp3 as F;
     use jolt_sumcheck::{EvaluationClaim, SumcheckClaim};
-    use jolt_transcript::Blake2bTranscript;
 
     struct Rng(u64);
     impl Rng {
@@ -405,16 +405,17 @@ mod tests {
 
         let mut prover_acc = Openings::<F>::new(log_t);
         seed_acc(&mut prover_acc);
-        let mut prover_t = Blake2bTranscript::<F>::new(b"hamming-weight-claim-reduce");
+        let mut prover_t = ProverTranscript::new("hamming-weight-claim-reduce");
         let params =
             HammingWeightClaimReductionParams::new(counts, log_k_chunk, &prover_acc, &mut prover_t);
         let input_claim = params.input_claim();
         let mut prover = HammingWeightClaimReduction::new_prover(params.clone(), g_cols.clone());
-        let (proof, challenges) = prove(&mut prover, &mut prover_acc, &mut prover_t);
+        let challenges = prove(&mut prover, &mut prover_acc, &mut prover_t);
+        let narg = prover_t.into_proof();
 
         let mut verifier_acc = Openings::<F>::new(log_t);
         seed_acc(&mut verifier_acc);
-        let mut verifier_t = Blake2bTranscript::<F>::new(b"hamming-weight-claim-reduce");
+        let mut verifier_t = VerifierTranscript::new("hamming-weight-claim-reduce", &narg);
         let vparams = HammingWeightClaimReductionParams::new(
             counts,
             log_k_chunk,
@@ -428,7 +429,7 @@ mod tests {
             claimed_sum: input_claim,
         };
         let EvaluationClaim { point, value } =
-            verify(&claim, &proof, &mut verifier_t).expect("hamming-weight reduction must verify");
+            verify(&claim, &mut verifier_t).expect("hamming-weight reduction must verify");
         assert_eq!(
             point, challenges,
             "verifier point matches prover challenges"

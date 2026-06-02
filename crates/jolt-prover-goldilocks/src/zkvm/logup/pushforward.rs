@@ -20,8 +20,8 @@
 //! The Fiat-Shamir absorbs (d claims before `r_chunk`; `combined` before `α`) are soundness-load-
 //! bearing — the §4.5.2 RLC and the LogUp Lemma-2 bound require the challenges follow the claims.
 
+use crate::framework::transcript::{ProverFs, VerifierFs};
 use jolt_field::Field;
-use jolt_transcript::Transcript;
 
 use super::{lsb_eq_table, mle_eval_lsb, GkrError};
 
@@ -123,7 +123,7 @@ pub fn prepare_family<F, T>(
 ) -> Result<PushforwardData<F>, GkrError>
 where
     F: Field,
-    T: Transcript<Challenge = F>,
+    T: ProverFs<F>,
 {
     let d = family.d();
     assert_eq!(claims.len(), d, "expected d = 2^log_d claims");
@@ -134,7 +134,7 @@ where
     // §4.5.2 Fiat-Shamir continuity: absorb the d claims BEFORE squeezing r_chunk, so an adversary
     // cannot pick the claims after seeing r_chunk and trivially satisfy the RLC.
     for c in claims {
-        transcript.append(c);
+        transcript.observe(*c);
     }
     let r_chunk = transcript.challenge_vector(family.log_d);
     let eq_chunk = lsb_eq_table(&r_chunk);
@@ -147,7 +147,7 @@ where
 
     // Absorb the combined claim before squeezing α (the LogUp Lemma-2 (n+m)/|F| bound requires α
     // after the prover commits to the claim).
-    transcript.append(&combined_claim);
+    transcript.observe(combined_claim);
     let alpha: F = transcript.challenge();
 
     // r_M_row = r_row ++ r_chunk (cycle in the low log_t bits, chunk in the high log_d bits — matches
@@ -235,19 +235,19 @@ pub fn prepare_family_verifier<F, T>(
 ) -> VerifierView<F>
 where
     F: Field,
-    T: Transcript<Challenge = F>,
+    T: VerifierFs<F>,
 {
     debug_assert_eq!(claims.len(), 1usize << log_d);
-    for c in claims {
-        transcript.append(c);
-    }
+    // Advance the sponge over the prover's observed claims; the combined claim below is recomputed
+    // from the verifier's own (trusted) claims.
+    let _ = transcript.read_coeffs(claims.len());
     let r_chunk = transcript.challenge_vector(log_d);
     let eq_chunk = lsb_eq_table(&r_chunk);
     let combined_claim = claims
         .iter()
         .zip(eq_chunk.iter())
         .fold(F::zero(), |acc, (&c, &e)| acc + c * e);
-    transcript.append(&combined_claim);
+    let _ = transcript.read_coeffs(1);
     let alpha: F = transcript.challenge();
 
     let mut r_m_row = r_row.to_vec();
@@ -268,8 +268,8 @@ where
 #[expect(clippy::unwrap_used)]
 mod tests {
     use super::*;
+    use crate::field::ProverTranscript;
     use jolt_field::goldilocks::GoldilocksFp3 as F;
-    use jolt_transcript::{Blake2bTranscript, Transcript};
 
     struct Rng(u64);
     impl Rng {
@@ -314,7 +314,7 @@ mod tests {
         let claims = claim_eval(&family);
         assert_eq!(claims.len(), 1 << log_d);
 
-        let mut transcript = Blake2bTranscript::<F>::new(b"logup-prep");
+        let mut transcript = ProverTranscript::new("logup-prep");
         let data = prepare_family(&family, &claims, &mut transcript).unwrap();
 
         assert_eq!(data.eq_m_row.len(), (1 << log_t) * (1 << log_d));
@@ -353,7 +353,7 @@ mod tests {
         // Perturb a single input claim: combined = Σ claims·eq_chunk no longer equals P̃^F(r_col),
         // which is built from the (unchanged) genuine index columns.
         claims[0] += F::from_u64(1);
-        let mut transcript = Blake2bTranscript::<F>::new(b"logup-prep");
+        let mut transcript = ProverTranscript::new("logup-prep");
         assert!(matches!(
             prepare_family(&family, &claims, &mut transcript),
             Err(GkrError::MainIdentity),

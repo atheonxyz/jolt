@@ -19,9 +19,9 @@
 //! `eq(r_cycle, ρ)`. jolt-core keys the flag openings with `InstructionFlags(...)` variants; the
 //! decoupled port maps them to distinct existing variants.
 
+use crate::framework::transcript::Challenge;
 use jolt_field::{Field, FieldAccumulator};
 use jolt_poly::{BindingOrder, EqPolynomial, UnivariatePoly};
-use jolt_transcript::Transcript;
 
 use crate::framework::accumulator::{OpeningAccumulator, Openings, SumcheckId, VirtualPolynomial};
 use crate::framework::poly::MultilinearPolynomial;
@@ -55,7 +55,7 @@ impl<F: Field> InstructionInputParams<F> {
     /// draws `γ`.
     pub fn new(
         accumulator: &dyn OpeningAccumulator<F>,
-        transcript: &mut impl Transcript<Challenge = F>,
+        transcript: &mut impl Challenge<F>,
     ) -> Self {
         let (r_cycle, _) = accumulator.get_virtual_polynomial_opening(
             VirtualPolynomial::LeftInstructionInput,
@@ -186,11 +186,11 @@ impl<F: Field> SumcheckInstance<F> for InstructionInput<F> {
 #[expect(clippy::expect_used)]
 mod tests {
     use super::*;
+    use crate::field::{ProverTranscript, VerifierTranscript};
     use crate::framework::accumulator::OpeningPoint;
     use crate::framework::sumcheck::{prove, verify};
     use jolt_field::goldilocks::GoldilocksFp3 as F;
     use jolt_sumcheck::{EvaluationClaim, SumcheckClaim};
-    use jolt_transcript::Blake2bTranscript;
 
     struct Rng(u64);
     impl Rng {
@@ -240,15 +240,16 @@ mod tests {
 
         let mut prover_acc = Openings::<F>::new(log_t);
         seed_acc(&mut prover_acc);
-        let mut prover_t = Blake2bTranscript::<F>::new(b"spartan-instruction-input");
+        let mut prover_t = ProverTranscript::new("spartan-instruction-input");
         let params = InstructionInputParams::new(&prover_acc, &mut prover_t);
         let input_claim = params.input_claim(&prover_acc);
         let mut prover = InstructionInput::new_prover(params, cols.clone());
-        let (proof, challenges) = prove(&mut prover, &mut prover_acc, &mut prover_t);
+        let challenges = prove(&mut prover, &mut prover_acc, &mut prover_t);
+        let narg = prover_t.into_proof();
 
         let mut verifier_acc = Openings::<F>::new(log_t);
         seed_acc(&mut verifier_acc);
-        let mut verifier_t = Blake2bTranscript::<F>::new(b"spartan-instruction-input");
+        let mut verifier_t = VerifierTranscript::new("spartan-instruction-input", &narg);
         let vparams = InstructionInputParams::new(&verifier_acc, &mut verifier_t);
         let verifier = InstructionInput::new_verifier(vparams);
         let claim = SumcheckClaim {
@@ -257,7 +258,7 @@ mod tests {
             claimed_sum: input_claim,
         };
         let EvaluationClaim { point, value } =
-            verify(&claim, &proof, &mut verifier_t).expect("instruction-input must verify");
+            verify(&claim, &mut verifier_t).expect("instruction-input must verify");
         assert_eq!(
             point, challenges,
             "verifier point matches prover challenges"
@@ -310,25 +311,23 @@ mod tests {
             pt,
             right_claim,
         );
-        let mut prover_t = Blake2bTranscript::<F>::new(b"t");
+        let mut prover_t = ProverTranscript::new("t");
         let params = InstructionInputParams::new(&acc, &mut prover_t);
         let input_claim = params.input_claim(&acc);
         let mut prover = InstructionInput::new_prover(params, cols);
-        let (mut proof, _) = prove(&mut prover, &mut acc, &mut prover_t);
-        proof.round_polynomials[0] = UnivariatePoly::new(vec![
-            F::from_u64(1),
-            F::from_u64(2),
-            F::from_u64(3),
-            F::from_u64(4),
-        ]);
+        let _ = prove(&mut prover, &mut acc, &mut prover_t);
+        let mut narg = prover_t.into_proof();
+        narg.narg_string[0] ^= 0x01;
         let claim = SumcheckClaim {
             num_vars: log_t,
             degree: DEGREE,
             claimed_sum: input_claim,
         };
-        let mut verifier_t = Blake2bTranscript::<F>::new(b"t");
+        let mut verifier_t = VerifierTranscript::new("t", &narg);
+        // Replay the prover's pre-round γ squeeze to keep the verifier transcript aligned.
+        let _ = InstructionInputParams::new(&acc, &mut verifier_t);
         assert!(
-            verify(&claim, &proof, &mut verifier_t).is_err(),
+            verify(&claim, &mut verifier_t).is_err(),
             "tampered proof must be rejected"
         );
     }

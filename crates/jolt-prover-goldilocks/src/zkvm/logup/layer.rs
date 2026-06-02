@@ -191,12 +191,12 @@ impl<F: Field> SumcheckInstance<F> for GkrLayer<F> {
 #[expect(clippy::expect_used)]
 mod tests {
     use super::*;
+    use crate::field::{ProverTranscript, VerifierTranscript};
     use crate::framework::sumcheck::{prove, verify};
     use crate::zkvm::logup::{lsb_eq_table, mle_eval_lsb};
     use jolt_field::goldilocks::GoldilocksFp3 as F;
     use jolt_poly::EqPolynomial;
     use jolt_sumcheck::{EvaluationClaim, SumcheckClaim};
-    use jolt_transcript::{Blake2bTranscript, Transcript};
 
     struct Rng(u64);
     impl Rng {
@@ -245,20 +245,21 @@ mod tests {
 
         let mut instance = GkrLayer::new(&level, point.clone(), alpha, beta, input_claim);
         let mut acc = Openings::<F>::new(k.max(1));
-        let mut prover_t = Blake2bTranscript::<F>::new(b"gkr-layer");
-        let (proof, challenges) = prove(&mut instance, &mut acc, &mut prover_t);
+        let mut prover_t = ProverTranscript::new("gkr-layer");
+        let challenges = prove(&mut instance, &mut acc, &mut prover_t);
         assert_eq!(challenges.len(), k);
+        let narg = prover_t.into_proof();
 
         let claim = SumcheckClaim {
             num_vars: k,
             degree: DEGREE,
             claimed_sum: input_claim,
         };
-        let mut verifier_t = Blake2bTranscript::<F>::new(b"gkr-layer");
+        let mut verifier_t = VerifierTranscript::new("gkr-layer", &narg);
         let EvaluationClaim {
             point: r_prime,
             value,
-        } = verify(&claim, &proof, &mut verifier_t).expect("layer must verify");
+        } = verify(&claim, &mut verifier_t).expect("layer must verify");
         assert_eq!(
             r_prime, challenges,
             "verifier point matches prover challenges"
@@ -303,20 +304,16 @@ mod tests {
 
         let mut instance = GkrLayer::new(&level, point, alpha, beta, input_claim);
         let mut acc = Openings::<F>::new(k);
-        let mut prover_t = Blake2bTranscript::<F>::new(b"t");
-        let (mut proof, _) = prove(&mut instance, &mut acc, &mut prover_t);
-        proof.round_polynomials[0] = UnivariatePoly::new(vec![
-            F::from_u64(1),
-            F::from_u64(2),
-            F::from_u64(3),
-            F::from_u64(4),
-        ]);
+        let mut prover_t = ProverTranscript::new("t");
+        let _ = prove(&mut instance, &mut acc, &mut prover_t);
+        let mut narg = prover_t.into_proof();
+        narg.narg_string[0] ^= 0x01;
         let claim = SumcheckClaim {
             num_vars: k,
             degree: DEGREE,
             claimed_sum: input_claim,
         };
-        let mut verifier_t = Blake2bTranscript::<F>::new(b"t");
-        assert!(verify(&claim, &proof, &mut verifier_t).is_err());
+        let mut verifier_t = VerifierTranscript::new("t", &narg);
+        assert!(verify(&claim, &mut verifier_t).is_err());
     }
 }

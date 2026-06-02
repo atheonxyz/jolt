@@ -17,9 +17,9 @@
 //! `RdWriteValue`/`Rs1Value`/`Rs2Value` value columns are taken pre-materialized (`Fp3`), decoupling
 //! the sumcheck from the trace → register-file extraction (M8).
 
+use crate::framework::transcript::Challenge;
 use jolt_field::{Field, FieldAccumulator};
 use jolt_poly::{BindingOrder, EqPolynomial, UnivariatePoly};
-use jolt_transcript::Transcript;
 
 use crate::framework::accumulator::{
     OpeningAccumulator, OpeningPoint, Openings, SumcheckId, VirtualPolynomial, BIG_ENDIAN,
@@ -45,7 +45,7 @@ impl<F: Field> RegistersClaimReductionParams<F> {
     pub fn new(
         n_cycle_vars: usize,
         accumulator: &dyn OpeningAccumulator<F>,
-        transcript: &mut impl Transcript<Challenge = F>,
+        transcript: &mut impl Challenge<F>,
     ) -> Self {
         let gamma = transcript.challenge();
         let gamma_sqr = gamma * gamma;
@@ -215,10 +215,10 @@ impl<F: Field> SumcheckInstance<F> for RegistersClaimReduction<F> {
 #[expect(clippy::expect_used)]
 mod tests {
     use super::*;
+    use crate::field::{ProverTranscript, VerifierTranscript};
     use crate::framework::sumcheck::{prove, verify};
     use jolt_field::goldilocks::GoldilocksFp3 as F;
     use jolt_sumcheck::{EvaluationClaim, SumcheckClaim};
-    use jolt_transcript::Blake2bTranscript;
 
     struct Rng(u64);
     impl Rng {
@@ -282,7 +282,7 @@ mod tests {
 
         let mut prover_acc = Openings::<F>::new(log_t);
         seed_acc(&mut prover_acc, &r_spartan, &rd, &rs1, &rs2);
-        let mut prover_t = Blake2bTranscript::<F>::new(b"registers-claim-reduction");
+        let mut prover_t = ProverTranscript::new("registers-claim-reduction");
         let params = RegistersClaimReductionParams::new(log_t, &prover_acc, &mut prover_t);
         let input_claim = params.input_claim(&prover_acc);
         let mut prover = RegistersClaimReduction::new_prover(
@@ -291,11 +291,12 @@ mod tests {
             rs1.clone(),
             rs2.clone(),
         );
-        let (proof, challenges) = prove(&mut prover, &mut prover_acc, &mut prover_t);
+        let challenges = prove(&mut prover, &mut prover_acc, &mut prover_t);
+        let narg = prover_t.into_proof();
 
         let mut verifier_acc = Openings::<F>::new(log_t);
         seed_acc(&mut verifier_acc, &r_spartan, &rd, &rs1, &rs2);
-        let mut verifier_t = Blake2bTranscript::<F>::new(b"registers-claim-reduction");
+        let mut verifier_t = VerifierTranscript::new("registers-claim-reduction", &narg);
         let vparams = RegistersClaimReductionParams::new(log_t, &verifier_acc, &mut verifier_t);
         let verifier = RegistersClaimReduction::new_verifier(vparams);
         let claim = SumcheckClaim {
@@ -304,7 +305,7 @@ mod tests {
             claimed_sum: input_claim,
         };
         let EvaluationClaim { point, value } =
-            verify(&claim, &proof, &mut verifier_t).expect("registers reduction must verify");
+            verify(&claim, &mut verifier_t).expect("registers reduction must verify");
         assert_eq!(
             point, challenges,
             "verifier point matches prover challenges"
@@ -367,10 +368,10 @@ mod tests {
 
         let mut prover_acc = Openings::<F>::new(log_t);
         seed_acc(&mut prover_acc, &r_spartan, &rd, &rs1, &rs2);
-        let mut prover_t = Blake2bTranscript::<F>::new(b"registers-claim-reduction");
+        let mut prover_t = ProverTranscript::new("registers-claim-reduction");
         let params = RegistersClaimReductionParams::new(log_t, &prover_acc, &mut prover_t);
         let mut prover = RegistersClaimReduction::new_prover(params.clone(), rd.clone(), rs1, rs2);
-        let (_, challenges) = prove(&mut prover, &mut prover_acc, &mut prover_t);
+        let challenges = prove(&mut prover, &mut prover_acc, &mut prover_t);
 
         let verifier = RegistersClaimReduction::new_verifier(params);
         let point: Vec<F> = challenges.clone();

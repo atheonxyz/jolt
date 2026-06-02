@@ -14,10 +14,10 @@
 
 use jolt_field::Field;
 use jolt_poly::{UnivariatePoly, UnivariatePolynomial};
-use jolt_transcript::{AppendToTranscript, Transcript};
 
 use super::lagrange::{check_sum_evals, LagrangePolynomial};
-use super::sumcheck::SumcheckInstance;
+use super::sumcheck::{write_round_poly, SumcheckInstance};
+use super::transcript::{ProverFs, VerifierFs};
 use crate::framework::accumulator::Openings;
 
 /// Univariate-skip verification failure.
@@ -140,41 +140,32 @@ pub fn build_uniskip_first_round_poly<
     UnivariatePoly::new(s1_coeffs.to_vec())
 }
 
-/// The uni-skip first-round proof: the (full) high-degree univariate sent in round 0.
-#[derive(Clone, Debug)]
-pub struct UniSkipFirstRoundProof<F: Field> {
-    pub uni_poly: UnivariatePoly<F>,
-}
-
 /// Prove the uni-skip first round (non-ZK): read the input claim, build `s1` via the instance's
-/// `compute_message(0, ·)`, absorb its coefficients, squeeze `r0`, cache the instance's openings at
-/// `[r0]`. Returns the proof and `r0` (the caller continues with the batched cycle rounds).
+/// `compute_message(0, ·)`, write its coefficients into the NARG, squeeze `r0`, cache the
+/// instance's openings at `[r0]`. Returns `r0` (the caller continues with the batched cycle rounds).
 pub fn prove_uniskip_round<F, I, T>(
     instance: &mut I,
     accumulator: &mut Openings<F>,
     transcript: &mut T,
-) -> (UniSkipFirstRoundProof<F>, F)
+) -> F
 where
     F: Field,
     I: SumcheckInstance<F>,
-    T: Transcript<Challenge = F>,
+    T: ProverFs<F>,
 {
     let input_claim = instance.input_claim(&*accumulator);
     let uni_poly = instance.compute_message(0, input_claim);
-    for coeff in uni_poly.coefficients() {
-        coeff.append_to_transcript(transcript);
-    }
+    write_round_poly(transcript, &uni_poly, instance.degree() + 1);
     let r0 = transcript.challenge();
     instance.cache_openings(accumulator, &[r0]);
-    (UniSkipFirstRoundProof { uni_poly }, r0)
+    r0
 }
 
-/// Verify the uni-skip first round: degree bound, then absorb `s1` and squeeze `r0` (matching the
-/// prover), check the symmetric-`N`-window sum equals the input claim, and check `s1(r0)` equals the
-/// instance's recomputed output claim. `N` is the base window size (`DOMAIN_SIZE`); `NUM_COEFFS` is
-/// `s1`'s coefficient count. Returns `r0` on success.
+/// Verify the uni-skip first round: read `s1` (`NUM_COEFFS` coeffs) from the NARG, enforce the
+/// degree bound, squeeze `r0`, check the symmetric-`N`-window sum equals the input claim, and check
+/// `s1(r0)` equals the instance's recomputed output claim. `N` is the base window size
+/// (`DOMAIN_SIZE`); `NUM_COEFFS` is `s1`'s coefficient count. Returns `r0` on success.
 pub fn verify_uniskip_round<F, I, T, const N: usize, const NUM_COEFFS: usize>(
-    proof: &UniSkipFirstRoundProof<F>,
     instance: &I,
     accumulator: &mut Openings<F>,
     transcript: &mut T,
@@ -182,29 +173,30 @@ pub fn verify_uniskip_round<F, I, T, const N: usize, const NUM_COEFFS: usize>(
 where
     F: Field,
     I: SumcheckInstance<F>,
-    T: Transcript<Challenge = F>,
+    T: VerifierFs<F>,
 {
+    let coeffs = transcript
+        .read_coeffs(NUM_COEFFS)
+        .ok_or(UniSkipError::SumCheck)?;
+    let uni_poly = UnivariatePoly::new(coeffs);
+
     let degree_bound = instance.degree();
-    let got = UnivariatePolynomial::degree(&proof.uni_poly);
+    let got = UnivariatePolynomial::degree(&uni_poly);
     if got > degree_bound {
         return Err(UniSkipError::DegreeBound {
             got,
             max: degree_bound,
         });
     }
-
-    for coeff in proof.uni_poly.coefficients() {
-        coeff.append_to_transcript(transcript);
-    }
     let r0 = transcript.challenge();
 
     let input_claim = instance.input_claim(&*accumulator);
-    if !check_sum_evals::<F, N, NUM_COEFFS>(&proof.uni_poly, input_claim) {
+    if !check_sum_evals::<F, N, NUM_COEFFS>(&uni_poly, input_claim) {
         return Err(UniSkipError::SumCheck);
     }
 
     instance.cache_openings(accumulator, &[r0]);
-    let expected_output = proof.uni_poly.evaluate(r0);
+    let expected_output = uni_poly.evaluate(r0);
     let claimed_output = instance.expected_output_claim(&*accumulator, &[r0]);
     if claimed_output != expected_output {
         return Err(UniSkipError::OutputClaim);
@@ -216,9 +208,9 @@ where
 #[expect(clippy::expect_used)]
 mod tests {
     use super::*;
+    use crate::field::{ProverTranscript, VerifierTranscript};
     use crate::framework::accumulator::OpeningAccumulator;
     use jolt_field::goldilocks::GoldilocksFp3 as F;
-    use jolt_transcript::Blake2bTranscript;
 
     // Concrete uni-skip parameters for the tests: DOMAIN_SIZE = DEGREE + 1.
     const DEGREE: usize = 2;
@@ -370,14 +362,14 @@ mod tests {
         let mut rng = Rng(0x5151);
         let mut instance = UniSkipTestInstance::new(&mut rng);
         let mut prover_acc = Openings::<F>::new(4);
-        let mut prover_t = Blake2bTranscript::<F>::new(b"uniskip");
-        let (proof, r0_prover) = prove_uniskip_round(&mut instance, &mut prover_acc, &mut prover_t);
+        let mut prover_t = ProverTranscript::new("uniskip");
+        let r0_prover = prove_uniskip_round(&mut instance, &mut prover_acc, &mut prover_t);
+        let proof = prover_t.into_proof();
 
         let verifier_instance = UniSkipTestInstance::new(&mut Rng(0x5151));
         let mut verifier_acc = Openings::<F>::new(4);
-        let mut verifier_t = Blake2bTranscript::<F>::new(b"uniskip");
+        let mut verifier_t = VerifierTranscript::new("uniskip", &proof);
         let r0 = verify_uniskip_round::<F, _, _, DOMAIN_SIZE, NUM_COEFFS>(
-            &proof,
             &verifier_instance,
             &mut verifier_acc,
             &mut verifier_t,
@@ -391,19 +383,18 @@ mod tests {
         let mut rng = Rng(0x5252);
         let mut instance = UniSkipTestInstance::new(&mut rng);
         let mut prover_acc = Openings::<F>::new(4);
-        let mut prover_t = Blake2bTranscript::<F>::new(b"uniskip");
-        let (mut proof, _) = prove_uniskip_round(&mut instance, &mut prover_acc, &mut prover_t);
+        let mut prover_t = ProverTranscript::new("uniskip");
+        let _ = prove_uniskip_round(&mut instance, &mut prover_acc, &mut prover_t);
+        let mut proof = prover_t.into_proof();
 
-        // Perturb the constant coefficient: the window sum no longer equals the input claim.
-        let mut coeffs = proof.uni_poly.coefficients().to_vec();
-        coeffs[0] += F::from_u64(1);
-        proof.uni_poly = UnivariatePoly::new(coeffs);
+        // Corrupt the first-round polynomial's bytes in the NARG: the window sum no longer
+        // equals the input claim (or the message fails to decode).
+        proof.narg_string[0] ^= 0x01;
 
         let verifier_instance = UniSkipTestInstance::new(&mut Rng(0x5252));
         let mut verifier_acc = Openings::<F>::new(4);
-        let mut verifier_t = Blake2bTranscript::<F>::new(b"uniskip");
+        let mut verifier_t = VerifierTranscript::new("uniskip", &proof);
         let result = verify_uniskip_round::<F, _, _, DOMAIN_SIZE, NUM_COEFFS>(
-            &proof,
             &verifier_instance,
             &mut verifier_acc,
             &mut verifier_t,

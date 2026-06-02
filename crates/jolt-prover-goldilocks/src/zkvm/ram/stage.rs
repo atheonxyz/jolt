@@ -23,13 +23,13 @@
 
 use jolt_field::Field;
 use jolt_poly::EqPolynomial;
-use jolt_sumcheck::{EvaluationClaim, SumcheckClaim, SumcheckProof};
-use jolt_transcript::Transcript;
+use jolt_sumcheck::{EvaluationClaim, SumcheckClaim};
 
 use crate::framework::accumulator::{
     CommittedPolynomial, OpeningAccumulator, OpeningPoint, Openings, SumcheckId, VirtualPolynomial,
 };
 use crate::framework::sumcheck::{prove, prove_batched, verify, verify_batched, SumcheckInstance};
+use crate::framework::transcript::{ProverFs, VerifierFs};
 use crate::zkvm::ram::output_check::{RamOutputCheck, RamOutputCheckParams};
 use crate::zkvm::ram::raf_evaluation::{RamRafEvaluation, RamRafEvaluationParams};
 use crate::zkvm::ram::read_write_checking::{RamReadWriteChecking, RamReadWriteCheckingParams};
@@ -49,21 +49,19 @@ pub enum RamStageError {
     ValCheckClaim,
 }
 
-/// The RAM-stage proof: the batched (RW+RAF+OutputCheck) transcript + the sequential val-check
-/// transcript + the opening claims the verifier discharges (the committed `RamInc` openings are
-/// PCS-opened at stage 8).
+/// The RAM-stage opening claims the verifier discharges (the committed `RamInc` openings are
+/// PCS-opened at stage 8). The batched (RW+RAF+OutputCheck) and val-check round polynomials live in
+/// the shared NARG, not here.
 #[derive(Clone, Debug)]
 pub struct RamStageProof<F: Field> {
     /// Interim SpartanOuter seeds `(RamReadValue, RamWriteValue, RamAddress)(r_spartan)`.
     pub spartan_seeds: [F; 3],
-    pub batched: SumcheckProof<F>,
     /// `(RamVal, RamRa, RamInc)` @ RamReadWriteChecking.
     pub rw_openings: [F; 3],
     /// `RamRa` @ RamRafEvaluation.
     pub raf_opening: F,
     /// `RamValFinal` @ RamOutputCheck.
     pub oc_opening: F,
-    pub val_check: SumcheckProof<F>,
     /// `(RamRa, RamInc)` @ RamValCheck.
     pub vc_openings: [F; 2],
 }
@@ -116,7 +114,7 @@ pub fn prove_ram<F, T>(
 ) -> RamStageProof<F>
 where
     F: Field,
-    T: Transcript<Challenge = F>,
+    T: ProverFs<F>,
 {
     let (log_t, log_k) = (reg.log_t, reg.log_k);
     let r_spartan = transcript.challenge_vector(log_t);
@@ -154,7 +152,7 @@ where
     );
 
     let instances: Vec<&mut dyn SumcheckInstance<F>> = vec![&mut rw, &mut raf, &mut oc];
-    let (batched, _, _) = prove_batched(instances, accumulator, transcript);
+    let _ = prove_batched(instances, accumulator, transcript);
 
     let rw_openings = [
         get_virtual(
@@ -194,7 +192,7 @@ where
     let initial_ram = vec![F::zero(); 1 << log_k];
     let vc_params = RamValCheckParams::new(accumulator, log_k, &initial_ram, transcript);
     let mut vc = RamValCheck::new_prover(vc_params, reg.inc.clone(), wa_col);
-    let (val_check, _) = prove(&mut vc, accumulator, transcript);
+    let _ = prove(&mut vc, accumulator, transcript);
     let vc_openings = [
         get_virtual(
             accumulator,
@@ -210,11 +208,9 @@ where
 
     RamStageProof {
         spartan_seeds,
-        batched,
         rw_openings,
         raf_opening,
         oc_opening,
-        val_check,
         vc_openings,
     }
 }
@@ -236,7 +232,7 @@ pub fn verify_ram<F, T>(
 ) -> Result<(), RamStageError>
 where
     F: Field,
-    T: Transcript<Challenge = F>,
+    T: VerifierFs<F>,
 {
     let r_spartan = transcript.challenge_vector(log_t);
     seed_spartan_outer(accumulator, &r_spartan, proof.spartan_seeds);
@@ -273,7 +269,7 @@ where
             value,
         },
         coeffs,
-    ) = verify_batched(&claims, &proof.batched, transcript).map_err(|_| RamStageError::Sumcheck)?;
+    ) = verify_batched(&claims, transcript).map_err(|_| RamStageError::Sumcheck)?;
 
     // Seed the batched stages' cached openings at their (aligned) points.
     let rw_point = rw.normalize_opening_point(&challenges);
@@ -333,7 +329,6 @@ where
             degree: VAL_CHECK_DEGREE,
             claimed_sum: vc_input,
         },
-        &proof.val_check,
         transcript,
     )
     .map_err(|_| RamStageError::Sumcheck)?;
@@ -388,10 +383,10 @@ fn get_committed<F: Field>(
 #[expect(clippy::expect_used)]
 mod tests {
     use super::*;
+    use crate::field::{ProverTranscript, VerifierTranscript};
     use crate::zkvm::r1cs_witness::tests_support::MockCycle;
     use crate::zkvm::ram::witness::ram_witness;
     use jolt_field::goldilocks::GoldilocksFp3 as F;
-    use jolt_transcript::Blake2bTranscript;
 
     fn sample_trace() -> Vec<MockCycle> {
         vec![
@@ -421,7 +416,7 @@ mod tests {
         let (unmap, val_io, io_mask) = public_columns(w.log_k);
 
         let mut prover_acc = Openings::<F>::new(w.log_t);
-        let mut prover_t = Blake2bTranscript::<F>::new(b"ram-stage");
+        let mut prover_t = ProverTranscript::new("ram-stage");
         let proof = prove_ram(
             &w,
             &unmap,
@@ -430,9 +425,10 @@ mod tests {
             &mut prover_acc,
             &mut prover_t,
         );
+        let narg = prover_t.into_proof();
 
         let mut verifier_acc = Openings::<F>::new(w.log_t);
-        let mut verifier_t = Blake2bTranscript::<F>::new(b"ram-stage");
+        let mut verifier_t = VerifierTranscript::new("ram-stage", &narg);
         verify_ram(
             &proof,
             w.log_t,
@@ -452,7 +448,7 @@ mod tests {
         let w = ram_witness::<MockCycle, F>(&trace, 8);
         let (unmap, val_io, io_mask) = public_columns(w.log_k);
         let mut prover_acc = Openings::<F>::new(w.log_t);
-        let mut prover_t = Blake2bTranscript::<F>::new(b"ram-stage");
+        let mut prover_t = ProverTranscript::new("ram-stage");
         let mut proof = prove_ram(
             &w,
             &unmap,
@@ -461,11 +457,12 @@ mod tests {
             &mut prover_acc,
             &mut prover_t,
         );
+        let narg = prover_t.into_proof();
         // Corrupt RamVal@RW → both the batched RW claim and the val-check input break.
         proof.rw_openings[0] += F::from_u64(1);
 
         let mut verifier_acc = Openings::<F>::new(w.log_t);
-        let mut verifier_t = Blake2bTranscript::<F>::new(b"ram-stage");
+        let mut verifier_t = VerifierTranscript::new("ram-stage", &narg);
         assert!(
             verify_ram(
                 &proof,

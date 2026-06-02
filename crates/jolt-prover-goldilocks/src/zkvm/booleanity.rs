@@ -18,9 +18,9 @@
 //! accumulation. **Decoupled** (the M5 convention): takes the materialized Boolean columns; the
 //! verifier reads the cached `R1csAux(i)` openings.
 
+use crate::framework::transcript::Challenge;
 use jolt_field::{Field, FieldAccumulator};
 use jolt_poly::{BindingOrder, GruenSplitEqPolynomial, UnivariatePoly};
-use jolt_transcript::Transcript;
 
 use crate::framework::accumulator::{
     CommittedPolynomial, OpeningAccumulator, Openings, SumcheckId,
@@ -40,11 +40,7 @@ pub struct BooleanityParams<F: Field> {
 
 impl<F: Field> BooleanityParams<F> {
     /// Draws `γ` and forms the `[γ^0, γ², γ⁴, …]` batching coefficients for `num_cols` columns.
-    pub fn new(
-        r: Vec<F>,
-        num_cols: usize,
-        transcript: &mut impl Transcript<Challenge = F>,
-    ) -> Self {
+    pub fn new(r: Vec<F>, num_cols: usize, transcript: &mut impl Challenge<F>) -> Self {
         let gamma = transcript.challenge();
         let gamma_sq = gamma * gamma;
         let mut powers = Vec::with_capacity(num_cols);
@@ -172,11 +168,11 @@ impl<F: Field> SumcheckInstance<F> for Booleanity<F> {
 #[expect(clippy::expect_used)]
 mod tests {
     use super::*;
+    use crate::field::{ProverTranscript, VerifierTranscript};
     use crate::framework::sumcheck::{prove, verify};
     use jolt_field::goldilocks::GoldilocksFp3 as F;
     use jolt_poly::EqPolynomial;
     use jolt_sumcheck::{EvaluationClaim, SumcheckClaim};
-    use jolt_transcript::Blake2bTranscript;
 
     struct Rng(u64);
     impl Rng {
@@ -203,15 +199,16 @@ mod tests {
         let cols = bool_cols(&mut rng, n_cols, k);
 
         let mut prover_acc = Openings::<F>::new(log_k);
-        let mut prover_t = Blake2bTranscript::<F>::new(b"booleanity");
+        let mut prover_t = ProverTranscript::new("booleanity");
         let params = BooleanityParams::new(r.clone(), n_cols, &mut prover_t);
         let mut prover = Booleanity::new_prover(params, cols.clone());
         let input_claim = prover.input_claim(&prover_acc);
         assert_eq!(input_claim, F::from_u64(0), "booleanity is a zero-check");
-        let (proof, challenges) = prove(&mut prover, &mut prover_acc, &mut prover_t);
+        let challenges = prove(&mut prover, &mut prover_acc, &mut prover_t);
+        let narg = prover_t.into_proof();
 
         let mut verifier_acc = Openings::<F>::new(log_k);
-        let mut verifier_t = Blake2bTranscript::<F>::new(b"booleanity");
+        let mut verifier_t = VerifierTranscript::new("booleanity", &narg);
         let vparams = BooleanityParams::new(r, n_cols, &mut verifier_t);
         let verifier = Booleanity::new_verifier(vparams);
         let claim = SumcheckClaim {
@@ -220,7 +217,7 @@ mod tests {
             claimed_sum: input_claim,
         };
         let EvaluationClaim { point, value } =
-            verify(&claim, &proof, &mut verifier_t).expect("booleanity must verify");
+            verify(&claim, &mut verifier_t).expect("booleanity must verify");
         assert_eq!(
             point, challenges,
             "verifier point matches prover challenges"
@@ -283,12 +280,13 @@ mod tests {
         cols[0][3] = F::from_u64(7); // not in {0,1}
 
         let mut acc = Openings::<F>::new(log_k);
-        let mut prover_t = Blake2bTranscript::<F>::new(b"booleanity");
+        let mut prover_t = ProverTranscript::new("booleanity");
         let params = BooleanityParams::new(r.clone(), 1, &mut prover_t);
         let mut prover = Booleanity::new_prover(params, cols);
-        let (proof, challenges) = prove(&mut prover, &mut acc, &mut prover_t);
+        let challenges = prove(&mut prover, &mut acc, &mut prover_t);
+        let narg = prover_t.into_proof();
 
-        let mut verifier_t = Blake2bTranscript::<F>::new(b"booleanity");
+        let mut verifier_t = VerifierTranscript::new("booleanity", &narg);
         let vparams = BooleanityParams::new(r, 1, &mut verifier_t);
         let verifier = Booleanity::new_verifier(vparams);
         let claim = SumcheckClaim {
@@ -297,7 +295,7 @@ mod tests {
             claimed_sum: F::from_u64(0),
         };
         let EvaluationClaim { value, .. } =
-            verify(&claim, &proof, &mut verifier_t).expect("rounds are internally consistent");
+            verify(&claim, &mut verifier_t).expect("rounds are internally consistent");
         let (pt, c) = acc.get_committed_polynomial_opening(
             CommittedPolynomial::R1csAux(0),
             SumcheckId::Booleanity,
@@ -323,24 +321,22 @@ mod tests {
         let r: Vec<F> = (0..log_k).map(|_| F::from_u64(rng.next())).collect();
         let cols = bool_cols(&mut rng, 2, k);
         let mut acc = Openings::<F>::new(log_k);
-        let mut prover_t = Blake2bTranscript::<F>::new(b"t");
-        let params = BooleanityParams::new(r, 2, &mut prover_t);
+        let mut prover_t = ProverTranscript::new("t");
+        let params = BooleanityParams::new(r.clone(), 2, &mut prover_t);
         let mut prover = Booleanity::new_prover(params, cols);
-        let (mut proof, _) = prove(&mut prover, &mut acc, &mut prover_t);
-        proof.round_polynomials[0] = UnivariatePoly::new(vec![
-            F::from_u64(1),
-            F::from_u64(2),
-            F::from_u64(3),
-            F::from_u64(4),
-        ]);
+        let _ = prove(&mut prover, &mut acc, &mut prover_t);
+        let mut narg = prover_t.into_proof();
+        narg.narg_string[0] ^= 0x01;
         let claim = SumcheckClaim {
             num_vars: log_k,
             degree: DEGREE,
             claimed_sum: F::from_u64(0),
         };
-        let mut verifier_t = Blake2bTranscript::<F>::new(b"t");
+        let mut verifier_t = VerifierTranscript::new("t", &narg);
+        // Replay the prover's pre-round γ squeeze so the verifier transcript stays in lockstep.
+        let _ = BooleanityParams::new(r, 2, &mut verifier_t);
         assert!(
-            verify(&claim, &proof, &mut verifier_t).is_err(),
+            verify(&claim, &mut verifier_t).is_err(),
             "tampered proof must be rejected"
         );
     }

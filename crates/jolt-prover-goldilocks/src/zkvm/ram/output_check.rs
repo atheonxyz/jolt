@@ -191,11 +191,11 @@ impl<F: Field> SumcheckInstance<F> for RamOutputCheck<F> {
 #[expect(clippy::expect_used)]
 mod tests {
     use super::*;
+    use crate::field::{ProverTranscript, VerifierTranscript};
     use crate::framework::accumulator::OpeningPoint;
     use crate::framework::sumcheck::{prove, verify};
     use jolt_field::goldilocks::GoldilocksFp3 as F;
     use jolt_sumcheck::{EvaluationClaim, SumcheckClaim};
-    use jolt_transcript::{Blake2bTranscript, Transcript};
 
     struct Rng(u64);
     impl Rng {
@@ -251,8 +251,9 @@ mod tests {
             F::from_u64(0),
             "honest output check is a zero-check"
         );
-        let mut prover_t = Blake2bTranscript::<F>::new(b"ram-output-check");
-        let (proof, challenges) = prove(&mut prover, &mut prover_acc, &mut prover_t);
+        let mut prover_t = ProverTranscript::new("ram-output-check");
+        let challenges = prove(&mut prover, &mut prover_acc, &mut prover_t);
+        let narg = prover_t.into_proof();
 
         // Verifier
         let mut verifier_acc = Openings::<F>::new(log_k);
@@ -262,9 +263,9 @@ mod tests {
             degree: DEGREE,
             claimed_sum: input_claim,
         };
-        let mut verifier_t = Blake2bTranscript::<F>::new(b"ram-output-check");
+        let mut verifier_t = VerifierTranscript::new("ram-output-check", &narg);
         let EvaluationClaim { point, value } =
-            verify(&claim, &proof, &mut verifier_t).expect("output check must verify");
+            verify(&claim, &mut verifier_t).expect("output check must verify");
         assert_eq!(
             point, challenges,
             "verifier point matches prover challenges"
@@ -317,23 +318,19 @@ mod tests {
         let params = RamOutputCheckParams::new(r_address);
         let mut prover = RamOutputCheck::new_prover(params, val_final, val_io, io_mask);
         let input_claim = prover.input_claim(&acc);
-        let mut prover_t = Blake2bTranscript::<F>::new(b"t");
-        let (mut proof, _) = prove(&mut prover, &mut acc, &mut prover_t);
+        let mut prover_t = ProverTranscript::new("t");
+        let _ = prove(&mut prover, &mut acc, &mut prover_t);
+        let mut narg = prover_t.into_proof();
 
-        proof.round_polynomials[0] = UnivariatePoly::new(vec![
-            F::from_u64(1),
-            F::from_u64(2),
-            F::from_u64(3),
-            F::from_u64(4),
-        ]);
+        narg.narg_string[0] ^= 0x01;
         let claim = SumcheckClaim {
             num_vars: log_k,
             degree: DEGREE,
             claimed_sum: input_claim,
         };
-        let mut verifier_t = Blake2bTranscript::<F>::new(b"t");
+        let mut verifier_t = VerifierTranscript::new("t", &narg);
         assert!(
-            verify(&claim, &proof, &mut verifier_t).is_err(),
+            verify(&claim, &mut verifier_t).is_err(),
             "tampered proof must be rejected"
         );
     }

@@ -20,9 +20,9 @@
 //! across the `K` address blocks). jolt-core's sparse `ReadWriteMatrix` two-phase materialization
 //! and Gruen split-eq are perf optimizations deferred here (single-phase, uniform `LowToHigh`).
 
+use crate::framework::transcript::Challenge;
 use jolt_field::{Field, FieldAccumulator};
 use jolt_poly::{BindingOrder, EqPolynomial, UnivariatePoly};
-use jolt_transcript::Transcript;
 
 use crate::framework::accumulator::{
     CommittedPolynomial, OpeningAccumulator, OpeningPoint, Openings, SumcheckId, VirtualPolynomial,
@@ -47,7 +47,7 @@ impl<F: Field> RamReadWriteCheckingParams<F> {
     pub fn new(
         accumulator: &dyn OpeningAccumulator<F>,
         log_k: usize,
-        transcript: &mut impl Transcript<Challenge = F>,
+        transcript: &mut impl Challenge<F>,
     ) -> Self {
         let gamma = transcript.challenge();
         let (r_cycle, _) = accumulator.get_virtual_polynomial_opening(
@@ -219,10 +219,10 @@ impl<F: Field> SumcheckInstance<F> for RamReadWriteChecking<F> {
 #[expect(clippy::expect_used)]
 mod tests {
     use super::*;
+    use crate::field::{ProverTranscript, VerifierTranscript};
     use crate::framework::sumcheck::{prove, verify};
     use jolt_field::goldilocks::GoldilocksFp3 as F;
     use jolt_sumcheck::{EvaluationClaim, SumcheckClaim};
-    use jolt_transcript::Blake2bTranscript;
 
     struct Rng(u64);
     impl Rng {
@@ -289,16 +289,17 @@ mod tests {
 
         let mut prover_acc = Openings::<F>::new(log_t);
         seed_components(&mut prover_acc, &r_cycle, &ra, &val, &inc, log_k);
-        let mut prover_t = Blake2bTranscript::<F>::new(b"ram-rw-checking");
+        let mut prover_t = ProverTranscript::new("ram-rw-checking");
         let params = RamReadWriteCheckingParams::new(&prover_acc, log_k, &mut prover_t);
         let input_claim = params.input_claim(&prover_acc);
         let mut prover =
             RamReadWriteChecking::new_prover(params, ra.clone(), val.clone(), inc.clone());
-        let (proof, challenges) = prove(&mut prover, &mut prover_acc, &mut prover_t);
+        let challenges = prove(&mut prover, &mut prover_acc, &mut prover_t);
+        let narg = prover_t.into_proof();
 
         let mut verifier_acc = Openings::<F>::new(log_t);
         seed_components(&mut verifier_acc, &r_cycle, &ra, &val, &inc, log_k);
-        let mut verifier_t = Blake2bTranscript::<F>::new(b"ram-rw-checking");
+        let mut verifier_t = VerifierTranscript::new("ram-rw-checking", &narg);
         let vparams = RamReadWriteCheckingParams::new(&verifier_acc, log_k, &mut verifier_t);
         let verifier = RamReadWriteChecking::new_verifier(vparams);
         let claim = SumcheckClaim {
@@ -307,7 +308,7 @@ mod tests {
             claimed_sum: input_claim,
         };
         let EvaluationClaim { point, value } =
-            verify(&claim, &proof, &mut verifier_t).expect("ram rw-checking must verify");
+            verify(&claim, &mut verifier_t).expect("ram rw-checking must verify");
         assert_eq!(
             point, challenges,
             "verifier point matches prover challenges"
@@ -378,26 +379,24 @@ mod tests {
 
         let mut acc = Openings::<F>::new(log_t);
         seed_components(&mut acc, &r_cycle, &ra, &val, &inc, log_k);
-        let mut prover_t = Blake2bTranscript::<F>::new(b"t");
+        let mut prover_t = ProverTranscript::new("t");
         let params = RamReadWriteCheckingParams::new(&acc, log_k, &mut prover_t);
         let input_claim = params.input_claim(&acc);
         let mut prover = RamReadWriteChecking::new_prover(params, ra, val, inc);
-        let (mut proof, _) = prove(&mut prover, &mut acc, &mut prover_t);
+        let _ = prove(&mut prover, &mut acc, &mut prover_t);
+        let mut narg = prover_t.into_proof();
 
-        proof.round_polynomials[0] = UnivariatePoly::new(vec![
-            F::from_u64(1),
-            F::from_u64(2),
-            F::from_u64(3),
-            F::from_u64(4),
-        ]);
+        narg.narg_string[0] ^= 0x01;
         let claim = SumcheckClaim {
             num_vars: log_k + log_t,
             degree: DEGREE,
             claimed_sum: input_claim,
         };
-        let mut verifier_t = Blake2bTranscript::<F>::new(b"t");
+        let mut verifier_t = VerifierTranscript::new("t", &narg);
+        // Replay the prover's pre-round γ squeeze to keep the verifier transcript aligned.
+        let _ = RamReadWriteCheckingParams::new(&acc, log_k, &mut verifier_t);
         assert!(
-            verify(&claim, &proof, &mut verifier_t).is_err(),
+            verify(&claim, &mut verifier_t).is_err(),
             "tampered proof must be rejected"
         );
     }

@@ -15,6 +15,11 @@
 //! `(α_c, β_c)`. At the leaves the protocol yields two committed openings — `M̃*(r*_A) = α − D̃_A`
 //! and `P̃^F(r*_B) = Ñ_B` — plus the §4.5.2 `P̃^F(r_col)` claim; all three go to the accumulator.
 //!
+//! **Single-NARG model:** the layer sumcheck round polynomials (via [`sumcheck::prove`]), the circuit
+//! roots, and the per-layer leaf values are all written into the shared transcript — the prover
+//! `observe`s them, the verifier `read`s them back — so [`GkrProof`] carries no data (an empty marker
+//! kept only to preserve the per-chunk driver's `Vec<GkrProof>` shape).
+//!
 //! The three prototype `assert!`s become fallible [`GkrError`] checks (one prover-side, two
 //! verifier-side):
 //! - eq. 5 main identity — checked in [`pushforward::prepare_family`] (prover only; the verifier
@@ -23,55 +28,45 @@
 //! - per-layer consistency `value == eq(point, r')·F(NL,NR,DL,DR)` — [`verify_circuit`].
 //! - plus two leaf structural checks tying the GKR leaves to the public `eq_m_row` (A) / index
 //!   polynomial `α − k` (B).
-//!
-//! TODO(M8): the `K = 2³²` streaming-pyramid memory optimization (design §13-Q4) — this builds the
-//! full pyramid densely.
+
+use std::marker::PhantomData;
 
 use jolt_field::Field;
 use jolt_poly::EqPolynomial;
-use jolt_sumcheck::{EvaluationClaim, SumcheckClaim, SumcheckProof};
-use jolt_transcript::Transcript;
+use jolt_sumcheck::{EvaluationClaim, SumcheckClaim};
 
 use crate::framework::accumulator::{CommittedPolynomial, OpeningPoint, Openings, SumcheckId};
 use crate::framework::sumcheck;
+use crate::framework::transcript::{ProverFs, VerifierFs};
 
 use super::circuit::Circuit;
 use super::layer::{f_combine, GkrLayer, DEGREE};
 use super::pushforward::{PushforwardData, VerifierView};
 use super::{idx_mle_lsb, GkrError};
 
-/// A proven GKR layer: the framework sumcheck proof + the four leaf values `(NL,NR,DL,DR)(r')`.
-type ProvenLayer<F> = (SumcheckProof<F>, (F, F, F, F));
-
-/// One circuit's GKR transcript: the root fraction + per-layer `(sumcheck proof, leaf values)`.
-#[derive(Clone, Debug)]
-struct CircuitProof<F: Field> {
-    root: (F, F),
-    layers: Vec<ProvenLayer<F>>,
-}
-
-/// The per-family pushforward-GKR proof (A-circuit over `ra_dense`, B-circuit over `P^F`).
-#[derive(Clone, Debug)]
+/// The per-family pushforward-GKR proof. Carries no data — all round polynomials, circuit roots, and
+/// layer leaf values live in the shared NARG. An empty marker so the per-chunk driver keeps its
+/// `Vec<GkrProof>` shape.
+#[derive(Clone, Debug, Default)]
 pub struct GkrProof<F: Field> {
-    a: CircuitProof<F>,
-    b: CircuitProof<F>,
+    _marker: PhantomData<F>,
 }
 
-/// Prove one circuit top-down. Returns its proof, the leaf point `r*`, and the leaf fraction
-/// `(Ñ(r*), D̃(r*))` (the merged numerator/denominator at the leaves).
+/// Prove one circuit top-down: write the root + each layer's sumcheck (round polys) + leaf values into
+/// the NARG. Returns the leaf point `r*` and the leaf fraction `(Ñ(r*), D̃(r*))`.
 fn prove_circuit<F, T>(
     circuit: &Circuit<F>,
     accumulator: &mut Openings<F>,
     transcript: &mut T,
-) -> (CircuitProof<F>, Vec<F>, F, F)
+) -> (Vec<F>, F, F)
 where
     F: Field,
-    T: Transcript<Challenge = F>,
+    T: ProverFs<F>,
 {
     let log_size = circuit.log_size();
     let (n_root, d_root) = circuit.root();
-    transcript.append(&n_root);
-    transcript.append(&d_root);
+    transcript.observe(n_root);
+    transcript.observe(d_root);
     let mut alpha: F = transcript.challenge();
     let mut beta: F = transcript.challenge();
 
@@ -79,16 +74,15 @@ where
     let mut point: Vec<F> = Vec::new();
     let mut leaf_n = n_root;
     let mut leaf_d = d_root;
-    let mut layers = Vec::with_capacity(log_size);
 
-    for _k in 0..log_size {
-        let mut instance = GkrLayer::new(circuit.level(_k + 1), point.clone(), alpha, beta, claim);
-        let (proof, r_prime) = sumcheck::prove(&mut instance, accumulator, transcript);
-        let leaf_vals @ (nl, nr, dl, dr) = instance.leaf_values();
-        transcript.append(&nl);
-        transcript.append(&nr);
-        transcript.append(&dl);
-        transcript.append(&dr);
+    for k in 0..log_size {
+        let mut instance = GkrLayer::new(circuit.level(k + 1), point.clone(), alpha, beta, claim);
+        let r_prime = sumcheck::prove(&mut instance, accumulator, transcript);
+        let (nl, nr, dl, dr) = instance.leaf_values();
+        transcript.observe(nl);
+        transcript.observe(nr);
+        transcript.observe(dl);
+        transcript.observe(dr);
 
         let t: F = transcript.challenge();
         let new_alpha: F = transcript.challenge();
@@ -106,38 +100,25 @@ where
         beta = new_beta;
         leaf_n = n_comb;
         leaf_d = d_comb;
-        layers.push((proof, leaf_vals));
     }
 
-    (
-        CircuitProof {
-            root: (n_root, d_root),
-            layers,
-        },
-        point,
-        leaf_n,
-        leaf_d,
-    )
+    (point, leaf_n, leaf_d)
 }
 
-/// Verify one circuit top-down, returning the leaf point + leaf fraction. Performs the per-layer
-/// consistency check (`tag` identifies the circuit in any [`GkrError`]).
+/// Verify one circuit top-down by reading its root, per-layer sumchecks, and leaf values out of the
+/// NARG. Returns `(leaf point, Ñ(r*), D̃(r*), n_root, d_root)`; performs the per-layer consistency
+/// check (`tag` identifies the circuit in any [`GkrError`]).
 fn verify_circuit<F, T>(
-    proof: &CircuitProof<F>,
     log_size: usize,
     tag: char,
     transcript: &mut T,
-) -> Result<(Vec<F>, F, F), GkrError>
+) -> Result<(Vec<F>, F, F, F, F), GkrError>
 where
     F: Field,
-    T: Transcript<Challenge = F>,
+    T: VerifierFs<F>,
 {
-    if proof.layers.len() != log_size {
-        return Err(GkrError::Sumcheck);
-    }
-    let (n_root, d_root) = proof.root;
-    transcript.append(&n_root);
-    transcript.append(&d_root);
+    let roots = transcript.read_coeffs(2).ok_or(GkrError::Sumcheck)?;
+    let (n_root, d_root) = (roots[0], roots[1]);
     let mut alpha: F = transcript.challenge();
     let mut beta: F = transcript.challenge();
 
@@ -146,7 +127,7 @@ where
     let mut leaf_n = n_root;
     let mut leaf_d = d_root;
 
-    for (k, (layer_proof, leaf_vals)) in proof.layers.iter().enumerate() {
+    for k in 0..log_size {
         let sumcheck_claim = SumcheckClaim {
             num_vars: k,
             degree: DEGREE,
@@ -155,10 +136,11 @@ where
         let EvaluationClaim {
             point: r_prime,
             value,
-        } = sumcheck::verify(&sumcheck_claim, layer_proof, transcript)
-            .map_err(|_| GkrError::Sumcheck)?;
+        } = sumcheck::verify(&sumcheck_claim, transcript).map_err(|_| GkrError::Sumcheck)?;
 
-        let (nl, nr, dl, dr) = *leaf_vals;
+        let leaf = transcript.read_coeffs(4).ok_or(GkrError::Sumcheck)?;
+        let (nl, nr, dl, dr) = (leaf[0], leaf[1], leaf[2], leaf[3]);
+
         // Per-layer consistency (prototype assert #3): the reduced claim must be the bound eq factor
         // times the gate value at the bound leaf values.
         let eq_bound = EqPolynomial::<F>::mle(&point, &r_prime);
@@ -169,10 +151,6 @@ where
             });
         }
 
-        transcript.append(&nl);
-        transcript.append(&nr);
-        transcript.append(&dl);
-        transcript.append(&dr);
         let t: F = transcript.challenge();
         let new_alpha: F = transcript.challenge();
         let new_beta: F = transcript.challenge();
@@ -191,7 +169,7 @@ where
         leaf_d = d_comb;
     }
 
-    Ok((point, leaf_n, leaf_d))
+    Ok((point, leaf_n, leaf_d, n_root, d_root))
 }
 
 /// Prove the per-family pushforward GKR and append the three leaf/reduction openings to the
@@ -205,7 +183,7 @@ pub fn prove_family_gkr<F, T>(
 ) -> GkrProof<F>
 where
     F: Field,
-    T: Transcript<Challenge = F>,
+    T: ProverFs<F>,
 {
     let circuit_a = Circuit::build(
         data.eq_m_row.clone(),
@@ -218,8 +196,8 @@ where
         data.log_size_b(),
     );
 
-    let (a, point_a, _leaf_n_a, leaf_d_a) = prove_circuit(&circuit_a, accumulator, transcript);
-    let (b, point_b, leaf_n_b, _leaf_d_b) = prove_circuit(&circuit_b, accumulator, transcript);
+    let (point_a, _leaf_n_a, leaf_d_a) = prove_circuit(&circuit_a, accumulator, transcript);
+    let (point_b, leaf_n_b, _leaf_d_b) = prove_circuit(&circuit_b, accumulator, transcript);
 
     // ra_dense (M*) opening: D̃_A(r*_A) = α − M̃*(r*_A) ⇒ M̃*(r*_A) = α − D̃_A.
     accumulator.append_dense(
@@ -243,40 +221,40 @@ where
         data.combined_claim,
     );
 
-    GkrProof { a, b }
+    GkrProof {
+        _marker: PhantomData,
+    }
 }
 
 /// Verify the per-family pushforward GKR, performing the root-histogram, per-layer-consistency, and
 /// leaf-structural checks, and appending the reconstructed openings to the accumulator.
 pub fn verify_family_gkr<F, T>(
     view: &VerifierView<F>,
-    proof: &GkrProof<F>,
+    _proof: &GkrProof<F>,
     family_index: usize,
     accumulator: &mut Openings<F>,
     transcript: &mut T,
 ) -> Result<(), GkrError>
 where
     F: Field,
-    T: Transcript<Challenge = F>,
+    T: VerifierFs<F>,
 {
-    // Root histogram (prototype assert #2): the two fractional sums agree.
-    let (na, da) = proof.a.root;
-    let (nb, db) = proof.b.root;
+    // Circuits are read in the order the prover wrote them (A then B); the root-histogram check
+    // (prototype assert #2) runs once both roots have been read out of the NARG.
+    let (point_a, leaf_n_a, leaf_d_a, na, da) = verify_circuit(view.log_size_a(), 'A', transcript)?;
+    let (point_b, leaf_n_b, _leaf_d_b, nb, db) =
+        verify_circuit(view.log_size_b(), 'B', transcript)?;
+
     if na * db != nb * da {
         return Err(GkrError::RootHistogram);
     }
-
-    let (point_a, leaf_n_a, leaf_d_a) =
-        verify_circuit(&proof.a, view.log_size_a(), 'A', transcript)?;
-    let (point_b, leaf_n_b, leaf_d_b) =
-        verify_circuit(&proof.b, view.log_size_b(), 'B', transcript)?;
 
     // A-circuit numerator leaf is the public eq weighting eq(r_M_row, r*_A).
     if leaf_n_a != EqPolynomial::<F>::mle(&view.r_m_row, &point_a) {
         return Err(GkrError::LeafStructural { circuit: 'A' });
     }
     // B-circuit denominator leaf is the public index polynomial α − k at r*_B.
-    if leaf_d_b != view.alpha - idx_mle_lsb(&point_b) {
+    if _leaf_d_b != view.alpha - idx_mle_lsb(&point_b) {
         return Err(GkrError::LeafStructural { circuit: 'B' });
     }
 
@@ -306,12 +284,12 @@ where
 #[expect(clippy::expect_used)]
 mod tests {
     use super::*;
+    use crate::field::{ProverTranscript, VerifierTranscript};
     use crate::framework::accumulator::OpeningAccumulator;
     use crate::zkvm::logup::pushforward::{
         claim_eval, prepare_family, prepare_family_verifier, Family,
     };
     use jolt_field::goldilocks::GoldilocksFp3 as F;
-    use jolt_transcript::Blake2bTranscript;
 
     struct Rng(u64);
     impl Rng {
@@ -355,13 +333,14 @@ mod tests {
 
         // Prover
         let mut prover_acc = Openings::<F>::new(log_t);
-        let mut prover_t = Blake2bTranscript::<F>::new(b"logup-gkr");
+        let mut prover_t = ProverTranscript::new("logup-gkr");
         let data = prepare_family(&family, &claims, &mut prover_t).expect("prep");
         let proof = prove_family_gkr(&data, 0, &mut prover_acc, &mut prover_t);
+        let narg = prover_t.into_proof();
 
         // Verifier
         let mut verifier_acc = Openings::<F>::new(log_t);
-        let mut verifier_t = Blake2bTranscript::<F>::new(b"logup-gkr");
+        let mut verifier_t = VerifierTranscript::new("logup-gkr", &narg);
         let view = prepare_family_verifier(
             log_t,
             log_d,
@@ -409,7 +388,7 @@ mod tests {
         family_round_trip(0x6005, 3, 2, 5);
     }
 
-    /// Tampering a layer round polynomial trips the framework sumcheck verifier (→ `Sumcheck`).
+    /// Tampering a layer round polynomial in the NARG trips the verifier (sumcheck/consistency).
     #[test]
     fn tampered_layer_proof_rejected() {
         let mut rng = Rng(0x6FEE);
@@ -417,21 +396,17 @@ mod tests {
         let family = synth_family(&mut rng, log_t, log_d, log_m);
         let claims = claim_eval(&family);
         let mut prover_acc = Openings::<F>::new(log_t);
-        let mut prover_t = Blake2bTranscript::<F>::new(b"logup-gkr");
+        let mut prover_t = ProverTranscript::new("logup-gkr");
         let data = prepare_family(&family, &claims, &mut prover_t).expect("prep");
-        let mut proof = prove_family_gkr(&data, 0, &mut prover_acc, &mut prover_t);
+        let proof = prove_family_gkr(&data, 0, &mut prover_acc, &mut prover_t);
+        let mut narg = prover_t.into_proof();
 
-        // Corrupt the deepest A-circuit layer's round polynomial.
-        let last = proof.a.layers.len() - 1;
-        proof.a.layers[last].0.round_polynomials[0] = jolt_poly::UnivariatePoly::new(vec![
-            F::from_u64(1),
-            F::from_u64(2),
-            F::from_u64(3),
-            F::from_u64(4),
-        ]);
+        // Corrupt a byte midway through the NARG (inside the A-circuit layer data).
+        let off = narg.narg_string.len() / 3;
+        narg.narg_string[off] ^= 0x01;
 
         let mut verifier_acc = Openings::<F>::new(log_t);
-        let mut verifier_t = Blake2bTranscript::<F>::new(b"logup-gkr");
+        let mut verifier_t = VerifierTranscript::new("logup-gkr", &narg);
         let view = prepare_family_verifier(
             log_t,
             log_d,
@@ -444,7 +419,7 @@ mod tests {
         assert!(verify_family_gkr(&view, &proof, 0, &mut verifier_acc, &mut verifier_t).is_err());
     }
 
-    /// Tampering a committed root fraction trips the root-histogram check.
+    /// Tampering a committed root fraction (a NARG byte) is rejected.
     #[test]
     fn tampered_root_rejected() {
         let mut rng = Rng(0x6FAB);
@@ -452,14 +427,16 @@ mod tests {
         let family = synth_family(&mut rng, log_t, log_d, log_m);
         let claims = claim_eval(&family);
         let mut prover_acc = Openings::<F>::new(log_t);
-        let mut prover_t = Blake2bTranscript::<F>::new(b"logup-gkr");
+        let mut prover_t = ProverTranscript::new("logup-gkr");
         let data = prepare_family(&family, &claims, &mut prover_t).expect("prep");
-        let mut proof = prove_family_gkr(&data, 0, &mut prover_acc, &mut prover_t);
+        let proof = prove_family_gkr(&data, 0, &mut prover_acc, &mut prover_t);
+        let mut narg = prover_t.into_proof();
 
-        proof.b.root.0 += F::from_u64(1);
+        // Corrupt the very first observed value (circuit A's numerator root).
+        narg.narg_string[0] ^= 0x01;
 
         let mut verifier_acc = Openings::<F>::new(log_t);
-        let mut verifier_t = Blake2bTranscript::<F>::new(b"logup-gkr");
+        let mut verifier_t = VerifierTranscript::new("logup-gkr", &narg);
         let view = prepare_family_verifier(
             log_t,
             log_d,
@@ -469,9 +446,6 @@ mod tests {
             &claims,
             &mut verifier_t,
         );
-        assert_eq!(
-            verify_family_gkr(&view, &proof, 0, &mut verifier_acc, &mut verifier_t),
-            Err(GkrError::RootHistogram),
-        );
+        assert!(verify_family_gkr(&view, &proof, 0, &mut verifier_acc, &mut verifier_t).is_err());
     }
 }

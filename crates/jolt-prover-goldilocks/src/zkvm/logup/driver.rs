@@ -27,9 +27,9 @@
 //! path; the M8 stage driver calls [`prove_family_per_chunk`].
 
 use jolt_field::Field;
-use jolt_transcript::Transcript;
 
 use crate::framework::accumulator::Openings;
+use crate::framework::transcript::{ProverFs, VerifierFs};
 
 use super::gkr::{prove_family_gkr, verify_family_gkr, GkrProof};
 use super::pushforward::{prepare_family, prepare_family_verifier, Family};
@@ -47,7 +47,7 @@ pub fn prove_family<F, T>(
 ) -> Result<GkrProof<F>, GkrError>
 where
     F: Field,
-    T: Transcript<Challenge = F>,
+    T: ProverFs<F>,
 {
     let data = prepare_family(family, input_claims, transcript)?;
     Ok(prove_family_gkr(
@@ -80,7 +80,7 @@ pub fn verify_family<F, T>(
 ) -> Result<(), GkrError>
 where
     F: Field,
-    T: Transcript<Challenge = F>,
+    T: VerifierFs<F>,
 {
     let view = prepare_family_verifier(
         params.log_t,
@@ -135,7 +135,7 @@ pub fn prove_family_per_chunk<F, T>(
 ) -> Result<Vec<GkrProof<F>>, GkrError>
 where
     F: Field,
-    T: Transcript<Challenge = F>,
+    T: ProverFs<F>,
 {
     let r_row = rev(r_cycle);
     let mut proofs = Vec::with_capacity(chunks.len());
@@ -182,7 +182,7 @@ pub fn verify_family_per_chunk<F, T>(
 ) -> Result<(), GkrError>
 where
     F: Field,
-    T: Transcript<Challenge = F>,
+    T: VerifierFs<F>,
 {
     if proofs.len() != chunks.len() {
         return Err(GkrError::Sumcheck);
@@ -212,6 +212,7 @@ where
 #[expect(clippy::expect_used)]
 mod tests {
     use super::*;
+    use crate::field::{ProverTranscript, VerifierTranscript};
     use crate::framework::accumulator::{
         CommittedPolynomial, OpeningAccumulator, OpeningPoint, SumcheckId, VirtualPolynomial,
     };
@@ -220,7 +221,6 @@ mod tests {
     use crate::zkvm::shout_read_raf::{OneHotReadRaf, OneHotReadRafParams, ReadRafStage};
     use jolt_field::goldilocks::GoldilocksFp3 as F;
     use jolt_poly::EqPolynomial;
-    use jolt_transcript::{Blake2bTranscript, Transcript};
 
     struct Rng(u64);
     impl Rng {
@@ -295,7 +295,7 @@ mod tests {
         // Run the read-raf sumcheck (the upstream is UNCHANGED by M7).
         let mut rr_acc = Openings::<F>::new(log_t);
         seed(&mut rr_acc);
-        let mut rr_t = Blake2bTranscript::<F>::new(b"readraf");
+        let mut rr_t = ProverTranscript::new("readraf");
         let params = OneHotReadRafParams::new(
             CommittedPolynomial::InstructionRa,
             SumcheckId::InstructionReadRaf,
@@ -369,9 +369,10 @@ mod tests {
 
         // Prover
         let mut prover_acc = Openings::<F>::new(log_t);
-        let mut prover_t = Blake2bTranscript::<F>::new(b"logup-driver");
+        let mut prover_t = ProverTranscript::new("logup-driver");
         let proof =
             prove_family(&family, &input_claims, 0, &mut prover_acc, &mut prover_t).expect("prove");
+        let narg = prover_t.into_proof();
 
         // Verifier
         let vparams = FamilyVerifierParams {
@@ -382,7 +383,7 @@ mod tests {
             r_col,
         };
         let mut verifier_acc = Openings::<F>::new(log_t);
-        let mut verifier_t = Blake2bTranscript::<F>::new(b"logup-driver");
+        let mut verifier_t = VerifierTranscript::new("logup-driver", &narg);
         verify_family(
             &vparams,
             &input_claims,
@@ -463,7 +464,7 @@ mod tests {
 
         let mut rr_acc = Openings::<F>::new(log_t);
         rr_acc.append_virtual(rv_key.0, rv_key.1, OpeningPoint::new(r_cycle.clone()), rv);
-        let mut rr_t = Blake2bTranscript::<F>::new(b"readraf");
+        let mut rr_t = ProverTranscript::new("readraf");
         let params = OneHotReadRafParams::new(
             CommittedPolynomial::InstructionRa,
             SumcheckId::InstructionReadRaf,
@@ -532,7 +533,7 @@ mod tests {
             .collect();
 
         let mut prover_acc = Openings::<F>::new(log_t);
-        let mut prover_t = Blake2bTranscript::<F>::new(b"option-c");
+        let mut prover_t = ProverTranscript::new("option-c");
         let proofs = prove_family_per_chunk(
             "InstructionRa",
             log_t,
@@ -544,6 +545,7 @@ mod tests {
         )
         .expect("per-chunk prove");
         assert_eq!(proofs.len(), 2);
+        let narg = prover_t.into_proof();
 
         let vchunks: Vec<ChunkVerifierInput<F>> = out
             .iter()
@@ -554,7 +556,7 @@ mod tests {
             })
             .collect();
         let mut verifier_acc = Openings::<F>::new(log_t);
-        let mut verifier_t = Blake2bTranscript::<F>::new(b"option-c");
+        let mut verifier_t = VerifierTranscript::new("option-c", &narg);
         verify_family_per_chunk(
             log_t,
             0,
@@ -608,7 +610,7 @@ mod tests {
         chunks[1].claim += F::from_u64(1);
 
         let mut acc = Openings::<F>::new(log_t);
-        let mut transcript = Blake2bTranscript::<F>::new(b"option-c");
+        let mut transcript = ProverTranscript::new("option-c");
         assert!(matches!(
             prove_family_per_chunk(
                 "InstructionRa",
