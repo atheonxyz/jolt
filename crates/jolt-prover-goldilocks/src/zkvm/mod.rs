@@ -10,3 +10,4 @@ pub mod ram;
 pub mod registers;
 pub mod shout_read_raf;
 pub mod spartan;
+pub mod witness;
