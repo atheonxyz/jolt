@@ -16,6 +16,8 @@ jolt-transcript.workspace = true
 jolt-r1cs.workspace = true
 jolt-lookup-tables.workspace = true
 jolt-witness.workspace = true
+jolt-trace.workspace = true
+jolt-riscv.workspace = true
 # WHIR PCS + shared spongefish transcript (path dep; not in workspace.dependencies).
 jolt-whir = { path = "../jolt-whir", optional = true }
 rayon.workspace = true
