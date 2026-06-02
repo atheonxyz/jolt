@@ -44,15 +44,16 @@
 //! flag/lookup-table-specific `Val_s` construction (incl. multi-table selection and the wide-limb
 //! range-check stages that fold in here per design §4.2), and the `D`-chunk one-hot *commitment*.
 
-use crate::framework::transcript::Challenge;
+use crate::framework::transcript::{Challenge, ProverFs, VerifierFs};
 use jolt_field::{Field, FieldAccumulator};
 use jolt_poly::{BindingOrder, EqPolynomial, UnivariatePoly};
+use jolt_sumcheck::SumcheckClaim;
 
 use crate::framework::accumulator::{
     CommittedPolynomial, OpeningAccumulator, OpeningPoint, Openings, SumcheckId, VirtualPolynomial,
 };
 use crate::framework::poly::MultilinearPolynomial;
-use crate::framework::sumcheck::SumcheckInstance;
+use crate::framework::sumcheck::{prove, verify, SumcheckInstance};
 
 /// One batched stage: a per-stage cycle-eq point `r_cycle`, the public address-only value column
 /// `val_addr` (length `K = ∏_i 2^{log_K_i}`), and the accumulator key of the upstream read claim
@@ -308,14 +309,135 @@ impl<F: Field, const D: usize, const NE: usize> SumcheckInstance<F> for OneHotRe
     }
 }
 
+/// Read-raf stage verification failure.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ReadRafStageError {
+    Sumcheck,
+    OutputClaim,
+}
+
+/// The read-raf stage's proof: the `D` cached `ra_i(r_k_i, r_cycle)` opening claims (chunk order) —
+/// the M7 §4.5.2 inputs the per-chunk pushforward GKR (P7) consumes. The opening *points* are
+/// recomputed from the sumcheck challenges; the committed `ra_dense` columns are PCS-opened at
+/// stage 8. The sumcheck round polynomials live in the shared NARG.
+#[derive(Clone, Debug)]
+pub struct ReadRafStageProof<F: Field> {
+    pub ra_openings: Vec<F>,
+}
+
+/// One family's read-raf stage inputs (the un-`γ`'d [`OneHotReadRafParams`]): which committed RA
+/// family + sumcheck id, the `D` chunk widths, `log_t`, and the per-stage `(r_cycle, val_addr,
+/// rv_key)` columns. Both [`prove_read_raf`] and [`verify_read_raf`] build the same
+/// [`OneHotReadRafParams`] from this (drawing `γ` in lockstep).
+#[derive(Clone, Debug)]
+pub struct ReadRafInputs<F: Field, const D: usize> {
+    pub ra_family: fn(usize) -> CommittedPolynomial,
+    pub sumcheck_id: SumcheckId,
+    pub log_k_chunks: [usize; D],
+    pub log_t: usize,
+    pub stages: Vec<ReadRafStage<F>>,
+}
+
+/// Prove one family's read-raf as a composable stage on the shared transcript + accumulator
+/// (analogous to [`prove_registers`](crate::zkvm::registers::stage::prove_registers)): build the
+/// [`OneHotReadRaf`] instance from the materialized one-hot chunk columns, run it, and extract the
+/// `D` cached `ra_i` openings into the proof. `ra_chunks[i]` is the one-hot lift of chunk `i`'s
+/// dense column (see [`one_hot_ra_column`](crate::zkvm::witness::one_hot_ra_column)).
+///
+/// The per-stage `(r_cycle, val_addr, rv_key)` and the upstream `rv_s` claims are supplied via
+/// `inputs.stages` + the seeded `accumulator` (in the e2e they come from Spartan / the claim
+/// reductions).
+pub fn prove_read_raf<F, T, const D: usize, const NE: usize>(
+    ra_chunks: [Vec<F>; D],
+    inputs: ReadRafInputs<F, D>,
+    accumulator: &mut Openings<F>,
+    transcript: &mut T,
+) -> ReadRafStageProof<F>
+where
+    F: Field,
+    T: ProverFs<F>,
+{
+    let params = OneHotReadRafParams::<F, D>::new(
+        inputs.ra_family,
+        inputs.sumcheck_id,
+        inputs.log_k_chunks,
+        inputs.log_t,
+        inputs.stages,
+        transcript,
+    );
+    let mut instance = OneHotReadRaf::<F, D, NE>::new_prover(params, ra_chunks);
+    let _ = prove(&mut instance, accumulator, transcript);
+    let ra_family = instance.params.ra_family;
+    let sumcheck_id = instance.params.sumcheck_id;
+    let ra_openings = (0..D)
+        .map(|i| {
+            accumulator
+                .get_committed_polynomial_opening(ra_family(i), sumcheck_id)
+                .1
+        })
+        .collect();
+    ReadRafStageProof { ra_openings }
+}
+
+/// Verify one family's read-raf stage (mirror of [`prove_read_raf`]): replay the sumcheck, re-seed
+/// the `D` proof-carried `ra_i` openings at their recomputed chunk points, then check the reduced
+/// claim closes against `(∏_i ra_i)·Σ_s γ^s·eq_s·Val_s`. A tampered `ra_opening` fails that check.
+pub fn verify_read_raf<F, T, const D: usize, const NE: usize>(
+    proof: &ReadRafStageProof<F>,
+    inputs: ReadRafInputs<F, D>,
+    accumulator: &mut Openings<F>,
+    transcript: &mut T,
+) -> Result<(), ReadRafStageError>
+where
+    F: Field,
+    T: VerifierFs<F>,
+{
+    let log_k_chunks = inputs.log_k_chunks;
+    let log_t = inputs.log_t;
+    let params = OneHotReadRafParams::<F, D>::new(
+        inputs.ra_family,
+        inputs.sumcheck_id,
+        log_k_chunks,
+        log_t,
+        inputs.stages,
+        transcript,
+    );
+    let ra_family = params.ra_family;
+    let sumcheck_id = params.sumcheck_id;
+    let log_k: usize = log_k_chunks.iter().sum();
+    let instance = OneHotReadRaf::<F, D, NE>::new_verifier(params);
+    let input_claim = instance.input_claim(accumulator);
+    let claim = SumcheckClaim {
+        num_vars: log_k + log_t,
+        degree: D + 1,
+        claimed_sum: input_claim,
+    };
+    let eval = verify(&claim, transcript).map_err(|_| ReadRafStageError::Sumcheck)?;
+
+    let point = instance.normalize_opening_point(&eval.point);
+    let (r_addr, r_cycle) = point.split_at(log_k);
+    let mut offset = 0;
+    for (i, &c) in proof.ra_openings.iter().enumerate() {
+        let w = log_k_chunks[i];
+        let r_k_i = &r_addr.r[offset..offset + w];
+        offset += w;
+        let chunk_point = OpeningPoint::new([r_k_i, r_cycle.r.as_slice()].concat());
+        accumulator.append_dense(ra_family(i), sumcheck_id, chunk_point, c);
+    }
+    if eval.value != instance.expected_output_claim(accumulator, &eval.point) {
+        return Err(ReadRafStageError::OutputClaim);
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 #[expect(clippy::expect_used)]
 mod tests {
     use super::*;
     use crate::field::{ProverTranscript, VerifierTranscript};
-    use crate::framework::sumcheck::{prove, verify};
+    use crate::zkvm::witness::one_hot_ra_column;
     use jolt_field::goldilocks::GoldilocksFp3 as F;
-    use jolt_sumcheck::{EvaluationClaim, SumcheckClaim};
+    use jolt_sumcheck::EvaluationClaim;
 
     struct Rng(u64);
     impl Rng {
@@ -612,5 +734,122 @@ mod tests {
             verify(&claim, &mut verifier_t).is_err(),
             "tampered proof must be rejected"
         );
+    }
+
+    /// Drive the read-raf STAGE end-to-end: genuine per-chunk index columns → one-hot lift
+    /// ([`one_hot_ra_column`]) → seed the genuine read sum `rv_s = Σ_j eq_s(j)·Val(combined(j))` →
+    /// [`prove_read_raf`]/[`verify_read_raf`]. With `tamper`, corrupting a proof-carried `ra_i`
+    /// opening must trip the output-claim check.
+    fn stage_round_trip<const D: usize, const NE: usize>(
+        cfg: &Config,
+        seed: u64,
+        log_k_chunks: [usize; D],
+        log_t: usize,
+        num_stages: usize,
+        tamper: bool,
+    ) {
+        let mut rng = Rng(seed);
+        let k_dims: [usize; D] = std::array::from_fn(|i| 1usize << log_k_chunks[i]);
+        let suffix = super::suffix_products(&k_dims);
+        let k_total: usize = k_dims.iter().product();
+        let t = 1usize << log_t;
+
+        let indices: [Vec<u32>; D] = std::array::from_fn(|i| {
+            (0..t)
+                .map(|_| (rng.next() as u32) % (k_dims[i] as u32))
+                .collect()
+        });
+        let ra_chunks: [Vec<F>; D] =
+            std::array::from_fn(|i| one_hot_ra_column::<F>(&indices[i], log_k_chunks[i]));
+
+        let shared_r = rand_vec(&mut rng, log_t);
+        let stages: Vec<ReadRafStage<F>> = (0..num_stages)
+            .map(|s| ReadRafStage {
+                r_cycle: if cfg.shared_cycle {
+                    shared_r.clone()
+                } else {
+                    rand_vec(&mut rng, log_t)
+                },
+                val_addr: rand_vec(&mut rng, k_total),
+                rv_key: cfg.rv_keys[s],
+            })
+            .collect();
+
+        // Genuine one-hot read: cycle j reads the single address combined(j) = Σ_i idx_i[j]·suffix[i].
+        let combined: Vec<usize> = (0..t)
+            .map(|j| {
+                indices
+                    .iter()
+                    .zip(suffix.iter())
+                    .fold(0usize, |a, (idx, &s)| a + (idx[j] as usize) * s)
+            })
+            .collect();
+        let seed_acc = |acc: &mut Openings<F>| {
+            for stage in &stages {
+                let eq = EqPolynomial::<F>::evals(&stage.r_cycle, None);
+                let rv = (0..t).fold(F::from_u64(0), |a, j| {
+                    a + eq[j] * stage.val_addr[combined[j]]
+                });
+                acc.append_virtual(
+                    stage.rv_key.0,
+                    stage.rv_key.1,
+                    OpeningPoint::new(stage.r_cycle.clone()),
+                    rv,
+                );
+            }
+        };
+
+        let inputs = || ReadRafInputs::<F, D> {
+            ra_family: cfg.family,
+            sumcheck_id: cfg.sumcheck_id,
+            log_k_chunks,
+            log_t,
+            stages: stages.clone(),
+        };
+
+        let mut prover_acc = Openings::<F>::new(log_t);
+        seed_acc(&mut prover_acc);
+        let mut prover_t = ProverTranscript::new("read-raf-stage");
+        let mut proof =
+            prove_read_raf::<F, _, D, NE>(ra_chunks, inputs(), &mut prover_acc, &mut prover_t);
+        assert_eq!(proof.ra_openings.len(), D, "one cached opening per chunk");
+        let narg = prover_t.into_proof();
+        if tamper {
+            proof.ra_openings[0] += F::from_u64(1);
+        }
+
+        let mut verifier_acc = Openings::<F>::new(log_t);
+        seed_acc(&mut verifier_acc);
+        let mut verifier_t = VerifierTranscript::new("read-raf-stage", &narg);
+        let result =
+            verify_read_raf::<F, _, D, NE>(&proof, inputs(), &mut verifier_acc, &mut verifier_t);
+        if tamper {
+            assert!(result.is_err(), "tampered ra_i opening must be rejected");
+        } else {
+            result.expect("read-raf stage must verify");
+            // The prover + verifier cache the same ra_i openings (= the M7 §4.5.2 inputs).
+            for i in 0..D {
+                let (pp, pc) =
+                    prover_acc.get_committed_polynomial_opening((cfg.family)(i), cfg.sumcheck_id);
+                let (vp, vc) =
+                    verifier_acc.get_committed_polynomial_opening((cfg.family)(i), cfg.sumcheck_id);
+                assert_eq!(pp, vp, "chunk {i} opening point agrees");
+                assert_eq!(pc, vc, "chunk {i} opening claim agrees");
+            }
+        }
+    }
+
+    #[test]
+    fn read_raf_stage_round_trip() {
+        stage_round_trip::<2, 4>(&bytecode_config(), 0xB5A1, [2, 2], 4, 3, false);
+        stage_round_trip::<2, 4>(&bytecode_config(), 0xB5A2, [1, 2], 3, 2, false);
+        stage_round_trip::<5, 7>(&instruction_config(), 0x15A1, [1, 1, 1, 1, 1], 4, 3, false);
+        stage_round_trip::<5, 7>(&instruction_config(), 0x15A2, [2, 1, 1, 2, 1], 3, 2, false);
+    }
+
+    #[test]
+    fn read_raf_stage_tampered_opening_rejected() {
+        stage_round_trip::<2, 4>(&bytecode_config(), 0xB5A9, [2, 2], 4, 2, true);
+        stage_round_trip::<5, 7>(&instruction_config(), 0x15A9, [1, 1, 1, 1, 1], 3, 3, true);
     }
 }

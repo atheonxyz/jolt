@@ -59,6 +59,34 @@ impl RaDenseColumn {
     pub fn committed_key(&self) -> CommittedPolynomial {
         CommittedPolynomial::RaDense(self.global_index)
     }
+
+    /// The one-hot lift of this dense chunk column, the `ra_i` input the read-raf sumcheck binds
+    /// (the inverse of the dense form): `col[idx[j]·T + j] = 1`, address-major (`k·T + j`), length
+    /// `2^log_m · T`. See [`one_hot_ra_column`].
+    pub fn one_hot_column<F: Field>(&self) -> Vec<F> {
+        one_hot_ra_column(&self.indices, self.log_m)
+    }
+}
+
+/// Lift a dense chunk-index column to its one-hot `ra` matrix over `(chunk ∈ [0, 2^log_m), cycle)`:
+/// `col[idx[j]·T + j] = 1`, all else `0`, address-major (`k·T + j`), length `2^log_m · T` (with
+/// `T = indices.len()`, already padded to a power of two by [`CommittedWitness::build`]).
+///
+/// This is the witness-gen the read-raf stage consumes (analogous to `register_witness`/`ram_witness`
+/// building their one-hot `ra`/`wa` matrices). Padding cycles carry index `0`, so they read address
+/// `0` — consistent with the dense column's `None → 0` padding; the upstream `rv`/`Val` make the
+/// padding contributions accounted (the e2e responsibility).
+pub fn one_hot_ra_column<F: Field>(indices: &[u32], log_m: usize) -> Vec<F> {
+    let t = indices.len();
+    debug_assert!(t.is_power_of_two(), "cycle count must be a power of two");
+    let k = 1usize << log_m;
+    let mut col = vec![F::zero(); k * t];
+    for (j, &idx) in indices.iter().enumerate() {
+        let idx = idx as usize;
+        debug_assert!(idx < k, "chunk index {idx} out of range 2^{log_m}");
+        col[idx * t + j] = F::from_u64(1);
+    }
+    col
 }
 
 /// Committed base-field witness, materialized from [`CommitmentTraceSources`] into framework MLEs and
@@ -252,6 +280,42 @@ mod tests {
             let k = key.unwrap() as u32;
             assert_eq!(w.ra_dense[0].indices[cycle], (k >> 2) & 0b11, "hi chunk");
             assert_eq!(w.ra_dense[1].indices[cycle], k & 0b11, "lo chunk");
+        }
+    }
+
+    #[test]
+    fn one_hot_column_inverts_dense() {
+        let trace_len = 6; // pads to 8
+        let sources = synth_sources(4);
+        let w = CommittedWitness::<F>::build(&sources, &layout(trace_len));
+        let t = 1usize << w.log_t;
+
+        for col in &w.ra_dense {
+            let one_hot = col.one_hot_column::<F>();
+            let k = 1usize << col.log_m;
+            assert_eq!(one_hot.len(), k * t, "one-hot length 2^log_m · T");
+
+            // Exactly one hot entry per cycle, at the dense index.
+            for (j, &idx) in col.indices.iter().enumerate() {
+                for kk in 0..k {
+                    let expected = if kk == idx as usize {
+                        F::from_u64(1)
+                    } else {
+                        F::from_u64(0)
+                    };
+                    assert_eq!(
+                        one_hot[kk * t + j],
+                        expected,
+                        "chunk {} cycle {j} addr {kk}",
+                        col.global_index
+                    );
+                }
+            }
+            // Each cycle has Hamming weight exactly one.
+            for j in 0..t {
+                let weight = (0..k).fold(F::from_u64(0), |acc, kk| acc + one_hot[kk * t + j]);
+                assert_eq!(weight, F::from_u64(1), "one-hot Hamming weight per cycle");
+            }
         }
     }
 
