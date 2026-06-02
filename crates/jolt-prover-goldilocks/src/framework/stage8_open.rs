@@ -20,13 +20,18 @@
 //! each; the verifier receives every commitment in the identical order, then verifies each — so the
 //! shared sponge stays in lockstep.
 //!
-//! Built incrementally (per the P9 plan): **S1 (this commit)** is the core commit → open → verify
-//! round-trip over a [`Stage8Columns`] map + a [`Stage8Inventory`]. The per-limb Inc reconstruct
-//! (`Inc(ρ) = lo + 2³²·hi` vs the recomposed `RamInc`/`RdInc` claims), the `Pushforward` `P^F`
-//! base-limb decomposition, and the `build_committed_columns` materialization from the real witness
-//! land in the following sub-commits.
+//! Built incrementally (per the P9 plan): **S1** is the core commit → open → verify round-trip over
+//! a [`Stage8Columns`] map + a [`Stage8Inventory`] ([`prove_stage8`]/[`verify_stage8`]). **S2** adds
+//! the per-limb Inc open + linear reconstruct ([`prove_inc_open`]/[`verify_inc_open`]):
+//! `Inc(ρ) = lo + 2³²·hi` checked against the memory stage's recomposed `RamInc`/`RdInc` claims, run
+//! after the inventory open on the same transcript (the combined round-trip is tested). Remaining:
+//! the `Pushforward` `P^F` base-limb decomposition + the `build_committed_columns` materialization
+//! from the real witness (S3), and appending the Inc-limb / `Pushforward`-limb / range-check-half
+//! opens to [`canonical_requests`](crate::framework::stage8::canonical_requests).
 
 use std::collections::HashMap;
+
+use jolt_field::Field;
 
 use crate::field::{
     Base, ProverTranscript, VerifierTranscript, WhirCommitment, WhirError, WhirHint, WhirScheme, F,
@@ -73,6 +78,135 @@ pub enum Stage8OpenError {
     MissingColumn(CommittedPolynomial),
     /// A WHIR commit/open/verify rejected.
     Whir(WhirError),
+    /// A per-limb Inc reconstruct `lo + 2³²·hi` did not match the recomposed claim.
+    IncReconstruct,
+}
+
+/// The Inc committed columns: each of `RdInc`/`RamInc` is committed as its two signed base-Goldilocks
+/// limbs `lo`/`hi` (Fork 3), not the recomposed value. Length `2^log_t` each.
+#[derive(Clone, Debug)]
+pub struct IncLimbColumns {
+    pub rd_inc_lo: Vec<Base>,
+    pub rd_inc_hi: Vec<Base>,
+    pub ram_inc_lo: Vec<Base>,
+    pub ram_inc_hi: Vec<Base>,
+}
+
+/// The Inc-limb opening evals carried in the proof (WHIR-proven at the recomposed-claim points):
+/// `[rd_lo(ρ_rd), rd_hi(ρ_rd), ram_lo(ρ_ram), ram_hi(ρ_ram)]`. The verifier reconstructs
+/// `lo + 2³²·hi` from these and checks against the memory stage's recomposed `RamInc`/`RdInc` claims.
+#[derive(Clone, Debug)]
+pub struct Stage8IncProof<F2> {
+    pub evals: [F2; 4],
+}
+
+/// `2³²` over `F` — the linear limb-recomposition weight (`signed_limbs_recompose`).
+#[inline]
+fn limb_weight() -> F {
+    F::from_u64(1u64 << 32)
+}
+
+/// **Prover (Inc limbs).** Commit the four signed Inc limb columns on the shared transcript and open
+/// each at the recomposed-claim point for its family (`rd` limbs at `rd_point`, `ram` limbs at
+/// `ram_point`). Returns the four limb evals for the proof. Call AFTER [`prove_stage8`] (same
+/// transcript) so the commit order is fixed.
+pub fn prove_inc_open(
+    transcript: &mut ProverTranscript,
+    inc: &IncLimbColumns,
+    rd_point: &[F],
+    ram_point: &[F],
+) -> Stage8IncProof<F> {
+    let rd_cfg = WhirScheme::config(inc.rd_inc_lo.len());
+    let ram_cfg = WhirScheme::config(inc.ram_inc_lo.len());
+
+    // Commit all four limbs, then open each at its family's point.
+    let h_rd_lo = WhirScheme::commit(transcript, &rd_cfg, &inc.rd_inc_lo);
+    let h_rd_hi = WhirScheme::commit(transcript, &rd_cfg, &inc.rd_inc_hi);
+    let h_ram_lo = WhirScheme::commit(transcript, &ram_cfg, &inc.ram_inc_lo);
+    let h_ram_hi = WhirScheme::commit(transcript, &ram_cfg, &inc.ram_inc_hi);
+
+    let rd_lo = WhirScheme::evaluate(&rd_cfg, &inc.rd_inc_lo, rd_point);
+    let rd_hi = WhirScheme::evaluate(&rd_cfg, &inc.rd_inc_hi, rd_point);
+    let ram_lo = WhirScheme::evaluate(&ram_cfg, &inc.ram_inc_lo, ram_point);
+    let ram_hi = WhirScheme::evaluate(&ram_cfg, &inc.ram_inc_hi, ram_point);
+
+    WhirScheme::open(
+        transcript,
+        &rd_cfg,
+        &inc.rd_inc_lo,
+        h_rd_lo,
+        rd_point,
+        rd_lo,
+    );
+    WhirScheme::open(
+        transcript,
+        &rd_cfg,
+        &inc.rd_inc_hi,
+        h_rd_hi,
+        rd_point,
+        rd_hi,
+    );
+    WhirScheme::open(
+        transcript,
+        &ram_cfg,
+        &inc.ram_inc_lo,
+        h_ram_lo,
+        ram_point,
+        ram_lo,
+    );
+    WhirScheme::open(
+        transcript,
+        &ram_cfg,
+        &inc.ram_inc_hi,
+        h_ram_hi,
+        ram_point,
+        ram_hi,
+    );
+
+    Stage8IncProof {
+        evals: [rd_lo, rd_hi, ram_lo, ram_hi],
+    }
+}
+
+/// **Verifier (Inc limbs)** (mirror of [`prove_inc_open`]). Receive the four limb commitments, verify
+/// each open against the proof-carried evals, then check the linear reconstruct
+/// `lo + 2³²·hi == recomposed claim` for each family (`rd_claim`/`ram_claim` from the memory stage's
+/// `IncClaimReduction`).
+pub fn verify_inc_open(
+    transcript: &mut VerifierTranscript,
+    rd_point: &[F],
+    ram_point: &[F],
+    proof: &Stage8IncProof<F>,
+    rd_claim: F,
+    ram_claim: F,
+) -> Result<(), Stage8OpenError> {
+    let rd_cfg = WhirScheme::config(1usize << rd_point.len());
+    let ram_cfg = WhirScheme::config(1usize << ram_point.len());
+    let [rd_lo, rd_hi, ram_lo, ram_hi] = proof.evals;
+
+    let c_rd_lo =
+        WhirScheme::receive_commitment(transcript, &rd_cfg).map_err(Stage8OpenError::Whir)?;
+    let c_rd_hi =
+        WhirScheme::receive_commitment(transcript, &rd_cfg).map_err(Stage8OpenError::Whir)?;
+    let c_ram_lo =
+        WhirScheme::receive_commitment(transcript, &ram_cfg).map_err(Stage8OpenError::Whir)?;
+    let c_ram_hi =
+        WhirScheme::receive_commitment(transcript, &ram_cfg).map_err(Stage8OpenError::Whir)?;
+
+    WhirScheme::verify(transcript, &rd_cfg, &c_rd_lo, rd_point, rd_lo)
+        .map_err(Stage8OpenError::Whir)?;
+    WhirScheme::verify(transcript, &rd_cfg, &c_rd_hi, rd_point, rd_hi)
+        .map_err(Stage8OpenError::Whir)?;
+    WhirScheme::verify(transcript, &ram_cfg, &c_ram_lo, ram_point, ram_lo)
+        .map_err(Stage8OpenError::Whir)?;
+    WhirScheme::verify(transcript, &ram_cfg, &c_ram_hi, ram_point, ram_hi)
+        .map_err(Stage8OpenError::Whir)?;
+
+    let w = limb_weight();
+    if rd_lo + w * rd_hi != rd_claim || ram_lo + w * ram_hi != ram_claim {
+        return Err(Stage8OpenError::IncReconstruct);
+    }
+    Ok(())
 }
 
 /// **Prover.** Commit every inventory column on the shared transcript (size class ascending), then
@@ -139,6 +273,7 @@ pub fn verify_stage8(
 mod tests {
     use super::*;
     use crate::framework::accumulator::{OpeningPoint, BIG_ENDIAN};
+    use jolt_field::goldilocks::decompose::{i128_to_signed_limbs, signed_limbs_recompose};
     use jolt_field::Field;
 
     struct Rng(u64);
@@ -227,6 +362,109 @@ mod tests {
                 CommittedPolynomial::RaDense(0)
             ))
         );
+    }
+
+    /// Inc limb columns + their two recomposed-claim points + the independent recomposed claims
+    /// (the Inc MLE = `signed_limbs_recompose` per cell, evaluated at each point). Increments have
+    /// magnitude > 2³² (so both lo + hi columns are non-degenerate) and mixed sign.
+    fn inc_setup(log_t: usize) -> (IncLimbColumns, Vec<F>, Vec<F>, F, F) {
+        let n = 1usize << log_t;
+        let incs: Vec<i128> = (0..n as i128)
+            .map(|j| {
+                let base = (j + 1) * 0x1_2345_6789;
+                if j % 2 == 0 {
+                    base
+                } else {
+                    -base
+                }
+            })
+            .collect();
+        let limbs: Vec<[Base; 2]> = incs.iter().map(|&v| i128_to_signed_limbs(v)).collect();
+        let inc = IncLimbColumns {
+            rd_inc_lo: limbs.iter().map(|l| l[0]).collect(),
+            rd_inc_hi: limbs.iter().map(|l| l[1]).collect(),
+            ram_inc_lo: limbs.iter().map(|l| l[0]).collect(),
+            ram_inc_hi: limbs.iter().map(|l| l[1]).collect(),
+        };
+        let rd_point = pt(log_t, 0x500);
+        let ram_point = pt(log_t, 0x501);
+        let recomposed: Vec<Base> = limbs.iter().map(|l| signed_limbs_recompose(*l)).collect();
+        let cfg = WhirScheme::config(n);
+        let rd_claim = WhirScheme::evaluate(&cfg, &recomposed, &rd_point);
+        let ram_claim = WhirScheme::evaluate(&cfg, &recomposed, &ram_point);
+        (inc, rd_point, ram_point, rd_claim, ram_claim)
+    }
+
+    #[test]
+    fn inc_reconstruct_round_trip() {
+        let (inc, rd_point, ram_point, rd_claim, ram_claim) = inc_setup(5);
+        let mut prover_t = ProverTranscript::new("inc-open");
+        let proof = prove_inc_open(&mut prover_t, &inc, &rd_point, &ram_point);
+        // lo + 2^32·hi reconstructs the recomposed claim (linearity).
+        assert_eq!(proof.evals[0] + limb_weight() * proof.evals[1], rd_claim);
+        let narg = prover_t.into_proof();
+
+        let mut verifier_t = VerifierTranscript::new("inc-open", &narg);
+        verify_inc_open(
+            &mut verifier_t,
+            &rd_point,
+            &ram_point,
+            &proof,
+            rd_claim,
+            ram_claim,
+        )
+        .expect("verify inc");
+    }
+
+    #[test]
+    fn inc_reconstruct_tampered_claim_rejected() {
+        let (inc, rd_point, ram_point, rd_claim, ram_claim) = inc_setup(5);
+        let mut prover_t = ProverTranscript::new("inc-open");
+        let proof = prove_inc_open(&mut prover_t, &inc, &rd_point, &ram_point);
+        let narg = prover_t.into_proof();
+
+        // Corrupt the recomposed RdInc claim → the WHIR opens still pass but the linear reconstruct
+        // lo + 2^32·hi != rd_claim fails.
+        let mut verifier_t = VerifierTranscript::new("inc-open", &narg);
+        assert_eq!(
+            verify_inc_open(
+                &mut verifier_t,
+                &rd_point,
+                &ram_point,
+                &proof,
+                rd_claim + F::from_u64(1),
+                ram_claim,
+            ),
+            Err(Stage8OpenError::IncReconstruct)
+        );
+    }
+
+    /// Combined: inventory open (S1) then Inc limb open (S2) on ONE transcript — validates the
+    /// interleaved commit/open ordering (inventory committed+opened, then Inc) round-trips.
+    #[test]
+    fn inventory_then_inc_round_trip() {
+        let (columns, inventory) = build(&[
+            (CommittedPolynomial::RaDense(0), 5, 0x70),
+            (CommittedPolynomial::R1csAux(0), 5, 0x71),
+        ]);
+        let (inc, rd_point, ram_point, rd_claim, ram_claim) = inc_setup(5);
+
+        let mut prover_t = ProverTranscript::new("combined");
+        prove_stage8(&mut prover_t, &columns, &inventory).expect("prove inventory");
+        let proof = prove_inc_open(&mut prover_t, &inc, &rd_point, &ram_point);
+        let narg = prover_t.into_proof();
+
+        let mut verifier_t = VerifierTranscript::new("combined", &narg);
+        verify_stage8(&mut verifier_t, &inventory).expect("verify inventory");
+        verify_inc_open(
+            &mut verifier_t,
+            &rd_point,
+            &ram_point,
+            &proof,
+            rd_claim,
+            ram_claim,
+        )
+        .expect("verify inc");
     }
 
     #[test]
