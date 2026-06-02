@@ -24,10 +24,13 @@
 //! a [`Stage8Columns`] map + a [`Stage8Inventory`] ([`prove_stage8`]/[`verify_stage8`]). **S2** adds
 //! the per-limb Inc open + linear reconstruct ([`prove_inc_open`]/[`verify_inc_open`]):
 //! `Inc(ρ) = lo + 2³²·hi` checked against the memory stage's recomposed `RamInc`/`RdInc` claims, run
-//! after the inventory open on the same transcript (the combined round-trip is tested). Remaining:
-//! the `Pushforward` `P^F` base-limb decomposition + the `build_committed_columns` materialization
-//! from the real witness (S3), and appending the Inc-limb / `Pushforward`-limb / range-check-half
-//! opens to [`canonical_requests`](crate::framework::stage8::canonical_requests).
+//! after the inventory open on the same transcript (the combined round-trip is tested). **S3a** adds
+//! the `Pushforward` `P^F` Fp3 → 3-base-limb open + β-reconstruct
+//! ([`prove_pushforward_open`]/[`verify_pushforward_open`]): `P^F(r) = c0(r) + β·c1(r) + β²·c2(r)`
+//! checked against the GKR/reduction claim. Remaining (S3b): `build_committed_columns` to
+//! materialize all base columns from the real `CommittedWitness`/`CommitmentTraceSources`/pushforward
+//! outputs, and appending the Inc-limb / `Pushforward`-limb / range-check-half opens to
+//! [`canonical_requests`](crate::framework::stage8::canonical_requests).
 
 use std::collections::HashMap;
 
@@ -166,6 +169,110 @@ pub fn prove_inc_open(
     Stage8IncProof {
         evals: [rd_lo, rd_hi, ram_lo, ram_hi],
     }
+}
+
+/// One Fp3 committed column (the eq-weighted pushforward `P^F`) decomposed into its three base-
+/// Goldilocks coefficient limbs `c0`/`c1`/`c2` — the WHIR commit alphabet is base-Goldilocks, so the
+/// Fp3 `P^F` is committed coefficient-wise and reconstructed at open. Each limb has length `2^log_m`.
+#[derive(Clone, Debug)]
+pub struct Fp3LimbColumns {
+    pub c0: Vec<Base>,
+    pub c1: Vec<Base>,
+    pub c2: Vec<Base>,
+}
+
+impl Fp3LimbColumns {
+    /// Decompose an Fp3 MLE column into its three base-Goldilocks coefficient columns.
+    pub fn from_fp3(column: &[F]) -> Self {
+        let mut c0 = Vec::with_capacity(column.len());
+        let mut c1 = Vec::with_capacity(column.len());
+        let mut c2 = Vec::with_capacity(column.len());
+        for x in column {
+            let c = x.coeffs();
+            c0.push(c[0]);
+            c1.push(c[1]);
+            c2.push(c[2]);
+        }
+        Self { c0, c1, c2 }
+    }
+}
+
+/// Linear reconstruct `P^F(r) = c0(r) + β·c1(r) + β²·c2(r)` from the three limb evals (β is the Fp3
+/// generator `[0,1,0]`). Equals the Fp3 MLE of `P^F` at `r` by linearity of the WHIR evaluation over
+/// the coefficient columns.
+#[inline]
+fn fp3_reconstruct(evals: [F; 3]) -> F {
+    let beta = F::new(Base::from_u64(0), Base::from_u64(1), Base::from_u64(0));
+    let beta2 = F::new(Base::from_u64(0), Base::from_u64(0), Base::from_u64(1));
+    evals[0] + beta * evals[1] + beta2 * evals[2]
+}
+
+/// **Prover (Pushforward limbs).** For each pushforward chunk, commit its three Fp3-coefficient base
+/// columns on the shared transcript and open each at the chunk's point. Returns the per-chunk
+/// `[c0, c1, c2]` evals for the proof. Call after [`prove_stage8`]/[`prove_inc_open`] (same
+/// transcript) so the commit order is fixed.
+pub fn prove_pushforward_open(
+    transcript: &mut ProverTranscript,
+    chunks: &[Fp3LimbColumns],
+    points: &[Vec<F>],
+) -> Vec<[F; 3]> {
+    debug_assert_eq!(
+        chunks.len(),
+        points.len(),
+        "one point per pushforward chunk"
+    );
+    // Commit all limbs (chunk order, c0/c1/c2), staging the opens.
+    let mut staged: Vec<(WhirHint, &[Base], usize, usize)> = Vec::new(); // (hint, col, chunk, limb)
+    for (i, chunk) in chunks.iter().enumerate() {
+        let cfg = WhirScheme::config(chunk.c0.len());
+        for (limb, col) in [&chunk.c0, &chunk.c1, &chunk.c2].into_iter().enumerate() {
+            let hint = WhirScheme::commit(transcript, &cfg, col);
+            staged.push((hint, col, i, limb));
+        }
+    }
+    let mut evals = vec![[F::from_u64(0); 3]; chunks.len()];
+    for (hint, col, chunk, limb) in staged {
+        let cfg = WhirScheme::config(col.len());
+        let eval = WhirScheme::evaluate(&cfg, col, &points[chunk]);
+        WhirScheme::open(transcript, &cfg, col, hint, &points[chunk], eval);
+        evals[chunk][limb] = eval;
+    }
+    evals
+}
+
+/// **Verifier (Pushforward limbs)** (mirror of [`prove_pushforward_open`]). Receive each chunk's
+/// three limb commitments, verify the opens against the proof-carried evals, then reconstruct
+/// `c0 + β·c1 + β²·c2` and check it against the chunk's claimed `P^F(r)` (`claims[i]`).
+pub fn verify_pushforward_open(
+    transcript: &mut VerifierTranscript,
+    points: &[Vec<F>],
+    proof: &[[F; 3]],
+    claims: &[F],
+) -> Result<(), Stage8OpenError> {
+    if proof.len() != points.len() || claims.len() != points.len() {
+        return Err(Stage8OpenError::IncReconstruct);
+    }
+    // Receive all commitments (chunk order, c0/c1/c2).
+    let mut comms: Vec<(WhirCommitment, usize, usize)> = Vec::new();
+    for (i, point) in points.iter().enumerate() {
+        let cfg = WhirScheme::config(1usize << point.len());
+        for limb in 0..3 {
+            let c =
+                WhirScheme::receive_commitment(transcript, &cfg).map_err(Stage8OpenError::Whir)?;
+            comms.push((c, i, limb));
+        }
+    }
+    for (c, chunk, limb) in &comms {
+        let cfg = WhirScheme::config(1usize << points[*chunk].len());
+        WhirScheme::verify(transcript, &cfg, c, &points[*chunk], proof[*chunk][*limb])
+            .map_err(Stage8OpenError::Whir)?;
+    }
+    for (i, claim) in claims.iter().enumerate() {
+        if fp3_reconstruct(proof[i]) != *claim {
+            return Err(Stage8OpenError::IncReconstruct);
+        }
+    }
+    Ok(())
 }
 
 /// **Verifier (Inc limbs)** (mirror of [`prove_inc_open`]). Receive the four limb commitments, verify
@@ -435,6 +542,82 @@ mod tests {
                 rd_claim + F::from_u64(1),
                 ram_claim,
             ),
+            Err(Stage8OpenError::IncReconstruct)
+        );
+    }
+
+    fn fp3_col(size: usize, seed: u64) -> Vec<F> {
+        let mut rng = Rng(seed | 1);
+        (0..size)
+            .map(|_| {
+                F::new(
+                    Base::from_u64(rng.next() | 1),
+                    Base::from_u64(rng.next() | 1),
+                    Base::from_u64(rng.next() | 1),
+                )
+            })
+            .collect()
+    }
+
+    /// Fp3 MLE of `column` at `point` via the eq dot product (jolt-poly convention).
+    fn fp3_mle(column: &[F], point: &[F]) -> F {
+        let eq = jolt_poly::EqPolynomial::<F>::evals(point, None);
+        column
+            .iter()
+            .zip(eq.iter())
+            .fold(F::from_u64(0), |a, (x, e)| a + *x * *e)
+    }
+
+    #[test]
+    fn pushforward_decompose_identity() {
+        // Pure-math: an Fp3 column's MLE equals the β-reconstruct of its three base-limb MLEs.
+        let point = pt(4, 0x80);
+        let column = fp3_col(1 << 4, 0x81);
+        let limbs = Fp3LimbColumns::from_fp3(&column);
+        let lift = |c: &[Base]| {
+            fp3_mle(
+                &c.iter().map(|&b| F::from_base(b)).collect::<Vec<_>>(),
+                &point,
+            )
+        };
+        let reconstructed = fp3_reconstruct([lift(&limbs.c0), lift(&limbs.c1), lift(&limbs.c2)]);
+        assert_eq!(fp3_mle(&column, &point), reconstructed);
+    }
+
+    #[test]
+    fn pushforward_reconstruct_round_trip() {
+        let log_m = 4;
+        let n = 1usize << log_m;
+        let cols = [fp3_col(n, 0x90), fp3_col(n, 0x91)];
+        let limbs: Vec<Fp3LimbColumns> = cols.iter().map(|c| Fp3LimbColumns::from_fp3(c)).collect();
+        let points = vec![pt(log_m, 0x92), pt(log_m, 0x93)];
+
+        let mut prover_t = ProverTranscript::new("pf-open");
+        let proof = prove_pushforward_open(&mut prover_t, &limbs, &points);
+        // The reconstruct of the WHIR limb evals is the (WHIR-convention) P^F eval — use it as the claim.
+        let claims: Vec<F> = proof.iter().map(|e| fp3_reconstruct(*e)).collect();
+        let narg = prover_t.into_proof();
+
+        let mut verifier_t = VerifierTranscript::new("pf-open", &narg);
+        verify_pushforward_open(&mut verifier_t, &points, &proof, &claims)
+            .expect("verify pushforward");
+    }
+
+    #[test]
+    fn pushforward_tampered_claim_rejected() {
+        let log_m = 4;
+        let cols = [fp3_col(1 << log_m, 0xA0)];
+        let limbs: Vec<Fp3LimbColumns> = cols.iter().map(|c| Fp3LimbColumns::from_fp3(c)).collect();
+        let points = vec![pt(log_m, 0xA1)];
+        let mut prover_t = ProverTranscript::new("pf-open");
+        let proof = prove_pushforward_open(&mut prover_t, &limbs, &points);
+        let narg = prover_t.into_proof();
+
+        // Corrupt the claimed P^F eval → the limb opens still verify but the β-reconstruct mismatches.
+        let claims = vec![fp3_reconstruct(proof[0]) + F::from_u64(1)];
+        let mut verifier_t = VerifierTranscript::new("pf-open", &narg);
+        assert_eq!(
+            verify_pushforward_open(&mut verifier_t, &points, &proof, &claims),
             Err(Stage8OpenError::IncReconstruct)
         );
     }
