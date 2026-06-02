@@ -4,6 +4,7 @@
 pub mod booleanity;
 pub mod bytecode;
 pub mod claim_reductions;
+pub mod driver;
 pub mod instruction_lookups;
 pub mod logup;
 pub mod r1cs_witness;
