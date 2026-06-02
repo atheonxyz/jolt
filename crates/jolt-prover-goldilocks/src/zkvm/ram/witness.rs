@@ -43,6 +43,8 @@ pub struct RamWitness<F: Field> {
     pub ram_read_value: Vec<F>,
     /// Write (post) value per cycle (`0` if no access), length `T`.
     pub ram_write_value: Vec<F>,
+    /// Final memory state after all cycles, address-major (length `K`). Feeds the output-check.
+    pub val_final: Vec<F>,
 }
 
 /// Simulate RAM over `trace`, materializing the dense witness columns.
@@ -88,6 +90,8 @@ pub fn ram_witness<C: CycleRow, F: Field>(trace: &[C], ram_k: usize) -> RamWitne
         }
     }
 
+    let val_final = state.iter().map(|&s| F::from_u64(s)).collect();
+
     RamWitness {
         log_k,
         log_t,
@@ -96,6 +100,7 @@ pub fn ram_witness<C: CycleRow, F: Field>(trace: &[C], ram_k: usize) -> RamWitne
         inc,
         ram_read_value,
         ram_write_value,
+        val_final,
     }
 }
 

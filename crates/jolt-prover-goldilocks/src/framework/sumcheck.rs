@@ -12,8 +12,7 @@
 use jolt_field::Field;
 use jolt_poly::UnivariatePoly;
 use jolt_sumcheck::{
-    BatchedSumcheckVerifier, EvaluationClaim, RoundProof, SumcheckClaim, SumcheckError,
-    SumcheckProof, SumcheckVerifier,
+    EvaluationClaim, RoundProof, SumcheckClaim, SumcheckError, SumcheckProof, SumcheckVerifier,
 };
 use jolt_transcript::{AppendToTranscript, Transcript};
 
@@ -233,19 +232,52 @@ where
     )
 }
 
-/// Verify a batched proof via the workspace [`BatchedSumcheckVerifier`], returning the combined
-/// reduced claim `{point, value}`. The caller discharges `value` against
-/// `Σ_j α^j · expected_output_claim_j` at each instance's challenge slice.
+/// Verify a batched proof, returning the combined reduced claim `{point, value}` **and** the
+/// batching coefficients `α^j`. The caller discharges `value` against
+/// `Σ_j α^j · expected_output_claim_j` at each instance's challenge slice — so it needs the `α^j`.
+///
+/// This inlines the [`BatchedSumcheckVerifier`] front-loaded combination (absorb the claimed sums →
+/// squeeze `α` → scale each by `2^{max−n_j}` → combine with `α^j`) *verbatim*, then delegates the
+/// actual sumcheck check to the workspace single-instance [`SumcheckVerifier`]. Reimplemented (rather
+/// than calling `BatchedSumcheckVerifier::verify`) solely to expose the `α^j` the caller needs;
+/// the Fiat-Shamir order + scaling are identical, so the proof is the same one `prove_batched` emits.
 pub fn verify_batched<F, T>(
     claims: &[SumcheckClaim<F>],
     proof: &SumcheckProof<F>,
     transcript: &mut T,
-) -> Result<EvaluationClaim<F>, SumcheckError<F>>
+) -> Result<(EvaluationClaim<F>, Vec<F>), SumcheckError<F>>
 where
     F: Field,
     T: Transcript<Challenge = F>,
 {
-    BatchedSumcheckVerifier::verify(claims, &proof.round_polynomials, transcript)
+    let (first, rest) = claims.split_first().ok_or(SumcheckError::EmptyClaims)?;
+    let max_num_vars = rest
+        .iter()
+        .fold(first.num_vars, |acc, c| acc.max(c.num_vars));
+    let max_degree = rest.iter().fold(first.degree, |acc, c| acc.max(c.degree));
+
+    for claim in claims {
+        claim.claimed_sum.append_to_transcript(transcript);
+    }
+    let alpha: F = transcript.challenge();
+
+    let mut batching_coeffs = Vec::with_capacity(claims.len());
+    let mut power = F::one();
+    let mut combined_sum = F::zero();
+    for claim in claims {
+        batching_coeffs.push(power);
+        let scaled = claim.claimed_sum.mul_pow_2(max_num_vars - claim.num_vars);
+        combined_sum += power * scaled;
+        power *= alpha;
+    }
+
+    let combined_claim = SumcheckClaim {
+        num_vars: max_num_vars,
+        degree: max_degree,
+        claimed_sum: combined_sum,
+    };
+    let eval = SumcheckVerifier::verify(&combined_claim, &proof.round_polynomials, transcript)?;
+    Ok((eval, batching_coeffs))
 }
 
 #[cfg(test)]
@@ -440,11 +472,15 @@ mod tests {
         assert_eq!(challenges.len(), 4, "challenges has length max_num_rounds");
 
         let mut verifier_t = Blake2bTranscript::<Goldilocks>::new(b"batched");
-        let EvaluationClaim { point, value } =
+        let (EvaluationClaim { point, value }, vcoeffs) =
             verify_batched(&claims, &proof, &mut verifier_t).expect("batched proof must verify");
         assert_eq!(
             point, challenges,
             "verifier point matches prover challenges"
+        );
+        assert_eq!(
+            vcoeffs, coeffs,
+            "verifier recomputes the prover's α^j coeffs"
         );
 
         // Combined reduced claim = Σ_j α^j · A_j(r_slice)·B_j(r_slice) at each instance's active slice
