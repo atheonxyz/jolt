@@ -388,6 +388,7 @@ pub(crate) mod tests_support {
         rs1: Option<(u8, u64)>,
         rs2: Option<(u8, u64)>,
         rd: Option<(u8, u64, u64)>,
+        ram: Option<(u64, u64, u64)>,
         imm: i128,
         lookup_output: u64,
         cflags: CircuitFlagSet,
@@ -402,6 +403,7 @@ pub(crate) mod tests_support {
                 rs1: None,
                 rs2: None,
                 rd: None,
+                ram: None,
                 imm: 0,
                 lookup_output: 0,
                 cflags: CircuitFlagSet::default(),
@@ -415,6 +417,7 @@ pub(crate) mod tests_support {
                 rs1: Some((1, left)),
                 rs2: Some((2, right)),
                 rd: None,
+                ram: None,
                 imm: 0,
                 lookup_output: left.wrapping_add(right),
                 cflags: CircuitFlagSet::default().set(CircuitFlags::AddOperands),
@@ -427,6 +430,12 @@ pub(crate) mod tests_support {
         /// read-write witness-gen tests.
         pub(crate) fn with_rd(mut self, rd: u8, pre: u64, post: u64) -> Self {
             self.rd = Some((rd, pre, post));
+            self
+        }
+        /// Set a RAM access `(dense_address, read_value, write_value)`. The RAM witness-gen derives
+        /// the pre-value from tracked state and uses only the `write − read` delta as the increment.
+        pub(crate) fn with_ram(mut self, address: u64, read: u64, write: u64) -> Self {
+            self.ram = Some((address, read, write));
             self
         }
         /// Set the read operands `(rs1_reg, rs2_reg)` (values are derived from register state by the
@@ -470,13 +479,13 @@ pub(crate) mod tests_support {
             self.rd.map(|(reg, _, _)| reg)
         }
         fn ram_access_address(&self) -> Option<u64> {
-            None
+            self.ram.map(|(addr, _, _)| addr)
         }
         fn ram_read_value(&self) -> Option<u64> {
-            None
+            self.ram.map(|(_, read, _)| read)
         }
         fn ram_write_value(&self) -> Option<u64> {
-            None
+            self.ram.map(|(_, _, write)| write)
         }
         fn imm(&self) -> i128 {
             self.imm
