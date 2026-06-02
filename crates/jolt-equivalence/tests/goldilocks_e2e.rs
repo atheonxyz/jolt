@@ -8,11 +8,14 @@
 //! Milestones land incrementally:
 //!   M0 — assemble all binary-driver witnesses from the real trace; assert the limbed R1CS is
 //!        satisfied (flushes out `cycle_to_z` op-coverage on real MUL/virtual-sequence cycles).
+//!   M1 — the binary driver (Spartan -> memory -> booleanity) round-trips on the real trace.
 #![cfg(feature = "goldilocks")]
 
 use common::constants::REGISTER_COUNT;
 use jolt_core::host;
 use jolt_core::zkvm::ram::remap_address;
+use jolt_prover_goldilocks::field::{ProverTranscript, VerifierTranscript};
+use jolt_prover_goldilocks::zkvm::driver::{prove_binary, verify_binary};
 use jolt_prover_goldilocks::zkvm::real_trace::{assemble_real_witness, RealWitness};
 use jolt_prover_goldilocks::F;
 use jolt_trace::{BytecodePreprocessing, CycleRow};
@@ -76,4 +79,33 @@ fn goldilocks_real_trace_r1cs_is_satisfied() {
         w.ram.log_k,
         w.registers.log_k,
     );
+}
+
+#[test]
+fn goldilocks_real_trace_binary_driver_round_trip() {
+    let (w, _trace_len) = build_muldiv_real_witness();
+
+    let mut prover_t = ProverTranscript::new("muldiv-binary-e2e");
+    let proof = prove_binary(
+        &w.r1cs,
+        &w.ram,
+        &w.registers,
+        &w.ram_public,
+        &w.key,
+        &mut prover_t,
+    );
+    let narg = prover_t.into_proof();
+
+    let mut verifier_t = VerifierTranscript::new("muldiv-binary-e2e", &narg);
+    verify_binary(
+        &proof,
+        &w.key,
+        w.r1cs.num_row_vars(),
+        w.r1cs.log_num_cycles,
+        w.ram.log_k,
+        w.registers.log_k,
+        &w.ram_public,
+        &mut verifier_t,
+    )
+    .expect("binary driver (Spartan -> memory -> booleanity) must verify on the real muldiv trace");
 }
