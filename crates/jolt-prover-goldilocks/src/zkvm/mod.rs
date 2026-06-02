@@ -14,4 +14,5 @@ pub mod range_check;
 pub mod registers;
 pub mod shout_read_raf;
 pub mod spartan;
+pub mod stage8_columns;
 pub mod witness;
