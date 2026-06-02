@@ -28,7 +28,9 @@
 
 use jolt_field::Field;
 
-use crate::framework::accumulator::Openings;
+use crate::framework::accumulator::{
+    CommittedPolynomial, OpeningAccumulator, Openings, SumcheckId,
+};
 use crate::framework::transcript::{ProverFs, VerifierFs};
 
 use super::gkr::{prove_family_gkr, verify_family_gkr, GkrProof};
@@ -208,6 +210,130 @@ where
     Ok(())
 }
 
+/// One committed RA family's read-raf → pushforward hand-off descriptor (P7). The M8 stage driver
+/// builds one per family and calls [`prove_read_raf_pushforward`] / [`verify_read_raf_pushforward`]
+/// right after that family's read-raf stage.
+#[derive(Clone, Debug)]
+pub struct ReadRafPushforward {
+    /// Family label (for the GKR `Family::name`, e.g. `"InstructionRa"`).
+    pub name: &'static str,
+    /// `log2` of the (padded) cycle count.
+    pub log_t: usize,
+    /// This family's global chunk-index start in `CommittedWitness.ra_dense` — the
+    /// `RaDense(base+i)` / `Pushforward(base+i)` key base and the per-chunk pushforward `base_index`.
+    pub base_index: usize,
+    /// Per-chunk widths `[log_m_0, …, log_m_{D-1}]` (chunk-local order, matching `ra_family(i)`).
+    pub log_m_chunks: Vec<usize>,
+    /// Maps chunk-local index → the read-raf's committed RA key (e.g. `InstructionRa(i)`).
+    pub ra_family: fn(usize) -> CommittedPolynomial,
+    /// The sumcheck id the read-raf cached its `ra_i` openings under (e.g. `InstructionReadRaf`).
+    pub read_raf_id: SumcheckId,
+}
+
+impl ReadRafPushforward {
+    /// Extract the shared cycle point from the read-raf's cached chunk-0 opening (the read-raf binds
+    /// one cycle point per family). All chunks share it (debug-checked).
+    fn extract_cycle<F: Field>(&self, accumulator: &dyn OpeningAccumulator<F>) -> Vec<F> {
+        let (pt0, _) =
+            accumulator.get_committed_polynomial_opening((self.ra_family)(0), self.read_raf_id);
+        let (_, r_cycle) = pt0.split_at(self.log_m_chunks[0]);
+        r_cycle.r
+    }
+}
+
+/// **P7 read-raf → pushforward bridge (prover).** Extract this family's `D` cached read-raf chunk
+/// openings `ra_i = M̃^(i)(r_cycle, r_k_i)` from the accumulator, pair each with its `ra_dense` index
+/// column (`indices[i]`), and discharge them via the Option C per-chunk pushforward GKR
+/// ([`prove_family_per_chunk`]). The read-raf caches points BIG_ENDIAN; the slices are passed
+/// UNREVERSED — the per-chunk driver does the LSB-first `rev` bridge.
+pub fn prove_read_raf_pushforward<F, T>(
+    fam: &ReadRafPushforward,
+    indices: &[Vec<u32>],
+    accumulator: &mut Openings<F>,
+    transcript: &mut T,
+) -> Result<Vec<GkrProof<F>>, GkrError>
+where
+    F: Field,
+    T: ProverFs<F>,
+{
+    debug_assert_eq!(
+        indices.len(),
+        fam.log_m_chunks.len(),
+        "one index column per chunk"
+    );
+    let r_cycle = fam.extract_cycle(accumulator);
+    let chunks: Vec<ChunkPushforward<F>> = fam
+        .log_m_chunks
+        .iter()
+        .enumerate()
+        .map(|(i, &log_m)| {
+            let (pt, claim) =
+                accumulator.get_committed_polynomial_opening((fam.ra_family)(i), fam.read_raf_id);
+            let (r_col, r_cyc) = pt.split_at(log_m);
+            debug_assert_eq!(
+                r_cyc.r, r_cycle,
+                "all chunks share the read-raf cycle point"
+            );
+            ChunkPushforward {
+                log_m,
+                r_col: r_col.r,
+                indices: indices[i].clone(),
+                claim,
+            }
+        })
+        .collect();
+    prove_family_per_chunk(
+        fam.name,
+        fam.log_t,
+        fam.base_index,
+        &r_cycle,
+        &chunks,
+        accumulator,
+        transcript,
+    )
+}
+
+/// **P7 read-raf → pushforward bridge (verifier).** Mirror of [`prove_read_raf_pushforward`]:
+/// reconstruct the `D` per-chunk verifier inputs (`log_m`, `r_col`, `claim`) from the read-raf
+/// openings the read-raf-stage verifier re-seeded into the accumulator, then discharge the per-chunk
+/// pushforward GKRs ([`verify_family_per_chunk`]).
+pub fn verify_read_raf_pushforward<F, T>(
+    fam: &ReadRafPushforward,
+    proofs: &[GkrProof<F>],
+    accumulator: &mut Openings<F>,
+    transcript: &mut T,
+) -> Result<(), GkrError>
+where
+    F: Field,
+    T: VerifierFs<F>,
+{
+    let r_cycle = fam.extract_cycle(accumulator);
+    let chunks: Vec<ChunkVerifierInput<F>> = fam
+        .log_m_chunks
+        .iter()
+        .enumerate()
+        .map(|(i, &log_m)| {
+            let (pt, claim) =
+                accumulator.get_committed_polynomial_opening((fam.ra_family)(i), fam.read_raf_id);
+            let (r_col, _) = pt.split_at(log_m);
+            ChunkVerifierInput {
+                log_m,
+                r_col: r_col.r,
+                claim,
+            }
+        })
+        .collect();
+    verify_family_per_chunk(
+        fam.log_t,
+        fam.base_index,
+        &r_cycle,
+        &chunks,
+        proofs,
+        accumulator,
+        transcript,
+    )
+}
+
 #[cfg(test)]
 #[expect(clippy::expect_used)]
 mod tests {
@@ -218,7 +344,11 @@ mod tests {
     };
     use crate::framework::sumcheck::prove as sumcheck_prove;
     use crate::zkvm::logup::pushforward::claim_eval;
-    use crate::zkvm::shout_read_raf::{OneHotReadRaf, OneHotReadRafParams, ReadRafStage};
+    use crate::zkvm::shout_read_raf::{
+        prove_read_raf, verify_read_raf, OneHotReadRaf, OneHotReadRafParams, ReadRafInputs,
+        ReadRafStage,
+    };
+    use crate::zkvm::witness::one_hot_ra_column;
     use jolt_field::goldilocks::GoldilocksFp3 as F;
     use jolt_poly::EqPolynomial;
 
@@ -623,5 +753,139 @@ mod tests {
             ),
             Err(GkrError::MainIdentity),
         ));
+    }
+
+    /// **P7 end-to-end:** run the read-raf STAGE ([`prove_read_raf`]) on genuine one-hot columns
+    /// lifted from per-chunk index columns, then bridge its cached `ra_i` openings into the per-chunk
+    /// pushforward via [`prove_read_raf_pushforward`]; verifier replays the stage (re-seeding the
+    /// openings) + the pushforward and the GKR-leaf openings agree. The bridge keys the pushforward
+    /// under `RaDense(base_index+i)`/`Pushforward(base_index+i)` (the global chunk index).
+    fn read_raf_pushforward_round_trip<const D: usize, const NE: usize>(
+        seed: u64,
+        log_m_chunks: [usize; D],
+        log_t: usize,
+        base_index: usize,
+        ra_family: fn(usize) -> CommittedPolynomial,
+        read_raf_id: SumcheckId,
+        name: &'static str,
+    ) {
+        let mut rng = Rng(seed);
+        let k_dims: [usize; D] = std::array::from_fn(|i| 1usize << log_m_chunks[i]);
+        let mut suffix = [1usize; D];
+        for i in (1..D).rev() {
+            suffix[i - 1] = suffix[i] * k_dims[i];
+        }
+        let k_total: usize = k_dims.iter().product();
+        let t = 1usize << log_t;
+
+        let indices: Vec<Vec<u32>> = (0..D)
+            .map(|i| {
+                (0..t)
+                    .map(|_| (rng.next() as u32) % (k_dims[i] as u32))
+                    .collect()
+            })
+            .collect();
+        let ra_chunks: [Vec<F>; D] =
+            std::array::from_fn(|i| one_hot_ra_column::<F>(&indices[i], log_m_chunks[i]));
+
+        // One read-raf stage; rv = Σ_j eq(j)·Val(combined(j)) for the genuine one-hot read.
+        let r_cycle = rand_vec(&mut rng, log_t);
+        let val_addr = rand_vec(&mut rng, k_total);
+        let rv_key = (
+            VirtualPolynomial::LookupOutput,
+            SumcheckId::InstructionClaimReduction,
+        );
+        let combined: Vec<usize> = (0..t)
+            .map(|j| {
+                indices
+                    .iter()
+                    .zip(suffix.iter())
+                    .fold(0usize, |a, (idx, &s)| a + (idx[j] as usize) * s)
+            })
+            .collect();
+        let eq = EqPolynomial::<F>::evals(&r_cycle, None);
+        let rv = (0..t).fold(F::from_u64(0), |a, j| a + eq[j] * val_addr[combined[j]]);
+
+        let inputs = || ReadRafInputs::<F, D> {
+            ra_family,
+            sumcheck_id: read_raf_id,
+            log_k_chunks: log_m_chunks,
+            log_t,
+            stages: vec![ReadRafStage {
+                r_cycle: r_cycle.clone(),
+                val_addr: val_addr.clone(),
+                rv_key,
+            }],
+        };
+        let fam = ReadRafPushforward {
+            name,
+            log_t,
+            base_index,
+            log_m_chunks: log_m_chunks.to_vec(),
+            ra_family,
+            read_raf_id,
+        };
+
+        let mut prover_acc = Openings::<F>::new(log_t);
+        prover_acc.append_virtual(rv_key.0, rv_key.1, OpeningPoint::new(r_cycle.clone()), rv);
+        let mut prover_t = ProverTranscript::new("p7");
+        let rr_proof =
+            prove_read_raf::<F, _, D, NE>(ra_chunks, inputs(), &mut prover_acc, &mut prover_t);
+        let pf_proofs = prove_read_raf_pushforward(&fam, &indices, &mut prover_acc, &mut prover_t)
+            .expect("pushforward prove");
+        assert_eq!(pf_proofs.len(), D, "one pushforward GKR per chunk");
+        let narg = prover_t.into_proof();
+
+        let mut verifier_acc = Openings::<F>::new(log_t);
+        verifier_acc.append_virtual(rv_key.0, rv_key.1, OpeningPoint::new(r_cycle.clone()), rv);
+        let mut verifier_t = VerifierTranscript::new("p7", &narg);
+        verify_read_raf::<F, _, D, NE>(&rr_proof, inputs(), &mut verifier_acc, &mut verifier_t)
+            .expect("read-raf stage verify");
+        verify_read_raf_pushforward(&fam, &pf_proofs, &mut verifier_acc, &mut verifier_t)
+            .expect("pushforward verify");
+
+        for i in 0..D {
+            let g = base_index + i;
+            for (poly, sc) in [
+                (CommittedPolynomial::RaDense(g), SumcheckId::PushforwardGkr),
+                (
+                    CommittedPolynomial::Pushforward(g),
+                    SumcheckId::PushforwardGkr,
+                ),
+                (
+                    CommittedPolynomial::Pushforward(g),
+                    SumcheckId::PushforwardReduction,
+                ),
+            ] {
+                let (pp, pc) = prover_acc.get_committed_polynomial_opening(poly, sc);
+                let (vp, vc) = verifier_acc.get_committed_polynomial_opening(poly, sc);
+                assert_eq!(pp, vp, "opening point agrees for {poly:?}/{sc:?}");
+                assert_eq!(pc, vc, "opening claim agrees for {poly:?}/{sc:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn read_raf_then_pushforward_round_trip() {
+        // Instruction family: D = 5, base_index = 0.
+        read_raf_pushforward_round_trip::<5, 7>(
+            0x9F50,
+            [1, 1, 1, 1, 1],
+            4,
+            0,
+            CommittedPolynomial::InstructionRa,
+            SumcheckId::InstructionReadRaf,
+            "InstructionRa",
+        );
+        // Bytecode family: D = 2, keyed after the 5 instruction chunks (base_index = 5).
+        read_raf_pushforward_round_trip::<2, 4>(
+            0x9F20,
+            [2, 2],
+            4,
+            5,
+            CommittedPolynomial::BytecodeRa,
+            SumcheckId::BytecodeReadRaf,
+            "BytecodeRa",
+        );
     }
 }
