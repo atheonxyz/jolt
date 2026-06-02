@@ -19,18 +19,19 @@ use jolt_field::Field;
 
 use crate::framework::accumulator::{CommittedPolynomial, SumcheckId};
 
-pub use crate::zkvm::shout_read_raf::{
-    OneHotReadRaf, OneHotReadRafParams, ReadRafStage, NUM_CHUNKS,
-};
+pub use crate::zkvm::shout_read_raf::{OneHotReadRaf, OneHotReadRafParams, ReadRafStage};
+
+/// Instruction-lookups address decomposition uses `D = 5` chunks (`NE = D + 2 = 7`).
+pub const INSTRUCTION_D: usize = 5;
 
 /// Build the instruction-lookups read-raf params (`InstructionRa` family, `InstructionReadRaf` id).
 /// Every stage should share `r_cycle = r_reduction` (the single instruction eq point).
 pub fn instruction_read_raf_params<F: Field>(
-    log_k_chunks: [usize; NUM_CHUNKS],
+    log_k_chunks: [usize; INSTRUCTION_D],
     log_t: usize,
     stages: Vec<ReadRafStage<F>>,
     transcript: &mut impl Challenge<F>,
-) -> OneHotReadRafParams<F> {
+) -> OneHotReadRafParams<F, INSTRUCTION_D> {
     OneHotReadRafParams::new(
         CommittedPolynomial::InstructionRa,
         SumcheckId::InstructionReadRaf,

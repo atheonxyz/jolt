@@ -9,17 +9,18 @@ use jolt_field::Field;
 
 use crate::framework::accumulator::{CommittedPolynomial, SumcheckId};
 
-pub use crate::zkvm::shout_read_raf::{
-    OneHotReadRaf, OneHotReadRafParams, ReadRafStage, NUM_CHUNKS,
-};
+pub use crate::zkvm::shout_read_raf::{OneHotReadRaf, OneHotReadRafParams, ReadRafStage};
+
+/// Bytecode address decomposition uses `D = 2` chunks (`NE = D + 2 = 4`).
+pub const BYTECODE_D: usize = 2;
 
 /// Build the bytecode read-raf params (`BytecodeRa` family, `BytecodeReadRaf` id).
 pub fn bytecode_read_raf_params<F: Field>(
-    log_k_chunks: [usize; NUM_CHUNKS],
+    log_k_chunks: [usize; BYTECODE_D],
     log_t: usize,
     stages: Vec<ReadRafStage<F>>,
     transcript: &mut impl Challenge<F>,
-) -> OneHotReadRafParams<F> {
+) -> OneHotReadRafParams<F, BYTECODE_D> {
     OneHotReadRafParams::new(
         CommittedPolynomial::BytecodeRa,
         SumcheckId::BytecodeReadRaf,

@@ -304,7 +304,7 @@ mod tests {
             stages,
             &mut rr_t,
         );
-        let mut prover = OneHotReadRaf::new_prover(params, [ra0, ra1]);
+        let mut prover = OneHotReadRaf::<F, 2, 4>::new_prover(params, [ra0, ra1]);
         let _ = sumcheck_prove(&mut prover, &mut rr_acc, &mut rr_t);
 
         // Extract the cached per-chunk ra_i openings (point = (r_k_i, r_cycle), value = M̃^(i)).
@@ -473,7 +473,7 @@ mod tests {
             stages,
             &mut rr_t,
         );
-        let mut prover = OneHotReadRaf::new_prover(params, [ra0, ra1]);
+        let mut prover = OneHotReadRaf::<F, 2, 4>::new_prover(params, [ra0, ra1]);
         let _ = sumcheck_prove(&mut prover, &mut rr_acc, &mut rr_t);
 
         let (pt0, c0) = rr_acc.get_committed_polynomial_opening(
