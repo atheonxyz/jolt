@@ -108,7 +108,9 @@ where
         indices,
     };
     let claims = claim_eval(&family);
-    let gkr = prove_family(&family, &claims, base_index, accumulator, transcript)
+    // The range-check standalone path does not yet PCS-open its `Pushforward` (R-integration is
+    // deferred), so the surfaced `P^F` column is dropped here.
+    let (gkr, _pushforward) = prove_family(&family, &claims, base_index, accumulator, transcript)
         .map_err(RangeCheckError::Gkr)?;
     Ok(RangeCheckProof { gkr, claims })
 }

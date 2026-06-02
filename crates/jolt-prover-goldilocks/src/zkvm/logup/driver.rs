@@ -37,6 +37,10 @@ use super::gkr::{prove_family_gkr, verify_family_gkr, GkrProof};
 use super::pushforward::{prepare_family, prepare_family_verifier, Family};
 use super::GkrError;
 
+/// Per-chunk pushforward GKR proofs paired with their materialized `P^F` columns (one `Vec<F>` per
+/// chunk, length `2^log_m`) — the columns the stage-8 open commits and opens at `r_col`.
+type PushforwardProofs<F> = (Vec<GkrProof<F>>, Vec<Vec<F>>);
+
 /// Prove one family's pushforward GKR from the upstream read-raf input claims. `input_claims` are
 /// the `d` `M̃^(i)(r_row, r_col)` evaluations (the read-raf's cached `ra_i` openings, aligned onto
 /// the shared column point). Errors only via the eq. 5 prover check.
@@ -46,18 +50,16 @@ pub fn prove_family<F, T>(
     family_index: usize,
     accumulator: &mut Openings<F>,
     transcript: &mut T,
-) -> Result<GkrProof<F>, GkrError>
+) -> Result<(GkrProof<F>, Vec<F>), GkrError>
 where
     F: Field,
     T: ProverFs<F>,
 {
     let data = prepare_family(family, input_claims, transcript)?;
-    Ok(prove_family_gkr(
-        &data,
-        family_index,
-        accumulator,
-        transcript,
-    ))
+    let proof = prove_family_gkr(&data, family_index, accumulator, transcript);
+    // Surface the eq-weighted pushforward `P^F` (length `2^log_m`) so the stage-8 open can commit it
+    // (`Pushforward(family_index)` is opened at `r_col` against the GKR's `PushforwardReduction` claim).
+    Ok((proof, data.pushforward))
 }
 
 /// Metadata the verifier needs to discharge a family's pushforward GKR (no index columns — the
@@ -134,13 +136,14 @@ pub fn prove_family_per_chunk<F, T>(
     chunks: &[ChunkPushforward<F>],
     accumulator: &mut Openings<F>,
     transcript: &mut T,
-) -> Result<Vec<GkrProof<F>>, GkrError>
+) -> Result<PushforwardProofs<F>, GkrError>
 where
     F: Field,
     T: ProverFs<F>,
 {
     let r_row = rev(r_cycle);
     let mut proofs = Vec::with_capacity(chunks.len());
+    let mut pushforwards = Vec::with_capacity(chunks.len());
     for (i, chunk) in chunks.iter().enumerate() {
         let family = Family {
             name,
@@ -151,15 +154,17 @@ where
             r_col: rev(&chunk.r_col),
             indices: vec![chunk.indices.clone()],
         };
-        proofs.push(prove_family(
+        let (proof, pushforward) = prove_family(
             &family,
             std::slice::from_ref(&chunk.claim),
             base_index + i,
             accumulator,
             transcript,
-        )?);
+        )?;
+        proofs.push(proof);
+        pushforwards.push(pushforward);
     }
-    Ok(proofs)
+    Ok((proofs, pushforwards))
 }
 
 /// Verifier-side per-chunk input: the chunk's width, its distinct column point, and the read-raf
@@ -251,7 +256,7 @@ pub fn prove_read_raf_pushforward<F, T>(
     indices: &[Vec<u32>],
     accumulator: &mut Openings<F>,
     transcript: &mut T,
-) -> Result<Vec<GkrProof<F>>, GkrError>
+) -> Result<PushforwardProofs<F>, GkrError>
 where
     F: Field,
     T: ProverFs<F>,
@@ -488,7 +493,7 @@ mod tests {
         // Prover
         let mut prover_acc = Openings::<F>::new(log_t);
         let mut prover_t = ProverTranscript::new("logup-driver");
-        let proof =
+        let (proof, _pushforward) =
             prove_family(&family, &input_claims, 0, &mut prover_acc, &mut prover_t).expect("prove");
         let narg = prover_t.into_proof();
 
@@ -642,7 +647,7 @@ mod tests {
 
         let mut prover_acc = Openings::<F>::new(log_t);
         let mut prover_t = ProverTranscript::new("option-c");
-        let proofs = prove_family_per_chunk(
+        let (proofs, pushforwards) = prove_family_per_chunk(
             "InstructionRa",
             log_t,
             0,
@@ -653,6 +658,7 @@ mod tests {
         )
         .expect("per-chunk prove");
         assert_eq!(proofs.len(), 2);
+        assert_eq!(pushforwards.len(), 2, "one P^F column per chunk");
         let narg = prover_t.into_proof();
 
         let vchunks: Vec<ChunkVerifierInput<F>> = out
@@ -809,9 +815,11 @@ mod tests {
             &mut prover_acc,
             &mut prover_t,
         );
-        let pf_proofs = prove_read_raf_pushforward(&fam, &indices, &mut prover_acc, &mut prover_t)
-            .expect("pushforward prove");
+        let (pf_proofs, pushforwards) =
+            prove_read_raf_pushforward(&fam, &indices, &mut prover_acc, &mut prover_t)
+                .expect("pushforward prove");
         assert_eq!(pf_proofs.len(), D, "one pushforward GKR per chunk");
+        assert_eq!(pushforwards.len(), D, "one P^F column per chunk");
         let narg = prover_t.into_proof();
 
         let mut verifier_acc = Openings::<F>::new(log_t);
