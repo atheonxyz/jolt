@@ -11,6 +11,7 @@ pub mod memory;
 pub mod r1cs_witness;
 pub mod ram;
 pub mod range_check;
+pub mod real_trace;
 pub mod registers;
 pub mod shout_read_raf;
 pub mod spartan;
