@@ -16,6 +16,7 @@ pub mod lagrange;
 pub mod multiquadratic;
 pub mod poly;
 pub mod stage8;
+pub mod stage8_open;
 pub mod sumcheck;
 pub mod transcript;
 pub mod univariate_skip;
