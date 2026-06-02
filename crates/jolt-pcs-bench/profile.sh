@@ -23,7 +23,6 @@
 set -euo pipefail
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
-WHIR_BENCH_DIR="${REPO_ROOT}/../whir-pcs-bench"
 OUT_ROOT="/tmp/jolt-pcs-bench/traces"
 DUMP_PATH="/tmp/jolt-pcs-bench/polys.bin"
 
@@ -74,10 +73,10 @@ build_whir() {
     local extra_features="${2:-}"
     echo "=== building whir-pcs-bench (profile=$profile, features='$extra_features') ==="
     if [[ -n "$extra_features" ]]; then
-        (cd "$WHIR_BENCH_DIR" && cargo build --profile "$profile" \
+        (cd "$REPO_ROOT" && cargo build -p whir-pcs-bench --profile "$profile" \
             --features "$extra_features" -q)
     else
-        (cd "$WHIR_BENCH_DIR" && cargo build --profile "$profile" -q)
+        (cd "$REPO_ROOT" && cargo build -p whir-pcs-bench --profile "$profile" -q)
     fi
 }
 
@@ -145,7 +144,7 @@ run_whir() {
         echo "[samply] recording $label..."
         samply record --save-only \
             --output "$out_dir/samply.profraw" -- \
-            "$WHIR_BENCH_DIR/target/samply/whir-pcs-bench" \
+            "$REPO_ROOT/target/samply/whir-pcs-bench" \
                 --field "$field" \
                 --warmup "$WARMUP" --runs "$RUNS" \
                 --dump "$DUMP_PATH"
@@ -154,7 +153,7 @@ run_whir() {
     if [[ "$MODE" == "--chrome" || "$MODE" == "--all" ]]; then
         build_whir release
         echo "[chrome] recording $label..."
-        "$WHIR_BENCH_DIR/target/release/whir-pcs-bench" \
+        "$REPO_ROOT/target/release/whir-pcs-bench" \
             --field "$field" \
             --warmup "$WARMUP" --runs "$RUNS" \
             --dump "$DUMP_PATH" \
@@ -164,7 +163,7 @@ run_whir() {
     if [[ "$MODE" == "--dhat" || "$MODE" == "--all" ]]; then
         build_whir release profile-alloc
         echo "[dhat] recording $label..."
-        "$WHIR_BENCH_DIR/target/release/whir-pcs-bench" \
+        "$REPO_ROOT/target/release/whir-pcs-bench" \
             --field "$field" \
             --warmup "$WARMUP" --runs "$RUNS" \
             --dump "$DUMP_PATH" \

@@ -14,7 +14,6 @@
 set -euo pipefail
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
-WHIR_BENCH_DIR="${REPO_ROOT}/../whir-pcs-bench"
 OUT_DIR="/tmp/jolt-pcs-bench"
 DORY_JSON="${OUT_DIR}/dory.json"
 WHIR_BN254_JSON="${OUT_DIR}/whir-bn254.json"
@@ -49,7 +48,7 @@ echo "=== building jolt-pcs-bench ==="
 (cd "${REPO_ROOT}" && cargo build -p jolt-pcs-bench --release -q)
 
 echo "=== building whir-pcs-bench ==="
-(cd "${WHIR_BENCH_DIR}" && cargo build --release -q)
+(cd "${REPO_ROOT}" && cargo build -p whir-pcs-bench --release -q)
 
 echo "=== Dory bench (Jolt side, BN254) ==="
 "${REPO_ROOT}/target/release/jolt-pcs-bench" \
@@ -63,7 +62,7 @@ WHIR_BN254_PRESENT=0
 WHIR_GOLD_PRESENT=0
 if [[ "$FIELD" == "bn254" || "$FIELD" == "both" ]]; then
     echo "=== WHIR-ZK bench: BN254 ==="
-    "${WHIR_BENCH_DIR}/target/release/whir-pcs-bench" \
+    "${REPO_ROOT}/target/release/whir-pcs-bench" \
         --field bn254 \
         --warmup "${WARMUP}" \
         --runs "${RUNS}" \
@@ -73,7 +72,7 @@ if [[ "$FIELD" == "bn254" || "$FIELD" == "both" ]]; then
 fi
 if [[ "$FIELD" == "goldilocks-fp3" || "$FIELD" == "both" ]]; then
     echo "=== WHIR-ZK bench: Goldilocks Fp3 ==="
-    "${WHIR_BENCH_DIR}/target/release/whir-pcs-bench" \
+    "${REPO_ROOT}/target/release/whir-pcs-bench" \
         --field goldilocks-fp3 \
         --warmup "${WARMUP}" \
         --runs "${RUNS}" \
