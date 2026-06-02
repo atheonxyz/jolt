@@ -10,6 +10,7 @@ pub mod logup;
 pub mod memory;
 pub mod r1cs_witness;
 pub mod ram;
+pub mod range_check;
 pub mod registers;
 pub mod shout_read_raf;
 pub mod spartan;
