@@ -3,6 +3,8 @@
 
 pub mod read_write_checking;
 pub mod val_evaluation;
+pub mod witness;
 
 pub use read_write_checking::{RegistersReadWriteChecking, RegistersReadWriteCheckingParams};
 pub use val_evaluation::{RegistersValEvaluation, RegistersValEvaluationParams};
+pub use witness::{register_witness, RegisterWitness};

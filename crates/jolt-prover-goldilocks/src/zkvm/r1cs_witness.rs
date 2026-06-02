@@ -387,6 +387,7 @@ pub(crate) mod tests_support {
         unexpanded_pc: u64,
         rs1: Option<(u8, u64)>,
         rs2: Option<(u8, u64)>,
+        rd: Option<(u8, u64, u64)>,
         imm: i128,
         lookup_output: u64,
         cflags: CircuitFlagSet,
@@ -400,6 +401,7 @@ pub(crate) mod tests_support {
                 unexpanded_pc,
                 rs1: None,
                 rs2: None,
+                rd: None,
                 imm: 0,
                 lookup_output: 0,
                 cflags: CircuitFlagSet::default(),
@@ -412,6 +414,7 @@ pub(crate) mod tests_support {
                 unexpanded_pc,
                 rs1: Some((1, left)),
                 rs2: Some((2, right)),
+                rd: None,
                 imm: 0,
                 lookup_output: left.wrapping_add(right),
                 cflags: CircuitFlagSet::default().set(CircuitFlags::AddOperands),
@@ -419,6 +422,19 @@ pub(crate) mod tests_support {
                     .set(InstructionFlags::LeftOperandIsRs1Value)
                     .set(InstructionFlags::RightOperandIsRs2Value),
             }
+        }
+        /// Set the register-write operand `(rd, pre_value, post_value)`. Used by the register
+        /// read-write witness-gen tests.
+        pub(crate) fn with_rd(mut self, rd: u8, pre: u64, post: u64) -> Self {
+            self.rd = Some((rd, pre, post));
+            self
+        }
+        /// Set the read operands `(rs1_reg, rs2_reg)` (values are derived from register state by the
+        /// register witness-gen, so the reported read values here are placeholders).
+        pub(crate) fn with_reads(mut self, rs1: Option<u8>, rs2: Option<u8>) -> Self {
+            self.rs1 = rs1.map(|r| (r, 0));
+            self.rs2 = rs2.map(|r| (r, 0));
+            self
         }
     }
 
@@ -448,10 +464,10 @@ pub(crate) mod tests_support {
             self.rs2
         }
         fn rd_write(&self) -> Option<(u8, u64, u64)> {
-            None
+            self.rd
         }
         fn rd_operand(&self) -> Option<u8> {
-            None
+            self.rd.map(|(reg, _, _)| reg)
         }
         fn ram_access_address(&self) -> Option<u64> {
             None
