@@ -90,6 +90,10 @@ pub enum SumcheckId {
     /// M7 LogUp\*: the §4.5.2 reduction's `P̃^F(r_col) = combined_claim` opening (the upstream
     /// read-raf claim reduced onto the committed pushforward).
     PushforwardReduction,
+    /// M8 binary Spartan inner reduction (R1CSEval analog over `jolt_r1cs::R1csKey`): reduces the
+    /// outer `Az/Bz/Cz(r_x)` to a single witness `z(r_y)` opening. (Uni-skip Spartan is deferred —
+    /// see `zkvm::spartan`.)
+    SpartanInner,
 }
 
 /// Committed (PCS-opened) polynomials. Vendored from jolt-core `zkvm/witness.rs`.
@@ -160,6 +164,10 @@ pub enum VirtualPolynomial {
     SpartanAz,
     SpartanBz,
     SpartanCz,
+    /// M8 binary Spartan inner reduction: the witness `z(r_y)` opening (over the column hypercube).
+    /// In the e2e it decomposes into the committed/virtual input openings; the standalone reduction
+    /// caches it directly.
+    SpartanWitnessZ,
 }
 
 /// Map key: which polynomial an opening belongs to.
