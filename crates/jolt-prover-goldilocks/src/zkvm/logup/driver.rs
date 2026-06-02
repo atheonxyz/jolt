@@ -8,18 +8,23 @@
 //! `ra_i(r_k_i, r_cycle)` openings ARE the one-hot evaluations `M̃^(i)` the §4.5.2 reduction
 //! consumes (the `m7-logupstar-readraf-relationship` note; demonstrated by the integration test).
 //!
-//! **M8 alignment (deferred, documented not silent).** Two reconciliations between the read-raf's
-//! outputs and the §4.5.2 inputs are the integrated stage driver's responsibility:
+//! **M8 read-raf reconciliation.** Two gaps between the read-raf's outputs and the §4.5.2 inputs:
 //! 1. *Bit-ordering.* The read-raf builds its eq tables MSB-first (`EqPolynomial::evals`) and caches
 //!    openings at `reverse(challenges)`; this module is LSB-first. The bridge is a point reversal:
 //!    the read-raf's `ra_i` equals [`claim_eval`](super::pushforward::claim_eval) of chunk `i` at
 //!    `(reverse(r_cycle), reverse(r_k_i))`.
-//! 2. *Shared column point.* The read-raf opens the `d` chunks at **distinct** column points
-//!    `r_k_i`; the §4.1 batched pushforward (design §1A, prototype) reduces the `d` claims at a
-//!    **shared** `(r_row, r_col)`. Aligning the read-raf to open at a shared column point (or using
-//!    the general per-chunk-distinct §4.5.2 of `ProofsArgsAndZK.pdf`) is M8 — the brief scopes M7 to
-//!    the shared-`(r_row, r_col)` case. This driver takes the already-aligned shared point + the `d`
-//!    input claims.
+//! 2. *Distinct column points — RESOLVED via Option C ([`prove_family_per_chunk`]).* The read-raf
+//!    opens the `d` chunks at **distinct** column points `r_k_i`, but the §4.1 row-concatenated
+//!    pushforward (design §1A, prototype) assumes a **shared** `(r_row, r_col)`. M8 discharges each
+//!    chunk with its *own* pushforward GKR at its own `r_k_i` — the `log_d = 0` special case of
+//!    [`prove_family`], base identity `M̃^(i)(r_cycle, r_k_i) = P̃^F_i(r_k_i)` — rather than
+//!    row-concatenating + reducing to a shared point. This defers the §4.1 single-`P^F` optimization
+//!    (and its shared-point reduction) to OPT-D / full-`d`; it adds no new soundness-critical math
+//!    (reuses the M7 GKR verbatim) and is faithful to what the read-raf produces. See the
+//!    `m7-readraf-shared-point-gap` memory for the full rationale.
+//!
+//! [`prove_family`] (and the `log_d > 0` row-concatenated form) is retained for that future OPT-D
+//! path; the M8 stage driver calls [`prove_family_per_chunk`].
 
 use jolt_field::Field;
 use jolt_transcript::Transcript;
@@ -87,6 +92,120 @@ where
         transcript,
     );
     verify_family_gkr(&view, proof, family_index, accumulator, transcript)
+}
+
+#[inline]
+fn rev<F: Field>(point: &[F]) -> Vec<F> {
+    point.iter().rev().copied().collect()
+}
+
+/// One chunk's **Option C** input: the read-raf's cached `ra_i` opening at the chunk's *own* column
+/// point `r_col` (BIG_ENDIAN, as cached) + the chunk's `ra_dense` index column. The shared row point
+/// `r_cycle` is passed once to [`prove_family_per_chunk`].
+#[derive(Clone, Debug)]
+pub struct ChunkPushforward<F: Field> {
+    /// Chunk column width: `P^F` has length `2^log_m`, indices `< 2^log_m`.
+    pub log_m: usize,
+    /// The chunk's distinct column point `r_k_i` (BIG_ENDIAN, the read-raf address slice).
+    pub r_col: Vec<F>,
+    /// The chunk's `ra_dense` index column (`idx_i[j] < 2^log_m`), length `T = 2^log_t`.
+    pub indices: Vec<u32>,
+    /// The read-raf cached opening `ra_i = M̃^(i)(r_cycle, r_k_i)` — this chunk's §4.5.2 input claim.
+    pub claim: F,
+}
+
+/// **Option C** (M8 read-raf ↔ §4.5.2 reconciliation, see `m7-readraf-shared-point-gap`): discharge
+/// each of a family's `d` read-raf chunk openings with its *own* per-chunk pushforward GKR at the
+/// chunk's distinct column point — no §4.1 row-concatenation, no shared-column reduction. Each chunk
+/// is the `log_d = 0` special case of [`prove_family`]: a single index column, the base LogUp\* main
+/// identity `M̃^(i)(r_cycle, r_k_i) = P̃^F_i(r_k_i)`. The `d` GKR-leaf openings key under
+/// `RaDense(base_index + i)` / `Pushforward(base_index + i)` (a global chunk index across families).
+///
+/// The read-raf caches points MSB-first (BIG_ENDIAN); this module is LSB-first, so the shared
+/// `r_cycle` and each chunk's `r_col` are reversed into the [`Family`] (the bit-ordering bridge).
+/// `r_cycle` is shared across the `d` chunks — the read-raf binds one cycle point per family.
+pub fn prove_family_per_chunk<F, T>(
+    name: &'static str,
+    log_t: usize,
+    base_index: usize,
+    r_cycle: &[F],
+    chunks: &[ChunkPushforward<F>],
+    accumulator: &mut Openings<F>,
+    transcript: &mut T,
+) -> Result<Vec<GkrProof<F>>, GkrError>
+where
+    F: Field,
+    T: Transcript<Challenge = F>,
+{
+    let r_row = rev(r_cycle);
+    let mut proofs = Vec::with_capacity(chunks.len());
+    for (i, chunk) in chunks.iter().enumerate() {
+        let family = Family {
+            name,
+            log_t,
+            log_d: 0,
+            log_m: chunk.log_m,
+            r_row: r_row.clone(),
+            r_col: rev(&chunk.r_col),
+            indices: vec![chunk.indices.clone()],
+        };
+        proofs.push(prove_family(
+            &family,
+            std::slice::from_ref(&chunk.claim),
+            base_index + i,
+            accumulator,
+            transcript,
+        )?);
+    }
+    Ok(proofs)
+}
+
+/// Verifier-side per-chunk input: the chunk's width, its distinct column point, and the read-raf
+/// claim (no index column — the verifier never sees `ra_dense`).
+#[derive(Clone, Debug)]
+pub struct ChunkVerifierInput<F: Field> {
+    pub log_m: usize,
+    pub r_col: Vec<F>,
+    pub claim: F,
+}
+
+/// Verify the Option C per-chunk pushforward GKRs (mirror of [`prove_family_per_chunk`]); the
+/// transcript interaction order must match the prover's chunk-by-chunk loop.
+pub fn verify_family_per_chunk<F, T>(
+    log_t: usize,
+    base_index: usize,
+    r_cycle: &[F],
+    chunks: &[ChunkVerifierInput<F>],
+    proofs: &[GkrProof<F>],
+    accumulator: &mut Openings<F>,
+    transcript: &mut T,
+) -> Result<(), GkrError>
+where
+    F: Field,
+    T: Transcript<Challenge = F>,
+{
+    if proofs.len() != chunks.len() {
+        return Err(GkrError::Sumcheck);
+    }
+    let r_row = rev(r_cycle);
+    for (i, (chunk, proof)) in chunks.iter().zip(proofs.iter()).enumerate() {
+        let params = FamilyVerifierParams {
+            log_t,
+            log_d: 0,
+            log_m: chunk.log_m,
+            r_row: r_row.clone(),
+            r_col: rev(&chunk.r_col),
+        };
+        verify_family(
+            &params,
+            std::slice::from_ref(&chunk.claim),
+            proof,
+            base_index + i,
+            accumulator,
+            transcript,
+        )?;
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -290,5 +409,217 @@ mod tests {
             let (_, vc) = verifier_acc.get_committed_polynomial_opening(poly, sc);
             assert_eq!(pc, vc, "opening agrees for {poly:?}/{sc:?}");
         }
+    }
+
+    /// One chunk extracted from a genuine read-raf run: index column, width, the chunk's distinct
+    /// column point + the shared cycle point (both BIG_ENDIAN, as cached), and the `ra_i` claim.
+    struct ChunkOut {
+        idx: Vec<u32>,
+        log_k: usize,
+        r_col: Vec<F>,
+        r_cycle: Vec<F>,
+        claim: F,
+    }
+
+    /// Run a genuine `d = 2` read-raf sumcheck and return the two cached chunk openings — the inputs
+    /// the Option C per-chunk pushforward consumes. (Shares structure with `readraf_handoff_round_trip`.)
+    fn run_read_raf(seed: u64, log_k0: usize, log_k1: usize, log_t: usize) -> [ChunkOut; 2] {
+        let mut rng = Rng(seed);
+        let k0 = 1usize << log_k0;
+        let k1 = 1usize << log_k1;
+        let t = 1usize << log_t;
+
+        let idx0: Vec<u32> = (0..t).map(|_| (rng.next() as u32) % (k0 as u32)).collect();
+        let idx1: Vec<u32> = (0..t).map(|_| (rng.next() as u32) % (k1 as u32)).collect();
+
+        let one_hot = |idx: &[u32], k_dim: usize| -> Vec<F> {
+            let mut col = vec![F::from_u64(0); k_dim * t];
+            for (j, &k) in idx.iter().enumerate() {
+                col[(k as usize) * t + j] = F::from_u64(1);
+            }
+            col
+        };
+        let ra0 = one_hot(&idx0, k0);
+        let ra1 = one_hot(&idx1, k1);
+
+        let r_cycle = rand_vec(&mut rng, log_t);
+        let val_addr = rand_vec(&mut rng, k0 * k1);
+        let rv_key = (
+            VirtualPolynomial::LookupOutput,
+            SumcheckId::InstructionClaimReduction,
+        );
+        let stages = vec![ReadRafStage {
+            r_cycle: r_cycle.clone(),
+            val_addr: val_addr.clone(),
+            rv_key,
+        }];
+
+        let eq_cycle = EqPolynomial::<F>::evals(&r_cycle, None);
+        let mut rv = F::from_u64(0);
+        for j in 0..t {
+            let kk = (idx0[j] as usize) * k1 + (idx1[j] as usize);
+            rv += eq_cycle[j] * val_addr[kk];
+        }
+
+        let mut rr_acc = Openings::<F>::new(log_t);
+        rr_acc.append_virtual(rv_key.0, rv_key.1, OpeningPoint::new(r_cycle.clone()), rv);
+        let mut rr_t = Blake2bTranscript::<F>::new(b"readraf");
+        let params = OneHotReadRafParams::new(
+            CommittedPolynomial::InstructionRa,
+            SumcheckId::InstructionReadRaf,
+            [log_k0, log_k1],
+            log_t,
+            stages,
+            &mut rr_t,
+        );
+        let mut prover = OneHotReadRaf::new_prover(params, [ra0, ra1]);
+        let _ = sumcheck_prove(&mut prover, &mut rr_acc, &mut rr_t);
+
+        let (pt0, c0) = rr_acc.get_committed_polynomial_opening(
+            CommittedPolynomial::InstructionRa(0),
+            SumcheckId::InstructionReadRaf,
+        );
+        let (pt1, c1) = rr_acc.get_committed_polynomial_opening(
+            CommittedPolynomial::InstructionRa(1),
+            SumcheckId::InstructionReadRaf,
+        );
+        let (r_k0, r_cyc0) = pt0.split_at(log_k0);
+        let (r_k1, r_cyc1) = pt1.split_at(log_k1);
+
+        [
+            ChunkOut {
+                idx: idx0,
+                log_k: log_k0,
+                r_col: r_k0.r,
+                r_cycle: r_cyc0.r,
+                claim: c0,
+            },
+            ChunkOut {
+                idx: idx1,
+                log_k: log_k1,
+                r_col: r_k1.r,
+                r_cycle: r_cyc1.r,
+                claim: c1,
+            },
+        ]
+    }
+
+    /// **Option C end-to-end:** run the real read-raf, then discharge *both* distinct-column-point
+    /// chunk openings via per-chunk pushforward GKRs (`log_d = 0` each), prover→verifier. This is the
+    /// M8 read-raf ↔ §4.5.2 hand-off — both chunks, at their own `r_k_i`, no shared-point reduction.
+    #[test]
+    fn readraf_per_chunk_option_c_round_trip() {
+        let log_t = 4usize;
+        let out = run_read_raf(0xC0DE, 2, 2, log_t);
+        assert_eq!(
+            out[0].r_cycle, out[1].r_cycle,
+            "the d chunks share the read-raf cycle point",
+        );
+        assert_ne!(
+            out[0].r_col, out[1].r_col,
+            "the d chunks open at distinct column points (the M8 fork)",
+        );
+        let r_cycle = out[0].r_cycle.clone();
+
+        let chunks: Vec<ChunkPushforward<F>> = out
+            .iter()
+            .map(|c| ChunkPushforward {
+                log_m: c.log_k,
+                r_col: c.r_col.clone(),
+                indices: c.idx.clone(),
+                claim: c.claim,
+            })
+            .collect();
+
+        let mut prover_acc = Openings::<F>::new(log_t);
+        let mut prover_t = Blake2bTranscript::<F>::new(b"option-c");
+        let proofs = prove_family_per_chunk(
+            "InstructionRa",
+            log_t,
+            0,
+            &r_cycle,
+            &chunks,
+            &mut prover_acc,
+            &mut prover_t,
+        )
+        .expect("per-chunk prove");
+        assert_eq!(proofs.len(), 2);
+
+        let vchunks: Vec<ChunkVerifierInput<F>> = out
+            .iter()
+            .map(|c| ChunkVerifierInput {
+                log_m: c.log_k,
+                r_col: c.r_col.clone(),
+                claim: c.claim,
+            })
+            .collect();
+        let mut verifier_acc = Openings::<F>::new(log_t);
+        let mut verifier_t = Blake2bTranscript::<F>::new(b"option-c");
+        verify_family_per_chunk(
+            log_t,
+            0,
+            &r_cycle,
+            &vchunks,
+            &proofs,
+            &mut verifier_acc,
+            &mut verifier_t,
+        )
+        .expect("per-chunk verify");
+
+        for idx in 0..2usize {
+            for (poly, sc) in [
+                (
+                    CommittedPolynomial::RaDense(idx),
+                    SumcheckId::PushforwardGkr,
+                ),
+                (
+                    CommittedPolynomial::Pushforward(idx),
+                    SumcheckId::PushforwardGkr,
+                ),
+                (
+                    CommittedPolynomial::Pushforward(idx),
+                    SumcheckId::PushforwardReduction,
+                ),
+            ] {
+                let (pp, pc) = prover_acc.get_committed_polynomial_opening(poly, sc);
+                let (vp, vc) = verifier_acc.get_committed_polynomial_opening(poly, sc);
+                assert_eq!(pp, vp, "opening point agrees for {poly:?}/{sc:?}");
+                assert_eq!(pc, vc, "opening claim agrees for {poly:?}/{sc:?}");
+            }
+        }
+    }
+
+    /// A chunk input claim inconsistent with its genuine `ra_dense` (perturbed) trips the per-chunk
+    /// eq. 5 main identity inside `prepare_family` (`combined == claim` at `log_d = 0`).
+    #[test]
+    fn corrupted_chunk_claim_trips_main_identity() {
+        let log_t = 4usize;
+        let out = run_read_raf(0x0BAD_C0DE, 2, 2, log_t);
+        let r_cycle = out[0].r_cycle.clone();
+        let mut chunks: Vec<ChunkPushforward<F>> = out
+            .iter()
+            .map(|c| ChunkPushforward {
+                log_m: c.log_k,
+                r_col: c.r_col.clone(),
+                indices: c.idx.clone(),
+                claim: c.claim,
+            })
+            .collect();
+        chunks[1].claim += F::from_u64(1);
+
+        let mut acc = Openings::<F>::new(log_t);
+        let mut transcript = Blake2bTranscript::<F>::new(b"option-c");
+        assert!(matches!(
+            prove_family_per_chunk(
+                "InstructionRa",
+                log_t,
+                0,
+                &r_cycle,
+                &chunks,
+                &mut acc,
+                &mut transcript,
+            ),
+            Err(GkrError::MainIdentity),
+        ));
     }
 }
