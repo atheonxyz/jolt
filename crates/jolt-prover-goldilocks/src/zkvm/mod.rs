@@ -7,6 +7,7 @@ pub mod claim_reductions;
 pub mod driver;
 pub mod instruction_lookups;
 pub mod logup;
+pub mod memory;
 pub mod r1cs_witness;
 pub mod ram;
 pub mod registers;
