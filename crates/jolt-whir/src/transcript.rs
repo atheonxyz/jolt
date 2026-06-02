@@ -19,6 +19,7 @@ use whir::transcript::{DomainSeparator, Proof, ProverState, VerifierMessage, Ver
 use jolt_field::goldilocks::GoldilocksFp3;
 
 use crate::convert::{from_field64_3, to_field64_3};
+use crate::scheme::WhirError;
 
 /// Fiat-Shamir protocol-id seed shared by prover and verifier.
 ///
@@ -95,5 +96,36 @@ impl<'a> VerifierTranscript<'a> {
     #[inline]
     pub fn state_mut(&mut self) -> &mut VerifierState<'a> {
         &mut self.state
+    }
+
+    /// Read one `Fp3` prover message back out of the NARG string — the verifier
+    /// counterpart to [`ProverTranscript::observe_ext`]. Both sides move the same
+    /// bytes through the sponge, keeping the shared Fiat-Shamir schedule in lockstep.
+    /// Errors if the NARG is exhausted or the message fails to decode.
+    #[inline]
+    pub fn read_ext(&mut self) -> Result<GoldilocksFp3, WhirError> {
+        self.state
+            .prover_message::<Field64_3>()
+            .map(from_field64_3)
+            .map_err(|_| WhirError::VerificationFailed)
+    }
+
+    /// Read `len` consecutive `Fp3` prover messages (e.g. all coeffs of one sumcheck
+    /// round polynomial) back out of the NARG string.
+    #[inline]
+    pub fn read_exts(&mut self, len: usize) -> Result<Vec<GoldilocksFp3>, WhirError> {
+        self.state
+            .prover_messages_vec::<Field64_3>(len)
+            .map(|v| v.into_iter().map(from_field64_3).collect())
+            .map_err(|_| WhirError::VerificationFailed)
+    }
+
+    /// Assert the NARG string and out-of-band hints are fully consumed — the
+    /// end-of-proof check that no trailing prover data remains. Consumes the transcript.
+    #[inline]
+    pub fn check_eof(self) -> Result<(), WhirError> {
+        self.state
+            .check_eof()
+            .map_err(|_| WhirError::VerificationFailed)
     }
 }
