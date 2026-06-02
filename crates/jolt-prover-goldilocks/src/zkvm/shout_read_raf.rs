@@ -155,6 +155,16 @@ impl<F: Field, const D: usize, const NE: usize> OneHotReadRaf<F, D, NE> {
     /// `(…((k_0·K_1 + k_1)·K_2 + k_2)…)·T + j` (chunk 0 most significant).
     pub fn new_prover(params: OneHotReadRafParams<F, D>, ra_chunks: [Vec<F>; D]) -> Self {
         debug_assert_eq!(NE, D + 2, "NE must equal D + 2");
+        // The dense `K·T` broadcast indexes a `usize` hypercube; guard the total width so an
+        // over-wide `log_k_chunks` aborts loudly here instead of silently wrapping `k_total`/`n`
+        // (which would corrupt the broadcast). The dense path is only feasible for small `K·T`
+        // anyway — lifting this bound is the sparse prefix/suffix rewrite (Fork 4).
+        let total_bits: usize = params.log_k_chunks.iter().sum::<usize>() + params.log_t;
+        assert!(
+            total_bits < usize::BITS as usize,
+            "read-raf dense K·T broadcast needs total address+cycle width < {} bits, got {total_bits}",
+            usize::BITS
+        );
         let t = 1usize << params.log_t;
         let k_dims: [usize; D] = std::array::from_fn(|i| 1usize << params.log_k_chunks[i]);
         let k_total: usize = k_dims.iter().product();
