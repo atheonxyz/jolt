@@ -28,6 +28,7 @@ jolt-verifier = { path = "../jolt-verifier" }
 jolt-trace = { path = "../jolt-trace" }
 jolt-dory = { path = "../jolt-dory" }
 jolt-inlines-sha2.workspace = true
+jolt-inlines-p256 = { workspace = true, features = ["host"] }
 jolt-kernels = { path = "../jolt-kernels" }
 jolt-lookup-tables = { path = "../jolt-lookup-tables" }
 jolt-openings = { path = "../jolt-openings", features = ["test-utils"] }
@@ -37,9 +38,23 @@ jolt-r1cs = { path = "../jolt-r1cs" }
 jolt-sumcheck = { path = "../jolt-sumcheck" }
 jolt-witness = { path = "../jolt-witness" }
 tracer = { path = "../../tracer" }
+# Goldilocks+WHIR prover (Phase 2), pulled only under the `goldilocks` feature for the
+# witness-level structural parity gate (P11). The crate is empty without its own `goldilocks`
+# feature, so the default BN254 build never pulls the WHIR dependency graph.
+jolt-prover-goldilocks = { path = "../jolt-prover-goldilocks", optional = true }
 num-traits.workspace = true
 blake2.workspace = true
 rayon.workspace = true
 serde.workspace = true
 strum.workspace = true
 tracing.workspace = true
+
+[features]
+# Witness-integer + structural parity gate against the Goldilocks prover (Fork 5 / P11).
+# Run with: `cargo nextest run -p jolt-equivalence --features goldilocks`.
+goldilocks = [
+    "dep:jolt-prover-goldilocks",
+    "jolt-prover-goldilocks/goldilocks",
+    "jolt-field/goldilocks",
+    "jolt-witness/goldilocks",
+]
