@@ -53,6 +53,33 @@ pub fn r1cs_aux_columns(aux_columns: &[Vec<F>]) -> Stage8Columns {
     columns
 }
 
+/// Decompose the signed `RdInc`/`RamInc` increment vectors into their two base-Goldilocks limbs
+/// (`lo`/`hi`, [`i128_to_signed_limbs`]), each padded to `committed_len`. The real-trace driver feeds
+/// the memory-stage `inc_i128` vectors here so the committed limbs recompose to the stage's
+/// `IncClaimReduction` claim (the zero-init increments, not `extract_trace`'s real-init ones).
+pub fn inc_limb_columns(rd_inc: &[i128], ram_inc: &[i128], committed_len: usize) -> IncLimbColumns {
+    let limbs = |inc: &[i128]| -> (Vec<Base>, Vec<Base>) {
+        let mut lo = Vec::with_capacity(committed_len);
+        let mut hi = Vec::with_capacity(committed_len);
+        for &v in inc {
+            let [l, h] = i128_to_signed_limbs(v);
+            lo.push(l);
+            hi.push(h);
+        }
+        lo.resize(committed_len, Base::from_u64(0));
+        hi.resize(committed_len, Base::from_u64(0));
+        (lo, hi)
+    };
+    let (rd_inc_lo, rd_inc_hi) = limbs(rd_inc);
+    let (ram_inc_lo, ram_inc_hi) = limbs(ram_inc);
+    IncLimbColumns {
+        rd_inc_lo,
+        rd_inc_hi,
+        ram_inc_lo,
+        ram_inc_hi,
+    }
+}
+
 pub fn build_committed_columns(
     committed: &CommittedWitness<F>,
     sources: &CommitmentTraceSources,
@@ -77,30 +104,9 @@ pub fn build_committed_columns(
     }
 
     // Inc: signed two-limb decomposition, padded to the committed length.
-    let limbs = |inc: &[i128]| -> (Vec<Base>, Vec<Base>) {
-        let mut lo = Vec::with_capacity(committed_len);
-        let mut hi = Vec::with_capacity(committed_len);
-        for &v in inc {
-            let [l, h] = i128_to_signed_limbs(v);
-            lo.push(l);
-            hi.push(h);
-        }
-        lo.resize(committed_len, Base::from_u64(0));
-        hi.resize(committed_len, Base::from_u64(0));
-        (lo, hi)
-    };
-    let (rd_inc_lo, rd_inc_hi) = limbs(&sources.rd_inc);
-    let (ram_inc_lo, ram_inc_hi) = limbs(&sources.ram_inc);
+    let inc = inc_limb_columns(&sources.rd_inc, &sources.ram_inc, committed_len);
 
-    (
-        columns,
-        IncLimbColumns {
-            rd_inc_lo,
-            rd_inc_hi,
-            ram_inc_lo,
-            ram_inc_hi,
-        },
-    )
+    (columns, inc)
 }
 
 #[cfg(test)]

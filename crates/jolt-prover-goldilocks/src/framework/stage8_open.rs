@@ -37,7 +37,8 @@ use std::collections::HashMap;
 use jolt_field::Field;
 
 use crate::field::{
-    Base, ProverTranscript, VerifierTranscript, WhirCommitment, WhirError, WhirHint, WhirScheme, F,
+    Base, ProverTranscript, VerifierTranscript, WhirCommitment, WhirConfig, WhirError, WhirHint,
+    WhirScheme, F,
 };
 use crate::framework::accumulator::CommittedPolynomial;
 use crate::framework::stage8::Stage8Inventory;
@@ -98,9 +99,14 @@ pub struct IncLimbColumns {
 /// The Inc-limb opening evals carried in the proof (WHIR-proven at the recomposed-claim points):
 /// `[rd_lo(ρ_rd), rd_hi(ρ_rd), ram_lo(ρ_ram), ram_hi(ρ_ram)]`. The verifier reconstructs
 /// `lo + 2³²·hi` from these and checks against the memory stage's recomposed `RamInc`/`RdInc` claims.
+///
+/// `present[i] = false` marks a limb whose committed column is identically zero (WHIR cannot open a
+/// zero polynomial): it is neither committed nor opened, its eval is forced to `0`, and the
+/// recompose check binds it (a falsely-skipped non-zero limb fails `lo + 2³²·hi == claim`).
 #[derive(Clone, Debug)]
 pub struct Stage8IncProof<F2> {
     pub evals: [F2; 4],
+    pub present: [bool; 4],
 }
 
 /// `2³²` over `F` — the linear limb-recomposition weight (`signed_limbs_recompose`).
@@ -121,54 +127,35 @@ pub fn prove_inc_open(
 ) -> Stage8IncProof<F> {
     let rd_cfg = WhirScheme::config(inc.rd_inc_lo.len());
     let ram_cfg = WhirScheme::config(inc.ram_inc_lo.len());
-
-    // Commit all four limbs, then open each at its family's point.
-    let h_rd_lo = WhirScheme::commit(transcript, &rd_cfg, &inc.rd_inc_lo);
-    let h_rd_hi = WhirScheme::commit(transcript, &rd_cfg, &inc.rd_inc_hi);
-    let h_ram_lo = WhirScheme::commit(transcript, &ram_cfg, &inc.ram_inc_lo);
-    let h_ram_hi = WhirScheme::commit(transcript, &ram_cfg, &inc.ram_inc_hi);
-
-    let rd_lo = WhirScheme::evaluate(&rd_cfg, &inc.rd_inc_lo, rd_point);
-    let rd_hi = WhirScheme::evaluate(&rd_cfg, &inc.rd_inc_hi, rd_point);
-    let ram_lo = WhirScheme::evaluate(&ram_cfg, &inc.ram_inc_lo, ram_point);
-    let ram_hi = WhirScheme::evaluate(&ram_cfg, &inc.ram_inc_hi, ram_point);
-
-    WhirScheme::open(
-        transcript,
-        &rd_cfg,
+    let cols: [&[Base]; 4] = [
         &inc.rd_inc_lo,
-        h_rd_lo,
-        rd_point,
-        rd_lo,
-    );
-    WhirScheme::open(
-        transcript,
-        &rd_cfg,
         &inc.rd_inc_hi,
-        h_rd_hi,
-        rd_point,
-        rd_hi,
-    );
-    WhirScheme::open(
-        transcript,
-        &ram_cfg,
         &inc.ram_inc_lo,
-        h_ram_lo,
-        ram_point,
-        ram_lo,
-    );
-    WhirScheme::open(
-        transcript,
-        &ram_cfg,
         &inc.ram_inc_hi,
-        h_ram_hi,
-        ram_point,
-        ram_hi,
-    );
+    ];
+    let cfgs: [&WhirConfig; 4] = [&rd_cfg, &rd_cfg, &ram_cfg, &ram_cfg];
+    let points: [&[F]; 4] = [rd_point, rd_point, ram_point, ram_point];
 
-    Stage8IncProof {
-        evals: [rd_lo, rd_hi, ram_lo, ram_hi],
+    // Two passes (commit all, then open all), skipping all-zero limbs: WHIR cannot open a zero
+    // polynomial, and a program may never set a limb (e.g. the high 32 bits of small increments).
+    let zero = Base::from_u64(0);
+    let mut present = [false; 4];
+    let mut evals = [F::from_u64(0); 4];
+    let mut staged: Vec<(WhirHint, usize)> = Vec::new();
+    for (i, col) in cols.iter().enumerate() {
+        if col.iter().all(|&x| x == zero) {
+            continue;
+        }
+        present[i] = true;
+        staged.push((WhirScheme::commit(transcript, cfgs[i], col), i));
     }
+    for (hint, i) in staged {
+        let eval = WhirScheme::evaluate(cfgs[i], cols[i], points[i]);
+        WhirScheme::open(transcript, cfgs[i], cols[i], hint, points[i], eval);
+        evals[i] = eval;
+    }
+
+    Stage8IncProof { evals, present }
 }
 
 /// One Fp3 committed column (the eq-weighted pushforward `P^F`) decomposed into its three base-
@@ -289,28 +276,33 @@ pub fn verify_inc_open(
 ) -> Result<(), Stage8OpenError> {
     let rd_cfg = WhirScheme::config(1usize << rd_point.len());
     let ram_cfg = WhirScheme::config(1usize << ram_point.len());
-    let [rd_lo, rd_hi, ram_lo, ram_hi] = proof.evals;
+    let cfgs: [&WhirConfig; 4] = [&rd_cfg, &rd_cfg, &ram_cfg, &ram_cfg];
+    let points: [&[F]; 4] = [rd_point, rd_point, ram_point, ram_point];
 
-    let c_rd_lo =
-        WhirScheme::receive_commitment(transcript, &rd_cfg).map_err(Stage8OpenError::Whir)?;
-    let c_rd_hi =
-        WhirScheme::receive_commitment(transcript, &rd_cfg).map_err(Stage8OpenError::Whir)?;
-    let c_ram_lo =
-        WhirScheme::receive_commitment(transcript, &ram_cfg).map_err(Stage8OpenError::Whir)?;
-    let c_ram_hi =
-        WhirScheme::receive_commitment(transcript, &ram_cfg).map_err(Stage8OpenError::Whir)?;
+    // Mirror the prover: receive commitments for present limbs (in order), then verify the opens.
+    let mut comms: Vec<(WhirCommitment, usize)> = Vec::new();
+    for (i, &is_present) in proof.present.iter().enumerate() {
+        if is_present {
+            let c = WhirScheme::receive_commitment(transcript, cfgs[i])
+                .map_err(Stage8OpenError::Whir)?;
+            comms.push((c, i));
+        }
+    }
+    for (c, i) in &comms {
+        WhirScheme::verify(transcript, cfgs[*i], c, points[*i], proof.evals[*i])
+            .map_err(Stage8OpenError::Whir)?;
+    }
 
-    WhirScheme::verify(transcript, &rd_cfg, &c_rd_lo, rd_point, rd_lo)
-        .map_err(Stage8OpenError::Whir)?;
-    WhirScheme::verify(transcript, &rd_cfg, &c_rd_hi, rd_point, rd_hi)
-        .map_err(Stage8OpenError::Whir)?;
-    WhirScheme::verify(transcript, &ram_cfg, &c_ram_lo, ram_point, ram_lo)
-        .map_err(Stage8OpenError::Whir)?;
-    WhirScheme::verify(transcript, &ram_cfg, &c_ram_hi, ram_point, ram_hi)
-        .map_err(Stage8OpenError::Whir)?;
-
+    // Skipped limbs contribute eval 0 (forced — never trust the proof's eval for an unopened limb).
+    let eval = |i: usize| {
+        if proof.present[i] {
+            proof.evals[i]
+        } else {
+            F::from_u64(0)
+        }
+    };
     let w = limb_weight();
-    if rd_lo + w * rd_hi != rd_claim || ram_lo + w * ram_hi != ram_claim {
+    if eval(0) + w * eval(1) != rd_claim || eval(2) + w * eval(3) != ram_claim {
         return Err(Stage8OpenError::IncReconstruct);
     }
     Ok(())

@@ -39,6 +39,10 @@ pub struct RamWitness<F: Field> {
     pub val: Vec<F>,
     /// Write increment per cycle (`post − Val(addr,j)`, `0` for non-access/loads), length `T`.
     pub inc: Vec<F>,
+    /// `inc` as a signed integer (the value `inc[j] = F::from_i128(inc_i128[j])`). The stage-8 Inc
+    /// limb open decomposes THIS (the zero-init `RamInc` the memory stage claims), not the
+    /// `extract_trace` real-init increments, so the committed limbs recompose to the stage claim.
+    pub inc_i128: Vec<i128>,
     /// Read value per cycle (`Val(addr,j)`, `0` if no access), length `T`.
     pub ram_read_value: Vec<F>,
     /// Write (post) value per cycle (`0` if no access), length `T`.
@@ -60,6 +64,7 @@ pub fn ram_witness<C: CycleRow, F: Field>(trace: &[C], ram_k: usize) -> RamWitne
     let mut ra = vec![F::zero(); k * t];
     let mut val = vec![F::zero(); k * t];
     let mut inc = vec![F::zero(); t];
+    let mut inc_i128 = vec![0i128; t];
     let mut ram_read_value = vec![F::zero(); t];
     let mut ram_write_value = vec![F::zero(); t];
 
@@ -79,7 +84,9 @@ pub fn ram_witness<C: CycleRow, F: Field>(trace: &[C], ram_k: usize) -> RamWitne
             let post = cycle.ram_write_value().unwrap_or(pre);
             ram_read_value[j] = F::from_u64(pre);
             ram_write_value[j] = F::from_u64(post);
-            inc[j] = F::from_i128(i128::from(post) - i128::from(pre));
+            let delta = i128::from(post) - i128::from(pre);
+            inc[j] = F::from_i128(delta);
+            inc_i128[j] = delta;
             state[kk] = post;
         }
     }
@@ -98,6 +105,7 @@ pub fn ram_witness<C: CycleRow, F: Field>(trace: &[C], ram_k: usize) -> RamWitne
         ra,
         val,
         inc,
+        inc_i128,
         ram_read_value,
         ram_write_value,
         val_final,

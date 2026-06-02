@@ -4,21 +4,23 @@
 //! base-Goldilocks alphabet.
 //!
 //! Wired incrementally:
-//!   M2 — discharge the booleanity `R1csAux(i)` openings via [`prove_stage8`]/[`verify_stage8`].
+//!   M2  — discharge the booleanity `R1csAux(i)` openings via [`prove_stage8`]/[`verify_stage8`].
+//!   M3a — discharge `RdInc`/`RamInc` via [`prove_inc_open`]/[`verify_inc_open`] (limb recompose).
 //!
-//! The read-raf / M7 pushforward families and the `Inc` limb open extend the inventory in later
-//! milestones; the binary driver's other committed openings (`RamInc`/`RdInc`, the RA chunks) are
-//! still carried as cached claims until then.
+//! The read-raf / M7 pushforward families (the RA chunks) extend the open in a later milestone; until
+//! then the binary driver's RA-chunk openings are carried as cached claims.
 
 use crate::field::{ProverTranscript, VerifierTranscript, F};
 use crate::framework::accumulator::{
     CommittedPolynomial, OpeningAccumulator, Openings, SumcheckId,
 };
 use crate::framework::stage8::{Stage8Inventory, Stage8Request};
-use crate::framework::stage8_open::{prove_stage8, verify_stage8, Stage8OpenError};
+use crate::framework::stage8_open::{
+    prove_inc_open, prove_stage8, verify_inc_open, verify_stage8, Stage8IncProof, Stage8OpenError,
+};
 use crate::zkvm::driver::{prove_binary_into, verify_binary_into, BinaryProof, DriverError};
 use crate::zkvm::real_trace::RealWitness;
-use crate::zkvm::stage8_columns::r1cs_aux_columns;
+use crate::zkvm::stage8_columns::{inc_limb_columns, r1cs_aux_columns};
 use jolt_field::Field;
 use jolt_r1cs::R1csKey;
 
@@ -36,6 +38,7 @@ pub enum E2eError {
 #[derive(Clone, Debug)]
 pub struct E2eProof {
     pub binary: BinaryProof<F>,
+    pub inc: Stage8IncProof<F>,
 }
 
 /// Verifier-side public parameters (geometry + the R1CS key + RAM public columns). Derived from the
@@ -127,7 +130,24 @@ pub fn prove_e2e(
     let columns = r1cs_aux_columns(&aux);
     prove_stage8(transcript, &columns, &inventory).map_err(E2eError::Stage8)?;
 
-    Ok(E2eProof { binary })
+    // Inc limb open: the committed limbs decompose the memory stage's zero-init RdInc/RamInc (the
+    // polynomials the IncClaimReduction claim is about), so they recompose to that claim.
+    let committed_len = 1usize << log_t;
+    let inc = inc_limb_columns(&real.registers.inc_i128, &real.ram.inc_i128, committed_len);
+    let (rd_point, _) = accumulator.get_committed_polynomial_opening(
+        CommittedPolynomial::RdInc,
+        SumcheckId::IncClaimReduction,
+    );
+    let (ram_point, _) = accumulator.get_committed_polynomial_opening(
+        CommittedPolynomial::RamInc,
+        SumcheckId::IncClaimReduction,
+    );
+    let inc_proof = prove_inc_open(transcript, &inc, &rd_point.r, &ram_point.r);
+
+    Ok(E2eProof {
+        binary,
+        inc: inc_proof,
+    })
 }
 
 /// Verify the full e2e (mirror of [`prove_e2e`]).
@@ -154,6 +174,24 @@ pub fn verify_e2e(
     let requests = nonzero_r1cs_aux_requests(&accumulator, params.n_aux, params.log_num_cycles);
     let inventory = Stage8Inventory::from_accumulator(&accumulator, &requests);
     verify_stage8(transcript, &inventory).map_err(E2eError::Stage8)?;
+
+    let (rd_point, rd_claim) = accumulator.get_committed_polynomial_opening(
+        CommittedPolynomial::RdInc,
+        SumcheckId::IncClaimReduction,
+    );
+    let (ram_point, ram_claim) = accumulator.get_committed_polynomial_opening(
+        CommittedPolynomial::RamInc,
+        SumcheckId::IncClaimReduction,
+    );
+    verify_inc_open(
+        transcript,
+        &rd_point.r,
+        &ram_point.r,
+        &proof.inc,
+        rd_claim,
+        ram_claim,
+    )
+    .map_err(E2eError::Stage8)?;
 
     Ok(())
 }

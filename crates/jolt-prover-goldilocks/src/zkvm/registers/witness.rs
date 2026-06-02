@@ -37,6 +37,9 @@ pub struct RegisterWitness<F: Field> {
     pub val: Vec<F>,
     /// Write increment per cycle (`post − Val(rd,j)`), length `T`.
     pub inc: Vec<F>,
+    /// `inc` as a signed integer (`inc[j] = F::from_i128(inc_i128[j])`). The stage-8 Inc limb open
+    /// decomposes THIS (the `RdInc` the memory stage claims) so the committed limbs recompose to it.
+    pub inc_i128: Vec<i128>,
     /// `rd` post-value per cycle (`0` if no write), length `T`.
     pub rd_write_value: Vec<F>,
     /// `rs1` read value per cycle (`Val(rs1,j)`, `0` if no read), length `T`.
@@ -66,6 +69,7 @@ pub fn register_witness<C: CycleRow, F: Field>(
     let mut wa = vec![F::zero(); k * t];
     let mut val = vec![F::zero(); k * t];
     let mut inc = vec![F::zero(); t];
+    let mut inc_i128 = vec![0i128; t];
     let mut rd_write_value = vec![F::zero(); t];
     let mut rs1_value = vec![F::zero(); t];
     let mut rs2_value = vec![F::zero(); t];
@@ -94,7 +98,9 @@ pub fn register_witness<C: CycleRow, F: Field>(
             let rd = rd as usize;
             wa[rd * t + j] = F::from_u64(1);
             rd_write_value[j] = F::from_u64(post);
-            inc[j] = F::from_i128(i128::from(post) - i128::from(state[rd]));
+            let delta = i128::from(post) - i128::from(state[rd]);
+            inc[j] = F::from_i128(delta);
+            inc_i128[j] = delta;
             state[rd] = post;
         }
     }
@@ -114,6 +120,7 @@ pub fn register_witness<C: CycleRow, F: Field>(
         wa,
         val,
         inc,
+        inc_i128,
         rd_write_value,
         rs1_value,
         rs2_value,
