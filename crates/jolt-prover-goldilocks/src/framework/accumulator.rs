@@ -118,8 +118,10 @@ pub enum CommittedPolynomial {
 }
 
 /// Virtual (derived-during-proving) polynomials. Vendored subset from jolt-core `zkvm/witness.rs`;
-/// the flag-carrying variants (`OpFlags`/`InstructionFlags`/`LookupTableFlag`) are added when the
-/// Spartan/bytecode ports need them (they require the RISC-V flag enums).
+/// the RISC-V-flag-carrying variants (`OpFlags`/`InstructionFlags`) are added when the
+/// Spartan/bytecode ports need them (they require the RISC-V flag enums). `LookupTableFlag(usize)`
+/// is keyed by `LookupTableKind` discriminant (0..40) — the per-table selector flags the
+/// instruction read-raf's `expected_output_claim` opens.
 #[derive(Hash, PartialEq, Eq, Copy, Clone, Debug, PartialOrd, Ord)]
 pub enum VirtualPolynomial {
     PC,
@@ -148,6 +150,10 @@ pub enum VirtualPolynomial {
     InstructionRaf,
     InstructionRafFlag,
     InstructionRa(usize),
+    /// Per-lookup-table selector flag, keyed by `LookupTableKind` discriminant (0..40). The
+    /// instruction read-raf's `expected_output_claim` opens one per table to select the active
+    /// table's MLE (`Σ_tbl LookupTableFlag(tbl) · table_mle(r_addr)`).
+    LookupTableFlag(usize),
     RegistersVal,
     RamAddress,
     RamRa,
