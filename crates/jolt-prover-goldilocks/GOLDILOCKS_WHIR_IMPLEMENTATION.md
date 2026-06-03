@@ -43,7 +43,8 @@ large remaining functional piece — see §12), and several soundness bindings a
 | Stage-8 WHIR open (R1csAux / Inc / RaDense / Pushforward) | ✅ done (M2/M3a/M3b-3) |
 | Range-check (R-core membership) | ✅ standalone; ⏸ not integrated into e2e |
 | e2e on real muldiv + jolt-core geometry parity gate | ✅ done (M0–M4) |
-| **Instruction lookups (prefix/suffix)** | ⏳ IL-1 done; IL-2..IL-5 remaining |
+| **Instruction lookups (prefix/suffix)** | ✅ done (P3b: read-raf at LOG_K=128 + M7 pushforward + stage-8 open, wired into e2e; interim Fork-2 `r_reduction`) |
+| Cycle→table dispatch (jolt-core-free) | ✅ done (P3b-0: `jolt_lookup_tables::instruction_lookup_table_index`, parity-gated vs jolt-core) |
 | Uni-skip Spartan (sound stage binding) | ⏳ deferred (Fork 2) |
 | RAM real initial-state + dense-`RamRa` PCS discharge | ⏳ deferred |
 | Stage-5 lookup `Val_s` (registers val-eval + lookup membership) | ⏳ deferred |
@@ -361,14 +362,39 @@ The e2e round-trips and is geometry-gated, but it is **not yet a complete sound 
 - **Dense `RamRa` PCS discharge** — the memory stage opens a dense one-hot `RamRa`, but the committed witness
   is per-chunk `RaDense`; reconciling needs RAM-via-read-raf (not done).
 - **Zero-column skips** are bound by booleanity/recompose + Spartan `z`-open, not a dedicated PCS check.
-- **Instruction lookups absent** — instruction-semantic soundness (lookup_output = table(operands)) is not
-  yet proven (§12).
+- **Instruction read-raf `r_reduction` self-seeded (Fork 2)** — the instruction read-raf is wired and PCS-
+  discharged (P3b), but its reduction point is squeezed fresh from the transcript rather than bound to the
+  upstream `InstructionClaimReduction` (which itself awaits the uni-skip Spartan closure). So
+  instruction-lookup *structure* (read+raf at a random point, table membership) is proven, but the binding of
+  that random point to the Spartan-derived lookup-output claim is interim — same posture as the bytecode
+  read-raf and the memory-stage seeds.
 
 ---
 
 ## 12. What's left for full e2e parity with jolt-core
 
-### Instruction lookups (prefix/suffix) — the dominant remaining piece
+### Instruction lookups (prefix/suffix) — ✅ DONE (P3b)
+
+The dominant remaining piece is now landed and wired into `prove_e2e`/`verify_e2e`. As built:
+- **P3b-0** — jolt-core-free `Cycle→Option<usize>` table dispatch: `with_isa_struct!` is exported from
+  jolt-trace (`$crate`-relative) and reused by `jolt_lookup_tables::instruction_lookup_table_index::<XLEN>`
+  (`LookupTableKind::index()` = the `enum_index` analog). Gated by a jolt-equivalence parity test: matches
+  jolt-core on every cycle of the real muldiv trace (483 cycles, 21 distinct tables).
+- **P3b-1** — `instruction_lookup_columns::<XLEN>` (goldilocks `instruction_lookups/trace.rs`) mirrors
+  `stage5_lookup_trace`: per-cycle `lookup_index` / table dispatch / `is_interleaved` over the padded length.
+- **P3b-2** — `prove_e2e`/`verify_e2e` gain `Instruction{Prover,Verifier}Inputs`, three `E2eProof` fields,
+  a fresh transcript-squeezed `r_reduction` (interim Fork-2), pinned `XLEN=64, D=32, NE=34`, and
+  `instruction_pushforward_family` (drop-in over the family-generic M7 pushforward).
+- **P3b-3** — full PCS discharge: instruction `RaDense(0..32)` joins the stage-8 inventory open and the
+  per-chunk `Pushforward` `P^F` limbs are opened (base `instruction_range.start`, distinct from bytecode).
+- **P3b-4** — `goldilocks_e2e` round-trips the full e2e with the instruction family and asserts the
+  `instruction_range` geometry (5 tests green; the read-raf at production `LOG_K=128` proves in ~5s on muldiv).
+
+The prefix/suffix address-phase math (P1) + the `InstructionReadRaf` sibling instance (P2) + the composable
+`prove/verify_instruction_read_raf` stage (P3a) were landed earlier in the arc (see §14). The historical
+plan for that math is preserved below for reference.
+
+<details><summary>Historical IL plan (P1–P3a, as-built)</summary>
 
 > **PORT-SOURCE CORRECTION (2026-06-03, branch `refactor/crates`).** The forward plan below supersedes
 > the IL section of `PHASE6_NEXT_SESSION_PROMPT.md`, which assumed a `jolt-core/src/zkvm/lookup_table/`
@@ -402,9 +428,18 @@ are reusable; only the dense address-phase `Val_s` is replaced by prefix/suffix.
 - **P3** `prove_instruction_read_raf` + e2e wiring + `instruction_pushforward_family` (+`E2eProof` field) over
   the existing M7 pushforward (unchanged) + `INSTRUCTION_D=32` + parity gate.
 
-### Then, for true parity:
-Uni-skip Spartan (Fork 2 binding) · R-integration (limb soundness) · RAM real initial-state + dense-`RamRa`
-discharge · stage-5 lookup `Val_s` · true intra-class WHIR batching · (ZK is a separate track, not this crate).
+</details>
+
+### Then, for true parity (the remaining post-P3b work):
+1. **Uni-skip Spartan (Fork 2 binding)** — the main soundness gap. Binds every self-seeded reduction point
+   (bytecode/instruction `r_reduction`, the Spartan stage seeds, the memory `spartan_seeds`) to one sound
+   Spartan execution via the univariate-skip outer sumcheck. Until then the stages are individually sound
+   but their challenge points are not provably the Spartan-derived ones.
+2. **R-integration** — commit the limb range-checks (R-core) as `R1csRangeHalf` z-leaves tied to `z(r_y)`.
+3. **RAM real initial-state + dense-`RamRa` PCS discharge** — real initial memory + program-output binding;
+   reconcile the dense one-hot `RamRa` with the per-chunk committed `RaDense` (RAM-via-read-raf).
+4. **Stage-5 register val-evaluation** — the register-side `Val_s` closure.
+5. **True intra-class WHIR batching** (perf) · ZK / BlindFold (separate track, not this crate).
 
 ---
 
@@ -413,12 +448,16 @@ discharge · stage-5 lookup `Val_s` · true intra-class WHIR batching · (ZK is 
 ```bash
 source .bolt-dev-env 2>/dev/null            # MLIR/LLVM paths (harmless if unused)
 # Goldilocks crate — the per-commit gate:
-cargo nextest run -p jolt-prover-goldilocks --features goldilocks --cargo-quiet           # 131 green
+cargo nextest run -p jolt-prover-goldilocks --features goldilocks --cargo-quiet           # 136 green
 cargo clippy -p jolt-prover-goldilocks --features goldilocks --all-targets -- -D warnings
 cargo fmt -p jolt-prover-goldilocks
 # The real-trace e2e + parity gate (build ONLY the named test — the full --features goldilocks set fills the disk):
 cargo test -p jolt-equivalence --features goldilocks --test goldilocks_e2e
 cargo test -p jolt-equivalence --features goldilocks --test goldilocks_witness_gate
+# Run the FULL e2e proof+verify on the real muldiv trace (binary + bytecode + instruction read-raf at
+# LOG_K=128 + both M7 pushforwards + stage-8 WHIR opens):
+cargo test -p jolt-equivalence --features goldilocks --test goldilocks_e2e \
+  goldilocks_real_trace_e2e_with_read_raf -- --nocapture
 ```
 Gotchas: `F::zero()/one()` don't resolve on concrete `GoldilocksFp3` in tests (use `from_u64`); WHIR needs
 `log_t ≥ 4` and non-degenerate columns; binding LowToHigh, opening points BIG_ENDIAN; the sparse read-raf
