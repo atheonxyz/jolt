@@ -25,7 +25,7 @@ use jolt_prover_goldilocks::zkvm::e2e::{
 use jolt_prover_goldilocks::zkvm::real_trace::{assemble_real_witness, RealWitness};
 use jolt_prover_goldilocks::zkvm::witness::CommittedWitness;
 use jolt_prover_goldilocks::F;
-use jolt_trace::{extract_trace, BytecodePreprocessing, CycleRow, Instruction};
+use jolt_trace::{extract_trace, BytecodePreprocessing, Cycle, CycleRow, Instruction};
 use jolt_witness::commitment_trace_sources;
 use jolt_witness::goldilocks::{FamilyLayout, GoldilocksLayout};
 
@@ -40,6 +40,9 @@ struct Fixture {
     real: RealWitness<F>,
     committed: CommittedWitness<F>,
     bytecode_rows: Vec<Instruction>,
+    /// The raw padded-or-unpadded execution trace, retained for the instruction-lookup family
+    /// (per-cycle lookup index / table / interleaved flag) and the P3b-0 dispatch parity gate.
+    trace: Vec<Cycle>,
     log_k_chunk: usize,
     instruction_d: usize,
     bytecode_d: usize,
@@ -130,6 +133,7 @@ fn build_muldiv_fixture() -> Fixture {
         ram_d,
         log_register: (REGISTER_COUNT as usize).trailing_zeros() as usize,
         trace_len: trace.len(),
+        trace,
     }
 }
 
@@ -265,5 +269,41 @@ fn goldilocks_e2e_geometry_matches_core_muldiv() {
         "[goldilocks-e2e/M4] geometry parity vs jolt-core OK: log_t={}, log_k_chunk={}, \
          instruction_d={}, bytecode_d={} (ram_d goldilocks={} <= core={})",
         p.log_t, p.log_k_chunk, p.instruction_d, p.bytecode_d, fx.ram_d, p.ram_d,
+    );
+}
+
+/// P3b-0 — the jolt-core-free instruction lookup-table dispatch
+/// ([`jolt_lookup_tables::instruction_lookup_table_index`]) must agree with jolt-core's
+/// `InstructionLookup::lookup_table(cycle).map(enum_index)` on every cycle of the real muldiv trace.
+/// This gates both the per-opcode table choice AND that `LookupTableKind::index()` (the `#[repr(u8)]`
+/// discriminant) is the same ordering as jolt-core's `LookupTables::enum_index`.
+#[test]
+fn goldilocks_instruction_lookup_dispatch_matches_core() {
+    use common::constants::XLEN;
+    use jolt_core::zkvm::instruction::InstructionLookup;
+    use jolt_core::zkvm::lookup_table::LookupTables as CoreLookupTables;
+    use jolt_lookup_tables::instruction_lookup_table_index;
+
+    let fx = build_muldiv_fixture();
+    let mut tables_seen = std::collections::BTreeSet::new();
+    for cycle in &fx.trace {
+        let mine = instruction_lookup_table_index::<XLEN>(&cycle.instruction());
+        let core = InstructionLookup::<XLEN>::lookup_table(cycle)
+            .map(|table| CoreLookupTables::<XLEN>::enum_index(&table));
+        assert_eq!(
+            mine, core,
+            "instruction lookup-table dispatch must match jolt-core (cycle: {cycle:?})"
+        );
+        if let Some(t) = mine {
+            tables_seen.insert(t);
+        }
+    }
+    assert!(!fx.trace.is_empty(), "muldiv trace must be non-empty");
+
+    eprintln!(
+        "[goldilocks-e2e/P3b-0] dispatch parity vs jolt-core OK over {} cycles: {} distinct tables {:?}",
+        fx.trace.len(),
+        tables_seen.len(),
+        tables_seen,
     );
 }

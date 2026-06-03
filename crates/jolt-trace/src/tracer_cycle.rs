@@ -10,9 +10,17 @@ use crate::CycleRow;
 
 /// Map an `Instruction` variant to its ISA struct, bind it to `$i`, evaluate `$body`.
 /// The `noop =>` arm handles `Instruction::NoOp` separately.
+///
+/// Exported so other workspace crates (e.g. `jolt-lookup-tables`, which holds the per-ISA-struct
+/// `InstructionLookupTable`/`LookupQuery` impls) can dispatch a `tracer::Instruction` onto its typed
+/// ISA struct without re-listing every variant. The paths are `$crate`-relative (resolving against
+/// `jolt-trace`'s re-exports of `Instruction` and `instructions::*`), so the macro is usable both
+/// inside this crate and cross-crate.
+#[macro_export]
 macro_rules! with_isa_struct {
     ($instr:expr, |$i:ident| $body:expr, noop => $noop:expr) => {{
-        use jolt_riscv::instructions::*;
+        use $crate::instructions::*;
+        use $crate::Instruction;
         match $instr {
             Instruction::ADD(value) => {
                 let $i = Add(*value);
