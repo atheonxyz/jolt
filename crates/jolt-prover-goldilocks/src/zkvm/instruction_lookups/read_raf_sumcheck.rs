@@ -35,9 +35,12 @@ use jolt_poly::{BindingOrder, EqPolynomial, UnivariatePoly};
 
 use crate::framework::accumulator::{
     CommittedPolynomial, OpeningAccumulator, OpeningPoint, Openings, SumcheckId, VirtualPolynomial,
+    BIG_ENDIAN,
 };
 use crate::framework::poly::MultilinearPolynomial;
-use crate::framework::sumcheck::SumcheckInstance;
+use crate::framework::sumcheck::{prove, verify, SumcheckInstance};
+use crate::framework::transcript::{ProverFs, VerifierFs};
+use jolt_sumcheck::SumcheckClaim;
 
 use super::address_phase::{
     identity_polynomial_eval, lookup_groups_from_trace, operand_polynomial_eval,
@@ -108,11 +111,32 @@ impl<F: Field, const XLEN: usize, const D: usize, const NE: usize>
         }
     }
 
-    /// The reversed (MSB-first) address point after the address phase completes.
+    /// Build a verifier instance (no trace): only `gamma`, `r_reduction`, and `log_t` are needed by
+    /// [`SumcheckInstance::expected_output_claim`] (which reads ra/flag openings from the accumulator
+    /// and computes the table/operand MLEs at `r_addr` from the public tables).
+    pub fn new_verifier(r_reduction: Vec<F>, gamma: F) -> Self {
+        let log_t = r_reduction.len();
+        let address =
+            InstructionAddressPhase::<F, XLEN>::new(Vec::new(), Vec::new(), gamma, F::from_u64(1));
+        Self {
+            address,
+            gamma,
+            log_t,
+            r_reduction,
+            lookup_indices: Vec::new(),
+            lookup_table_indices: Vec::new(),
+            is_interleaved: Vec::new(),
+            indices: std::array::from_fn(|_| Vec::new()),
+            ra: Vec::new(),
+            g: None,
+        }
+    }
+
+    /// The MSB-first address point after the address phase completes. The address phase binds
+    /// HighToLow (round 0 = MSB), so `address_challenges` is already MSB-first — NO reverse (unlike
+    /// the LowToHigh `OneHotReadRaf`).
     fn r_addr(&self) -> Vec<F> {
-        let mut r = self.address.address_challenges().to_vec();
-        r.reverse();
-        r
+        self.address.address_challenges().to_vec()
     }
 
     /// Read+raf value MLE at `r_addr` for one cycle's table/interleaved flags.
@@ -193,6 +217,17 @@ impl<F: Field, const XLEN: usize, const D: usize, const NE: usize> SumcheckInsta
 
     fn degree(&self) -> usize {
         D + 1
+    }
+
+    /// Mixed binding orders: the address phase binds HighToLow (already MSB-first) while the cycle
+    /// phase binds LowToHigh. So the canonical BIG_ENDIAN point `[r_cycle ‖ r_addr]` reverses ONLY the
+    /// cycle challenges and keeps the address challenges as-is — NOT the default uniform reverse.
+    fn normalize_opening_point(&self, challenges: &[F]) -> OpeningPoint<BIG_ENDIAN, F> {
+        let (addr, cycle) = challenges.split_at(Self::LOG_K);
+        let mut point = Vec::with_capacity(challenges.len());
+        point.extend(cycle.iter().rev().copied());
+        point.extend_from_slice(addr);
+        OpeningPoint::new(point)
     }
 
     fn input_claim(&self, _accumulator: &dyn OpeningAccumulator<F>) -> F {
@@ -375,15 +410,158 @@ fn binary_point<F: Field>(idx: u128, n: usize) -> Vec<F> {
         .collect()
 }
 
+/// Instruction read-raf stage failure.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum InstructionReadRafError {
+    Sumcheck,
+    OutputClaim,
+}
+
+/// The instruction read-raf stage proof. Interim Fork-2 form: carries the input claim and the
+/// openings the verifier (which lacks the trace) cannot recompute — the `D` cached `ra_i(r_k_i,
+/// r_cycle)` (also the M7 pushforward inputs) and the per-table / raf flag virtual openings. The
+/// sumcheck round polynomials live in the shared NARG. (Binding the input claim to the upstream
+/// `InstructionClaimReduction` is the deferred Fork-2 closure — see the e2e seeding.)
+#[derive(Clone, Debug)]
+pub struct InstructionReadRafProof<F: Field> {
+    pub input_claim: F,
+    pub ra_openings: Vec<F>,
+    pub table_flags: Vec<F>,
+    pub raf_flag: F,
+}
+
+/// Prove the instruction-lookup read-raf as a composable stage on the shared transcript +
+/// accumulator: draw `γ`, build the [`InstructionReadRaf`] instance from the trace + the shared
+/// reduction point, run the sumcheck, and extract the `ra_i` + flag openings into the proof.
+pub fn prove_instruction_read_raf<F, T, const XLEN: usize, const D: usize, const NE: usize>(
+    trace: InstructionTrace<'_, D>,
+    r_reduction: Vec<F>,
+    accumulator: &mut Openings<F>,
+    transcript: &mut T,
+) -> InstructionReadRafProof<F>
+where
+    F: Field,
+    T: ProverFs<F>,
+{
+    let gamma = transcript.challenge();
+    let mut instance = InstructionReadRaf::<F, XLEN, D, NE>::new_prover(trace, r_reduction, gamma);
+    let input_claim = instance.input_claim(&*accumulator);
+    let _ = prove(&mut instance, accumulator, transcript);
+
+    let table_count = LookupTableKind::<XLEN>::all().len();
+    let ra_openings = (0..D)
+        .map(|i| {
+            accumulator
+                .get_committed_polynomial_opening(
+                    CommittedPolynomial::InstructionRa(i),
+                    SumcheckId::InstructionReadRaf,
+                )
+                .1
+        })
+        .collect();
+    let table_flags = (0..table_count)
+        .map(|t| {
+            accumulator
+                .get_virtual_polynomial_opening(
+                    VirtualPolynomial::LookupTableFlag(t),
+                    SumcheckId::InstructionReadRaf,
+                )
+                .1
+        })
+        .collect();
+    let raf_flag = accumulator
+        .get_virtual_polynomial_opening(
+            VirtualPolynomial::InstructionRafFlag,
+            SumcheckId::InstructionReadRaf,
+        )
+        .1;
+    InstructionReadRafProof {
+        input_claim,
+        ra_openings,
+        table_flags,
+        raf_flag,
+    }
+}
+
+/// Verify the instruction read-raf stage (mirror of [`prove_instruction_read_raf`]): draw `γ` in
+/// lockstep, replay the sumcheck against `proof.input_claim`, re-seed the proof-carried `ra_i` + flag
+/// openings at the recomputed points, and check the reduced claim closes against
+/// [`SumcheckInstance::expected_output_claim`]. A tampered opening fails that check.
+pub fn verify_instruction_read_raf<F, T, const XLEN: usize, const D: usize, const NE: usize>(
+    proof: &InstructionReadRafProof<F>,
+    r_reduction: Vec<F>,
+    accumulator: &mut Openings<F>,
+    transcript: &mut T,
+) -> Result<(), InstructionReadRafError>
+where
+    F: Field,
+    T: VerifierFs<F>,
+{
+    let log_t = r_reduction.len();
+    let log_k = 2 * XLEN;
+    let chunk_bits = log_k / D;
+    let gamma = transcript.challenge();
+    let instance = InstructionReadRaf::<F, XLEN, D, NE>::new_verifier(r_reduction, gamma);
+
+    let claim = SumcheckClaim {
+        num_vars: log_k + log_t,
+        degree: D + 1,
+        claimed_sum: proof.input_claim,
+    };
+    let eval = verify(&claim, transcript).map_err(|_| InstructionReadRafError::Sumcheck)?;
+
+    // Address bound first ⇒ BIG_ENDIAN point is [r_cycle ‖ r_addr]; split at log_t.
+    let point = instance.normalize_opening_point(&eval.point);
+    let (r_cycle, r_addr) = point.split_at(log_t);
+    for (i, &c) in proof.ra_openings.iter().enumerate() {
+        let r_k_i = &r_addr.r[i * chunk_bits..(i + 1) * chunk_bits];
+        let chunk_point = OpeningPoint::new([r_k_i, r_cycle.r.as_slice()].concat());
+        accumulator.append_dense(
+            CommittedPolynomial::InstructionRa(i),
+            SumcheckId::InstructionReadRaf,
+            chunk_point,
+            c,
+        );
+    }
+    let cycle_point = OpeningPoint::new(r_cycle.r.clone());
+    for (t, &flag) in proof.table_flags.iter().enumerate() {
+        accumulator.append_virtual(
+            VirtualPolynomial::LookupTableFlag(t),
+            SumcheckId::InstructionReadRaf,
+            cycle_point.clone(),
+            flag,
+        );
+    }
+    accumulator.append_virtual(
+        VirtualPolynomial::InstructionRafFlag,
+        SumcheckId::InstructionReadRaf,
+        cycle_point,
+        proof.raf_flag,
+    );
+
+    if eval.value != instance.expected_output_claim(accumulator, &eval.point) {
+        return Err(InstructionReadRafError::OutputClaim);
+    }
+    Ok(())
+}
+
 #[cfg(test)]
+#[expect(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    reason = "tests may unwrap/expect freely"
+)]
 mod tests {
     use super::*;
+    use crate::field::{ProverTranscript, VerifierTranscript};
     use jolt_field::goldilocks::GoldilocksFp3 as F;
     use jolt_lookup_tables::interleave_bits;
 
     const XLEN: usize = 8;
     const D: usize = 4; // LOG_K=16, RA_CHUNK_BITS=4
     const NE: usize = D + 2;
+
+    type SampleTrace = (Vec<u128>, Vec<Option<usize>>, Vec<bool>, [Vec<u32>; D]);
 
     fn f(v: u64) -> F {
         F::from_u64(v)
@@ -443,7 +621,6 @@ mod tests {
                     .iter()
                     .map(|p| p.final_sumcheck_claim())
                     .collect();
-                #[expect(clippy::unwrap_used, reason = "g materialized before cycle rounds")]
                 let g = instance.g.as_ref().unwrap();
                 g_final = g.final_sumcheck_claim();
             }
@@ -464,5 +641,95 @@ mod tests {
             claim, expected,
             "reduced claim == verifier expected_output_claim"
         );
+    }
+
+    fn sample_trace() -> SampleTrace {
+        let and = 2usize;
+        let idx_a = interleave_bits(0b1011_0110u64, 0b0110_1001u64);
+        let idx_b = interleave_bits(0b0011_1101u64, 0b1100_0011u64);
+        let idx_c = 0b1010_0101_1001_0110u128; // non-interleaved, no table
+        let idx_d = interleave_bits(0b0101_0101u64, 0b1010_1010u64);
+        let lookup_indices = vec![idx_a, idx_b, idx_c, idx_d];
+        let lookup_table_indices = vec![Some(and), Some(and), None, Some(and)];
+        let is_interleaved = vec![true, true, false, true];
+        let indices: [Vec<u32>; D] = std::array::from_fn(|i| {
+            lookup_indices
+                .iter()
+                .map(|&idx| chunk_index(idx, i))
+                .collect()
+        });
+        (
+            lookup_indices,
+            lookup_table_indices,
+            is_interleaved,
+            indices,
+        )
+    }
+
+    /// Prove → NARG → verify through the real framework drivers + WHIR spongefish transcript.
+    #[test]
+    fn instruction_read_raf_stage_round_trip() {
+        let (li, lti, ii, indices) = sample_trace();
+        let r_reduction = vec![f(5), f(9)];
+        let trace = InstructionTrace {
+            lookup_indices: &li,
+            lookup_table_indices: &lti,
+            is_interleaved: &ii,
+            indices: &indices,
+        };
+
+        let mut prover_acc = Openings::<F>::new(2);
+        let mut pt = ProverTranscript::new("instr-read-raf");
+        let proof = prove_instruction_read_raf::<F, _, XLEN, D, NE>(
+            trace,
+            r_reduction.clone(),
+            &mut prover_acc,
+            &mut pt,
+        );
+        let narg = pt.into_proof();
+
+        let mut verifier_acc = Openings::<F>::new(2);
+        let mut vt = VerifierTranscript::new("instr-read-raf", &narg);
+        verify_instruction_read_raf::<F, _, XLEN, D, NE>(
+            &proof,
+            r_reduction,
+            &mut verifier_acc,
+            &mut vt,
+        )
+        .expect("instruction read-raf must verify");
+    }
+
+    /// A tampered `ra_i` opening breaks the output-claim check (the NARG replay still succeeds).
+    #[test]
+    fn instruction_read_raf_tampered_rejected() {
+        let (li, lti, ii, indices) = sample_trace();
+        let r_reduction = vec![f(5), f(9)];
+        let trace = InstructionTrace {
+            lookup_indices: &li,
+            lookup_table_indices: &lti,
+            is_interleaved: &ii,
+            indices: &indices,
+        };
+
+        let mut prover_acc = Openings::<F>::new(2);
+        let mut pt = ProverTranscript::new("instr-read-raf");
+        let mut proof = prove_instruction_read_raf::<F, _, XLEN, D, NE>(
+            trace,
+            r_reduction.clone(),
+            &mut prover_acc,
+            &mut pt,
+        );
+        let narg = pt.into_proof();
+        proof.ra_openings[0] += f(1);
+
+        let mut verifier_acc = Openings::<F>::new(2);
+        let mut vt = VerifierTranscript::new("instr-read-raf", &narg);
+        let res = verify_instruction_read_raf::<F, _, XLEN, D, NE>(
+            &proof,
+            r_reduction,
+            &mut verifier_acc,
+            &mut vt,
+        );
+        assert_eq!(res, Err(InstructionReadRafError::OutputClaim));
     }
 }
