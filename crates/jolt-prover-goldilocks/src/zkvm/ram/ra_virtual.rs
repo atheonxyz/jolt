@@ -5,9 +5,19 @@
 //! [`super::super::claim_reductions::RamRaClaimReduction`] (`RamRa(r_address ‖ ρ)@RamRaClaimReduction`)
 //! into the `D` committed per-chunk `RamRa(i)` openings — the inputs the M7 per-chunk pushforward
 //! (`prove_read_raf_pushforward`) discharges to `RaDense`/`Pushforward` at stage 8, exactly as the
-//! bytecode/instruction read-raf families do. This is what PCS-binds the RAM access pattern (closes
-//! the documented dense-`RamRa` interim gap; the RAM read/write *checking* stays dense — only the RA
-//! *opening* is virtualized, matching jolt-core).
+//! bytecode/instruction read-raf families do. The RAM read/write *checking* stays dense — only the RA
+//! *opening* is virtualized, matching jolt-core.
+//!
+//! **WIRING PREREQUISITE (the remaining dense-`RamRa` gap, ST3b).** This reduction is sound for any
+//! `ra` where the dense one-hot `ra(r_address, c)` factorizes as `Π_i ra_i(r_address_i, c)` over the
+//! committed chunks (the unit tests below exercise that case). But the goldilocks dense RAM witness
+//! ([`super::witness::ram_witness`]) encodes a **non-access cycle as all-zero** `ra`, while the
+//! committed per-chunk one-hot ([`super::super::witness`]) encodes it as **chunk index 0** (one-hot at
+//! address 0) — so `Π_i ra_i[c] = eq(r_address, 0) ≠ 0` there, and the factorization fails on
+//! non-access cycles (most RAM cycles). jolt-core avoids this because its RAM `ra` is one-hot at a
+//! sentinel for *every* cycle (dense == committed). Wiring this into the real-trace e2e therefore
+//! first needs the dense RAM model reconciled with the committed one (a reserved no-access sentinel,
+//! or an access-flag factor) — the "RAM-via-read-raf" reconciliation, deferred.
 //!
 //! ## Identity (log_T cycle rounds, degree `D + 1`)
 //! ```text
