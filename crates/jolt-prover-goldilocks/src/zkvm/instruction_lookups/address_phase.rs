@@ -588,6 +588,29 @@ fn eq_eval_at_bits<F: Field>(point: &[F], bits: u128, num_bits: usize) -> F {
         .product()
 }
 
+/// Verifier-side operand MLE at an interleaved index point: `Σ_{i<m} point[2i+offset]·2^{m-1-i}`,
+/// `m = point.len()/2`, `offset = 0` for left. STAGE5 convention (`left → offset 0`) — the *opposite*
+/// of IL-1 [`super::OperandPolynomial`] (`left → offset 1`); the read-raf is byte-faithful to stage5,
+/// so the verifier reconstruction uses this. Mirrors jolt-kernels `operand_polynomial_eval`.
+pub(crate) fn operand_polynomial_eval<F: Field>(point: &[F], left: bool) -> F {
+    let offset = usize::from(!left);
+    let m = point.len() / 2;
+    (0..m)
+        .map(|i| point[2 * i + offset] * F::from_u128(1u128 << (m - 1 - i)))
+        .fold(F::from_u64(0), |acc, t| acc + t)
+}
+
+/// Verifier-side identity MLE at an index point: `Σ_i point[i]·2^{n-1-i}`. Mirrors jolt-kernels
+/// `identity_polynomial_eval`.
+pub(crate) fn identity_polynomial_eval<F: Field>(point: &[F]) -> F {
+    let n = point.len();
+    point
+        .iter()
+        .enumerate()
+        .map(|(i, v)| *v * F::from_u128(1u128 << (n - 1 - i)))
+        .fold(F::from_u64(0), |acc, t| acc + t)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -600,25 +623,6 @@ mod tests {
 
     fn f(v: u64) -> F {
         F::from_u64(v)
-    }
-
-    /// Verifier-side operand MLE (stage5 `operand_polynomial_eval` convention: `left → offset 0`,
-    /// the *opposite* of IL-1 `OperandPolynomial`). Lives in the P2 verifier; test-local for now.
-    fn operand_polynomial_eval(point: &[F], left: bool) -> F {
-        let offset = usize::from(!left);
-        let m = point.len() / 2;
-        (0..m)
-            .map(|i| point[2 * i + offset] * F::from_u128(1u128 << (m - 1 - i)))
-            .fold(f(0), |acc, t| acc + t)
-    }
-
-    fn identity_polynomial_eval(point: &[F]) -> F {
-        let n = point.len();
-        point
-            .iter()
-            .enumerate()
-            .map(|(i, v)| *v * F::from_u128(1u128 << (n - 1 - i)))
-            .fold(f(0), |acc, t| acc + t)
     }
 
     fn binary_point(idx: u128) -> Vec<F> {

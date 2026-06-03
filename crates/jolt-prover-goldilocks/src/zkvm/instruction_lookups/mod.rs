@@ -4,6 +4,7 @@
 pub mod address_phase;
 pub mod operand_poly;
 pub mod read_raf_checking;
+pub mod read_raf_sumcheck;
 
 pub use operand_poly::{OperandPolynomial, OperandSide};
 pub use read_raf_checking::{
