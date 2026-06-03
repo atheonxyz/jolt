@@ -20,8 +20,10 @@ use jolt_equivalence::core_oracle::core_muldiv_commitment_fixture;
 use jolt_prover_goldilocks::field::{ProverTranscript, VerifierTranscript};
 use jolt_prover_goldilocks::zkvm::driver::{prove_binary, verify_binary};
 use jolt_prover_goldilocks::zkvm::e2e::{
-    prove_e2e, verify_e2e, BytecodeProverInputs, BytecodeVerifierInputs, VerifierParams,
+    prove_e2e, verify_e2e, BytecodeProverInputs, BytecodeVerifierInputs, InstructionProverInputs,
+    InstructionVerifierInputs, VerifierParams,
 };
+use jolt_prover_goldilocks::zkvm::instruction_lookups::instruction_lookup_columns;
 use jolt_prover_goldilocks::zkvm::real_trace::{assemble_real_witness, RealWitness};
 use jolt_prover_goldilocks::zkvm::witness::CommittedWitness;
 use jolt_prover_goldilocks::F;
@@ -33,6 +35,12 @@ use jolt_witness::goldilocks::{FamilyLayout, GoldilocksLayout};
 /// is const-generic over D, so the e2e test pins D = 4, NE = D + 2 = 6.
 const BYTECODE_D: usize = 4;
 const BYTECODE_NE: usize = 6;
+
+/// Instruction-lookup family at production word size: XLEN=64, LOG_K=2·XLEN=128, decomposed into
+/// `INSTRUCTION_D = 128/log_k_chunk = 32` committed chunks (muldiv `log_k_chunk = 4`). Matches the
+/// e2e's pinned `INSTRUCTION_D`; the read-raf/pushforward consts live inside `prove_e2e`.
+const INSTRUCTION_XLEN: usize = 64;
+const INSTRUCTION_D: usize = 32;
 
 /// Everything the e2e needs from one real muldiv trace: the binary-driver witnesses, the committed
 /// witness (for the bytecode RA chunk-index columns), the padded bytecode table, and the geometry.
@@ -146,6 +154,31 @@ fn bytecode_indices(fx: &Fixture) -> [Vec<u32>; BYTECODE_D] {
     })
 }
 
+/// The instruction-lookup RA chunk-index columns (`ra_dense[instruction_range]`) as the read-raf's
+/// `INSTRUCTION_D` indices (MSB-first `log_k_chunk`-bit chunks of the interleaved lookup index).
+fn instruction_indices(fx: &Fixture) -> [Vec<u32>; INSTRUCTION_D] {
+    std::array::from_fn(|i| {
+        fx.committed.ra_dense[fx.committed.instruction_range.start + i]
+            .indices
+            .clone()
+    })
+}
+
+/// Build the prover-side instruction-lookup inputs from the real trace + committed witness: the three
+/// per-cycle lookup columns over the padded length, plus the `INSTRUCTION_D` committed chunk columns.
+fn instruction_prover_inputs(fx: &Fixture) -> InstructionProverInputs {
+    let padded_len = 1usize << fx.real.r1cs.log_num_cycles;
+    let cols = instruction_lookup_columns::<INSTRUCTION_XLEN>(&fx.trace, padded_len);
+    InstructionProverInputs {
+        lookup_indices: cols.lookup_indices,
+        lookup_table_indices: cols.lookup_table_indices,
+        is_interleaved: cols.is_interleaved,
+        indices: instruction_indices(fx),
+        log_k_chunk: fx.log_k_chunk,
+        base_index: fx.committed.instruction_range.start,
+    }
+}
+
 #[test]
 fn goldilocks_real_trace_r1cs_is_satisfied() {
     let fx = build_muldiv_fixture();
@@ -210,12 +243,28 @@ fn goldilocks_real_trace_binary_driver_round_trip() {
 }
 
 #[test]
-fn goldilocks_real_trace_e2e_with_bytecode_read_raf() {
+fn goldilocks_real_trace_e2e_with_read_raf() {
     let fx = build_muldiv_fixture();
     assert_eq!(
         fx.bytecode_d, BYTECODE_D,
         "muldiv bytecode_d must match the const D this test pins"
     );
+    assert_eq!(
+        fx.instruction_d, INSTRUCTION_D,
+        "muldiv instruction_d must match the const INSTRUCTION_D the e2e pins"
+    );
+    // P3b-4 geometry: the instruction family spans INSTRUCTION_D committed chunks, each log_k_chunk wide.
+    assert_eq!(
+        fx.committed.instruction_range.len(),
+        INSTRUCTION_D,
+        "instruction_range must span INSTRUCTION_D chunks"
+    );
+    for i in fx.committed.instruction_range.clone() {
+        assert_eq!(
+            fx.committed.ra_dense[i].log_m, fx.log_k_chunk,
+            "each instruction chunk column must have log_m == log_k_chunk"
+        );
+    }
     let log_k_chunks = [fx.log_k_chunk; BYTECODE_D];
 
     let mut prover_t = ProverTranscript::new("muldiv-e2e");
@@ -226,8 +275,9 @@ fn goldilocks_real_trace_e2e_with_bytecode_read_raf() {
         log_register: fx.log_register,
         base_index: fx.committed.bytecode_range.start,
     };
-    let proof = prove_e2e::<BYTECODE_D, BYTECODE_NE>(&fx.real, &bc_prover, &mut prover_t)
-        .expect("prove_e2e (binary + bytecode read-raf + stage-8 R1csAux/Inc opens) must succeed");
+    let instr_prover = instruction_prover_inputs(&fx);
+    let proof = prove_e2e::<BYTECODE_D, BYTECODE_NE>(&fx.real, &bc_prover, &instr_prover, &mut prover_t)
+        .expect("prove_e2e (binary + bytecode + instruction read-raf + pushforwards + stage-8) must succeed");
     let narg = prover_t.into_proof();
 
     let params = VerifierParams::from_witness(&fx.real);
@@ -237,9 +287,25 @@ fn goldilocks_real_trace_e2e_with_bytecode_read_raf() {
         log_register: fx.log_register,
         base_index: fx.committed.bytecode_range.start,
     };
+    let instr_verifier = InstructionVerifierInputs {
+        log_k_chunk: fx.log_k_chunk,
+        base_index: fx.committed.instruction_range.start,
+    };
     let mut verifier_t = VerifierTranscript::new("muldiv-e2e", &narg);
-    verify_e2e::<BYTECODE_D, BYTECODE_NE>(&proof, &params, &bc_verifier, &mut verifier_t)
-        .expect("verify_e2e must accept the real muldiv proof");
+    verify_e2e::<BYTECODE_D, BYTECODE_NE>(
+        &proof,
+        &params,
+        &bc_verifier,
+        &instr_verifier,
+        &mut verifier_t,
+    )
+    .expect("verify_e2e must accept the real muldiv proof");
+
+    eprintln!(
+        "[goldilocks-e2e/P3b] full e2e round-trip OK: binary + bytecode read-raf (D={}) + \
+         instruction read-raf (D={}, LOG_K=128) + both pushforwards + stage-8 opens",
+        BYTECODE_D, INSTRUCTION_D,
+    );
 }
 
 /// M4 — proof-level parity gate: the geometry the Goldilocks e2e proves matches jolt-core's
