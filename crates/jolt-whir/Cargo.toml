@@ -12,9 +12,9 @@ workspace = true
 jolt-field = { path = "../jolt-field" }
 jolt-poly = { path = "../jolt-poly" }
 jolt-witness = { path = "../jolt-witness" }
-# WHIR lives as a sibling of the jolt workspace; the workspace-level digest/blake3
-# pinning lets it coexist with the digest-0.11 Jolt graph (same as whir-pcs-bench).
-whir = { path = "../../../whir", features = ["parallel"], optional = true }
+# WHIR is pulled from the pushed fork; the workspace-level digest/blake3 pinning
+# lets it coexist with the digest-0.11 Jolt graph (same as whir-pcs-bench).
+whir = { git = "https://github.com/atheonxyz/whir", branch = "us/jolt-whir-pcs-bench", features = ["parallel"], optional = true }
 ark-ff = { workspace = true, optional = true }
 
 [features]

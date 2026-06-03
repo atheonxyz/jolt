@@ -46,6 +46,9 @@ members = [
   "crates/jolt-equivalence",
   "crates/jolt-field",
   "crates/jolt-pcs-bench",
+  "crates/whir-pcs-bench",
+  "crates/jolt-whir",
+  "crates/jolt-prover-goldilocks",
   "jolt-core",
   "tracer",
   "common",
@@ -171,12 +174,34 @@ lto = "fat"
 strip = false
 codegen-units = 1
 
+# Profiling-friendly release. Mirrors WHIR's matching [profile.samply] block:
+# inherits release optimizations but switches to thin LTO so samply can
+# attribute samples to functions without breaking inlining beyond recognition.
+# Used by crates/jolt-pcs-bench/profile.sh.
+[profile.samply]
+inherits = "release"
+lto = "thin"
+
 [patch.crates-io]
-ark-bn254 = { git = "https://github.com/a16z/arkworks-algebra", branch = "dev/twist-shout" }
-ark-ff = { git = "https://github.com/a16z/arkworks-algebra", branch = "dev/twist-shout" }
-ark-ec = { git = "https://github.com/a16z/arkworks-algebra", branch = "dev/twist-shout" }
-ark-serialize = { git = "https://github.com/a16z/arkworks-algebra", branch = "dev/twist-shout" }
+# Arkworks small-Fp fork (Goldilocks/SmallFp work + per-field iteration). The
+# crates.io patch intercepts transitive references (e.g. dory-pcs pulling ark-*
+# from the registry); the git patch below intercepts the workspace.dependencies
+# that point at the a16z/arkworks-algebra git URL.
+ark-bn254 = { git = "https://github.com/x-senpai-x/arkworks-algebra", branch = "dev/twist-shout-smallfp" }
+ark-ff = { git = "https://github.com/x-senpai-x/arkworks-algebra", branch = "dev/twist-shout-smallfp" }
+ark-ec = { git = "https://github.com/x-senpai-x/arkworks-algebra", branch = "dev/twist-shout-smallfp" }
+ark-serialize = { git = "https://github.com/x-senpai-x/arkworks-algebra", branch = "dev/twist-shout-smallfp" }
+ark-poly = { git = "https://github.com/x-senpai-x/arkworks-algebra", branch = "dev/twist-shout-smallfp" }
 allocative = { git = "https://github.com/facebookexperimental/allocative", rev = "85b773d85d526d068ce94724ff7a7b81203fc95e" }
+
+[patch."https://github.com/a16z/arkworks-algebra"]
+ark-bn254 = { git = "https://github.com/x-senpai-x/arkworks-algebra", branch = "dev/twist-shout-smallfp" }
+ark-ff = { git = "https://github.com/x-senpai-x/arkworks-algebra", branch = "dev/twist-shout-smallfp" }
+ark-ec = { git = "https://github.com/x-senpai-x/arkworks-algebra", branch = "dev/twist-shout-smallfp" }
+ark-serialize = { git = "https://github.com/x-senpai-x/arkworks-algebra", branch = "dev/twist-shout-smallfp" }
+ark-grumpkin = { git = "https://github.com/x-senpai-x/arkworks-algebra", branch = "dev/twist-shout-smallfp" }
+ark-secp256k1 = { git = "https://github.com/x-senpai-x/arkworks-algebra", branch = "dev/twist-shout-smallfp" }
+ark-secp256r1 = { git = "https://github.com/x-senpai-x/arkworks-algebra", branch = "dev/twist-shout-smallfp" }
 
 [workspace.metadata.cargo-machete]
 ignored = ["jolt-sdk"]
@@ -260,10 +285,10 @@ ark-std = { version = "0.5.0", default-features = false }
 sha2 = "0.11"
 sha3 = "0.11"
 blake2 = "0.11.0-rc.6"
-blake3 = { version = "1.5.0" }
+blake3 = { version = "=1.8.3", features = ["digest", "traits-preview"] }
 light-poseidon = "0.4"
 digest = "0.11"
-jolt-optimizations = { git = "https://github.com/a16z/arkworks-algebra", branch = "dev/twist-shout" }
+jolt-optimizations = { git = "https://github.com/x-senpai-x/arkworks-algebra", branch = "dev/twist-shout-smallfp" }
 dory = { package = "dory-pcs", version = "0.3.0", features = [
   "backends",
   "cache",
