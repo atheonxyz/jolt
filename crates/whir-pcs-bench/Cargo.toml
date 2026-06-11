@@ -1,0 +1,47 @@
+[package]
+name = "whir-pcs-bench"
+version = "0.1.0"
+edition = "2021"
+description = "WHIR-ZK side of the Jolt PCS commitment benchmark"
+
+[lints.clippy]
+pedantic = "allow"
+print_stdout = "allow"
+print_stderr = "allow"
+unwrap_used = "allow"
+expect_used = "allow"
+allow_attributes = "allow"
+panic = "allow"
+
+[lints.rust]
+unused_results = "allow"
+
+[[bin]]
+name = "whir-pcs-bench"
+path = "src/main.rs"
+
+[dependencies]
+# Pinned by immutable rev (not branch) for reproducibility. The fork's only
+# protocol-relevant change is `pub use ark_bn254::Fr as Field256`, which makes
+# WHIR's BN254 the same Rust type as jolt_field::Fr's inner field.
+whir = { git = "https://github.com/atheonxyz/whir", rev = "341ccdac6d113d65880c2ea1905f7cc6049c3937", features = ["rs_in_order", "parallel", "tracing"] }
+
+ark-ff = { workspace = true }
+ark-bn254 = { workspace = true, features = ["curve"] }
+ark-serialize = { workspace = true }
+ark-std = { workspace = true, features = ["std"] }
+blake3 = { workspace = true }
+jolt-field = { workspace = true }
+jolt-poly = { workspace = true, features = ["parallel"] }
+clap = { workspace = true }
+rayon = { workspace = true }
+serde_json = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+tracing-chrome = { workspace = true }
+
+dhat = { version = "0.3", optional = true }
+
+[features]
+default = []
+profile-alloc = ["dep:dhat"]

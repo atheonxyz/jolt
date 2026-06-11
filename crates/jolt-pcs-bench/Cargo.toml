@@ -1,0 +1,69 @@
+[package]
+name = "jolt-pcs-bench"
+version = "0.1.0"
+edition = "2021"
+description = "Jolt-side of the WHIR vs Dory PCS commitment benchmark on a real Jolt ECDSA workload"
+
+# This bench is a research/measurement binary; relax the workspace pedantic
+# policy here. It still enforces unused/dead_code warnings (via Rust's default
+# lints) and unsafe/correctness lints.
+[lints.clippy]
+pedantic = "allow"
+print_stdout = "allow"
+print_stderr = "allow"
+unwrap_used = "allow"
+expect_used = "allow"
+allow_attributes = "allow"
+
+[lints.rust]
+unused_results = "allow"
+
+[[bin]]
+name = "jolt-pcs-bench"
+path = "src/main.rs"
+
+[dependencies]
+# Native jolt-main trace pipeline, proof shape, witness/index helpers (replaces
+# the Bolt-only jolt-trace / jolt-witness crates which do not exist on jolt-main).
+jolt-core = { workspace = true, features = ["host"] }
+tracer = { workspace = true }
+jolt-program = { workspace = true }
+jolt-riscv = { workspace = true }
+
+# PCS / poly / field. jolt-dory has no [workspace.dependencies] alias on
+# jolt-main, so it must be a path dependency.
+jolt-dory = { path = "../jolt-dory" }
+jolt-field = { workspace = true }
+jolt-poly = { workspace = true }
+jolt-openings = { workspace = true }
+
+# Guest pipeline
+jolt-inlines-p256 = { workspace = true, features = ["host"] }
+common = { workspace = true, features = ["std"] }
+
+# Arkworks — `ark-bn254` is unused at the source level but kept in the
+# dependency graph (see `cargo-machete.ignored` below) so the `curve` feature
+# stays activated through the workspace patch graph.
+ark-bn254 = { workspace = true, features = ["curve"] }
+
+# Utilities
+clap = { workspace = true }
+postcard = "1"
+rayon = { workspace = true }
+serde = { workspace = true, features = ["derive"] }
+serde_json = "1"
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+tracing-chrome = { workspace = true }
+# Allocation profiling — opt-in via `--features profile-alloc` so dhat's
+# global allocator hook doesn't impact normal release runs.
+dhat = { version = "0.3", optional = true }
+
+[features]
+default = []
+# Enables dhat heap profiling. Bench binary installs a global allocator
+# wrapper that records every allocation; use only when running `--profile-alloc`.
+profile-alloc = ["dep:dhat"]
+
+[package.metadata.cargo-machete]
+ignored = ["jolt-inlines-p256", "ark-bn254"]
