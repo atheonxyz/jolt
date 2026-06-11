@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 #
-# Profiling orchestrator for jolt-pcs-bench + whir-pcs-bench.
+# Profiling orchestrator for jolt-pcs-bench + whir-pcs-bench (BN254 only).
 #
 # Captures three artifacts per configuration:
 #   - samply.profraw   CPU sampling profile (samply / Firefox profiler)
@@ -8,7 +8,7 @@
 #   - dhat-heap.json   heap-allocation profile (https://nnethercote.github.io/dh_view/)
 #
 # Usage:
-#   profile.sh {dory|whir-bn254|whir-fp3|all} [--samply|--chrome|--dhat|--all]
+#   profile.sh {dory|whir-bn254|all} [--samply|--chrome|--dhat|--all]
 #
 # Defaults to `--all` if no profile-type flag is given.
 #
@@ -36,12 +36,12 @@ CONFIG="${1:-}"
 MODE="${2:---all}"
 
 usage() {
-    echo "Usage: $0 {dory|whir-bn254|whir-fp3|all} [--samply|--chrome|--dhat|--all]" >&2
+    echo "Usage: $0 {dory|whir-bn254|all} [--samply|--chrome|--dhat|--all]" >&2
     exit 1
 }
 
 case "$CONFIG" in
-    dory|whir-bn254|whir-fp3|all) ;;
+    dory|whir-bn254|all) ;;
     *) usage ;;
 esac
 
@@ -98,7 +98,7 @@ run_dory() {
     local out_dir="$OUT_ROOT/dory"
     mkdir -p "$out_dir"
     echo
-    echo "=== profiling Dory (bolt AddressMajor path, BN254) ==="
+    echo "=== profiling Dory (AddressMajor one-hot path, BN254) ==="
 
     if [[ "$MODE" == "--samply" || "$MODE" == "--all" ]]; then
         build_jolt samply
@@ -131,13 +131,12 @@ run_dory() {
 }
 
 run_whir() {
-    local field="$1"          # bn254 | goldilocks-fp3
-    local label="$2"          # whir-bn254 | whir-fp3
+    local label="$1"          # whir-bn254
     local out_dir="$OUT_ROOT/$label"
     mkdir -p "$out_dir"
     ensure_dump
     echo
-    echo "=== profiling WHIR-ZK ($field) ==="
+    echo "=== profiling WHIR-ZK ($label, BN254) ==="
 
     if [[ "$MODE" == "--samply" || "$MODE" == "--all" ]]; then
         build_whir samply
@@ -145,7 +144,6 @@ run_whir() {
         samply record --save-only \
             --output "$out_dir/samply.profraw" -- \
             "$REPO_ROOT/target/samply/whir-pcs-bench" \
-                --field "$field" \
                 --warmup "$WARMUP" --runs "$RUNS" \
                 --dump "$DUMP_PATH"
     fi
@@ -154,7 +152,6 @@ run_whir() {
         build_whir release
         echo "[chrome] recording $label..."
         "$REPO_ROOT/target/release/whir-pcs-bench" \
-            --field "$field" \
             --warmup "$WARMUP" --runs "$RUNS" \
             --dump "$DUMP_PATH" \
             --trace-chrome "$out_dir/chrome.json" >/dev/null
@@ -164,7 +161,6 @@ run_whir() {
         build_whir release profile-alloc
         echo "[dhat] recording $label..."
         "$REPO_ROOT/target/release/whir-pcs-bench" \
-            --field "$field" \
             --warmup "$WARMUP" --runs "$RUNS" \
             --dump "$DUMP_PATH" \
             --profile-alloc \
@@ -178,12 +174,10 @@ run_whir() {
 
 case "$CONFIG" in
     dory)       run_dory ;;
-    whir-bn254) run_whir bn254 whir-bn254 ;;
-    whir-fp3)   run_whir goldilocks-fp3 whir-fp3 ;;
+    whir-bn254) run_whir whir-bn254 ;;
     all)
         run_dory
-        run_whir bn254 whir-bn254
-        run_whir goldilocks-fp3 whir-fp3
+        run_whir whir-bn254
         ;;
 esac
 

@@ -1,10 +1,9 @@
 //! WHIR-ZK side of the Jolt PCS commitment benchmark.
 //!
 //! Reads a field-agnostic polynomial dump produced by `jolt-pcs-bench`,
-//! encodes each vector into the chosen target field (BN254 Fr or
-//! Goldilocks Fp3), groups by `num_vars` (size class), and commits each
-//! group via `whir_zk::Config::commit`. Times only the commit calls and
-//! reports min/median/max in milliseconds.
+//! encodes each vector into BN254 `Field256`, groups by `num_vars` (size
+//! class), and commits each group via `whir_zk::Config::commit`. Times only
+//! the commit calls and reports min/median/max in milliseconds.
 
 // Allocation profiling: install dhat's global allocator wrapper when the
 // `profile-alloc` feature is on. Recording is gated on the `--profile-alloc`
@@ -244,7 +243,7 @@ fn read_u32(reader: &mut impl Read) -> u32 {
 
 /// i128 → F via signed mod-p reduction. Asserts |v| fits comfortably in F.
 fn i128_to_f<F: ArkField>(v: i128) -> F {
-    // For BN254 Fr (≈2^254) and Fp3 Goldilocks (≈2^192), |v| ≤ 2^65 ≪ modulus.
+    // For BN254 Fr (≈2^254), |v| ≤ 2^65 ≪ modulus.
     // The debug_assert catches a future small-field addition where this stops being true.
     debug_assert!(
         v.unsigned_abs() < (1u128 << 65),

@@ -851,11 +851,11 @@ mod tests {
     use super::*;
     use ark_std::rand::rngs::StdRng;
     use ark_std::rand::SeedableRng;
-    use whir::algebra::fields::Field64_3;
+    use whir::algebra::fields::Field256;
     use whir::transcript::codecs::Empty;
     use whir::transcript::DomainSeparator;
 
-    type F = Field64_3;
+    type F = Field256;
 
     fn synth_family(d: usize, log_t: usize, log_m: usize, seed: u64) -> Vec<Vec<u8>> {
         let mut rng = StdRng::seed_from_u64(seed);

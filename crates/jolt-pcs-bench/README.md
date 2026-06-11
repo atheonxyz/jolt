@@ -38,7 +38,7 @@ crates/jolt-pcs-bench/
     Builds the ECDSA workload, times Dory, and writes /tmp/jolt-pcs-bench/polys.bin.
 
 crates/whir-pcs-bench/
-    Reads the dump and times WHIR-ZK over BN254 or Goldilocks Fp3.
+    Reads the dump and times WHIR-ZK over BN254.
 ```
 
 The root workspace pins `blake3 = "=1.8.3"` because WHIR expects digest-0.10
@@ -51,7 +51,7 @@ From the repository root:
 
 ```bash
 # One-shot: builds both binaries, runs Dory and WHIR, and prints a combined table.
-crates/jolt-pcs-bench/run-bench.sh --runs 5 --warmup 1 --field both
+crates/jolt-pcs-bench/run-bench.sh --runs 5 --warmup 1
 ```
 
 Step by step:
@@ -65,16 +65,9 @@ target/release/jolt-pcs-bench \
 
 cargo build -p whir-pcs-bench --release
 target/release/whir-pcs-bench \
-    --field bn254 \
     --warmup 1 --runs 5 \
     --dump /tmp/jolt-pcs-bench/polys.bin \
     --json /tmp/jolt-pcs-bench/whir-bn254.json
-
-target/release/whir-pcs-bench \
-    --field goldilocks-fp3 \
-    --warmup 1 --runs 5 \
-    --dump /tmp/jolt-pcs-bench/polys.bin \
-    --json /tmp/jolt-pcs-bench/whir-goldilocks.json
 ```
 
 Useful flags:
@@ -112,7 +105,6 @@ The one-shot script prints a combined table and writes:
 
 - `/tmp/jolt-pcs-bench/dory.json`
 - `/tmp/jolt-pcs-bench/whir-bn254.json`
-- `/tmp/jolt-pcs-bench/whir-goldilocks.json`
 - `/tmp/jolt-pcs-bench/combined.json`
 
 The combined report includes workload metadata, Dory timings, WHIR timings,
@@ -121,9 +113,10 @@ field-element counts, and WHIR/Dory ratios.
 ## Implementation Notes
 
 - The workload is `examples/p256-ecdsa-verify` padded to `T = 2^19` cycles.
-- The Jolt side always uses BN254 Fr.
-- WHIR can run over `bn254` or `goldilocks-fp3`.
+- The Jolt side uses BN254 Fr; WHIR also runs over BN254 (`Field256`).
 - `src/workload.rs` drives the guest and trace extraction.
+- `src/sources.rs` derives the per-cycle committed-polynomial columns natively
+  (the same formulas as `CommittedPolynomial::generate_witness`).
 - `src/jolt_polys.rs` reconstructs the committed polynomial set.
 - `src/logup_star.rs` converts one-hot chunks into dense lookup-index vectors.
 - `src/dump.rs` writes the field-agnostic dump consumed by `whir-pcs-bench`.
@@ -131,7 +124,9 @@ field-element counts, and WHIR/Dory ratios.
 - `src/verify.rs` checks transformation invariants in debug builds and in
   release builds when `--verify-only` is supplied.
 
-The bench mirrors the Bolt/codegen commitment layout in
-`crates/jolt-prover/src/stages/commitment.rs`. That path uses an address-major
-layout and eager dense field materialization, so its Dory timing should not be
-treated as a direct measurement of every optimized Jolt prover path.
+The bench commits one-hot oracles through `jolt_dory::DoryScheme` (the PCS the
+in-development jolt-prover uses) with a column/address-major one-hot layout
+(`flat = index * T + cycle`). `jolt-dory` derives a per-oracle square matrix
+shape, which differs from jolt-core's embedded production layout, so the Dory
+timing is a representative proxy rather than a byte-exact reproduction of the
+production prover's commitment path.

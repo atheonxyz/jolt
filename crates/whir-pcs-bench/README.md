@@ -1,8 +1,9 @@
 # whir-pcs-bench
 
 `whir-pcs-bench` is the WHIR-ZK side of the Jolt PCS benchmark. It reads the
-integer-form dump produced by `jolt-pcs-bench`, encodes the data into a chosen
-field, and times the WHIR commitment plus the family pushforward checks.
+integer-form dump produced by `jolt-pcs-bench`, encodes the data into BN254
+(`Field256` = `ark_bn254::Fr`), and times the WHIR commitment plus the family
+pushforward checks.
 
 ## What It Measures
 
@@ -36,20 +37,18 @@ cargo run -p jolt-pcs-bench --release -- \
     --dump /tmp/jolt-pcs-bench/polys.bin --no-dory
 ```
 
-Then run WHIR for one field:
+Then run WHIR:
 
 ```bash
 cargo run -p whir-pcs-bench --release -- \
-    --field goldilocks-fp3 \
     --warmup 1 --runs 5 \
     --dump /tmp/jolt-pcs-bench/polys.bin \
-    --json /tmp/jolt-pcs-bench/whir-goldilocks.json
+    --json /tmp/jolt-pcs-bench/whir-bn254.json
 ```
 
-Available fields:
-
-- `bn254`: `Identity<Field256>`, 32 bytes per element.
-- `goldilocks-fp3`: `Identity<Field64_3>`, 24 bytes per element.
+Field: BN254 `Field256` (= `ark_bn254::Fr`, the same Rust type as
+`jolt_field::Fr`'s inner field), 32 bytes per element. The benchmark is
+BN254-only; the BN254-optimized GKR hot path lives in `src/gkr_bn254.rs`.
 
 Useful flags:
 
@@ -68,14 +67,14 @@ Useful flags:
 | File | Purpose |
 |---|---|
 | [src/main.rs](src/main.rs) | CLI, dump loading, integer-to-field encoding, WHIR commit timing, JSON output. |
-| [src/gkr.rs](src/gkr.rs) | Fractional-GKR prover used for the family pushforward checks. |
-| [src/gkr_bn254.rs](src/gkr_bn254.rs) | BN254-specific helpers for the GKR path. |
+| [src/gkr.rs](src/gkr.rs) | Shared GKR circuit/pushforward helpers + the generic reference loop (test-only). |
+| [src/gkr_bn254.rs](src/gkr_bn254.rs) | BN254 fractional-GKR backend (WideAccumulator hot path). |
+| [src/gruen.rs](src/gruen.rs) | Inline field-typed Gruen split-eq for the BN254 round polynomial. |
 | [Cargo.toml](Cargo.toml) | WHIR dependency and bench-local lint/feature configuration. |
 
 ## Output
 
-Stdout includes a summary for the selected field. With `--json`, the output
-contains:
+Stdout includes a summary. With `--json`, the output contains:
 
 - `scheme`
 - `field`
