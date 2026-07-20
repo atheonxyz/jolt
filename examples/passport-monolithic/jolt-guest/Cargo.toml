@@ -1,0 +1,14 @@
+[package]
+name = "passport-guest"
+version = "0.1.0"
+edition = "2021"
+
+[features]
+guest = []
+compute_advice = []
+
+[dependencies]
+jolt = { package = "jolt-sdk", git = "https://github.com/a16z/jolt", branch = "main", features = ["zk"] }
+jolt-inlines-sha2 = { git = "https://github.com/a16z/jolt", branch = "main" }
+serde = { version = "1.0", default-features = false, features = ["derive", "alloc"] }
+serde-big-array = { version = "0.5", default-features = false }
